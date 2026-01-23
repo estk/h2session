@@ -3,7 +3,7 @@ use std::collections::HashMap;
 /// Connection-level HTTP/2 state (internal to crate)
 pub(crate) struct H2ConnectionState {
     /// Persistent HPACK decoder with dynamic table
-    pub(crate) decoder: hpack::Decoder<'static>,
+    pub(crate) decoder: loona_hpack::Decoder<'static>,
 
     /// Active streams being tracked
     pub(crate) active_streams: HashMap<u32, StreamState>,
@@ -75,7 +75,7 @@ impl Default for H2Settings {
 impl H2ConnectionState {
     pub fn new() -> Self {
         Self {
-            decoder: hpack::Decoder::new(),
+            decoder: loona_hpack::Decoder::new(),
             active_streams: HashMap::new(),
             settings: H2Settings::default(),
             preface_received: false,

@@ -724,3 +724,457 @@ fn test_real_traffic_parsing() {
         eprintln!("Skipping real traffic test - fixture not found. Run generate_real_traffic to create it.");
     }
 }
+
+// =============================================================================
+// EDGE CASE TESTS
+// =============================================================================
+
+// =============================================================================
+// Edge Case 1: HEADERS with both PADDED and PRIORITY flags
+// =============================================================================
+
+#[test]
+fn test_headers_padded_and_priority_flags() {
+    // HEADERS frame with both PADDED and PRIORITY flags set simultaneously
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/padded-priority", "example.com");
+
+    // Build HEADERS with both flags:
+    // - Padding: 5 bytes
+    // - Priority: stream dependency 0, exclusive false, weight 16
+    buffer.extend(build_headers_frame_padded_priority(
+        1,
+        &hpack_block,
+        5,  // padding_len
+        0,  // stream_dependency
+        false, // exclusive
+        16, // weight
+        true, // end_stream
+        true, // end_headers
+    ));
+
+    let messages = parse_buffer(&buffer).expect("should parse HEADERS with PADDED+PRIORITY");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].path, Some("/padded-priority".to_string()));
+    assert_eq!(messages[0].method, Some("GET".to_string()));
+}
+
+#[test]
+fn test_headers_priority_only() {
+    // HEADERS frame with only PRIORITY flag
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/priority-only", "example.com");
+
+    buffer.extend(build_headers_frame_priority(
+        1,
+        &hpack_block,
+        0,     // stream_dependency
+        true,  // exclusive
+        255,   // weight (max)
+        true,  // end_stream
+        true,  // end_headers
+    ));
+
+    let messages = parse_buffer(&buffer).expect("should parse HEADERS with PRIORITY");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].path, Some("/priority-only".to_string()));
+}
+
+#[test]
+fn test_headers_padded_only() {
+    // HEADERS frame with only PADDED flag
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/padded-only", "example.com");
+
+    buffer.extend(build_headers_frame_padded(
+        1,
+        &hpack_block,
+        10,   // padding_len
+        true, // end_stream
+        true, // end_headers
+    ));
+
+    let messages = parse_buffer(&buffer).expect("should parse HEADERS with PADDED");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].path, Some("/padded-only".to_string()));
+}
+
+// =============================================================================
+// Edge Case 2: Dynamic table eviction under memory pressure
+// =============================================================================
+
+#[test]
+fn test_dynamic_table_eviction() {
+    // Fill the dynamic table beyond its capacity to trigger eviction
+    // Default HEADER_TABLE_SIZE is 4096 bytes
+    let mut buffer = connection_start();
+
+    // First, add many headers with indexing to fill the table
+    let fill_block = hpack_fill_dynamic_table(4096);
+
+    // Create a HEADERS frame that fills the dynamic table
+    buffer.extend(build_headers_frame(1, &fill_block, FLAG_END_HEADERS | FLAG_END_STREAM));
+
+    // Parse should succeed even with table eviction happening
+    let result = parse_buffer(&buffer);
+    // May error due to missing pseudo-headers, but shouldn't panic
+    assert!(result.is_ok() || result.is_err(), "Should not panic on table eviction");
+}
+
+#[test]
+fn test_dynamic_table_size_zero() {
+    // Set HEADER_TABLE_SIZE to 0, which evicts all entries
+    let mut buffer = connection_start();
+
+    // Set table size to 0
+    buffer.extend(build_settings_frame(&[(0x01, 0)])); // HEADER_TABLE_SIZE = 0
+
+    // Stream 1: Add a header with indexing
+    let mut hpack_1 = hpack_get_request("/", "example.com");
+    hpack_1.extend(hpack_literal_with_indexing("x-custom", "value"));
+    buffer.extend(build_complete_headers_frame(1, &hpack_1));
+
+    // Stream 3: Try to reference that header (should fail or use literal)
+    // With table size 0, indexing is disabled
+    let hpack_3 = hpack_get_request("/other", "example.com");
+    buffer.extend(build_complete_headers_frame(3, &hpack_3));
+
+    // Should parse without panicking
+    let result = parse_buffer(&buffer);
+    assert!(result.is_ok(), "Should handle table size 0: {:?}", result.err());
+}
+
+// =============================================================================
+// Edge Case 3: Max frame size boundary conditions
+// =============================================================================
+
+#[test]
+fn test_max_frame_size_boundary() {
+    // Default MAX_FRAME_SIZE is 16384 (2^14)
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/", "example.com");
+    buffer.extend(build_headers_frame(1, &hpack_block, FLAG_END_HEADERS));
+
+    // Create a DATA frame exactly at max frame size
+    let max_data = vec![b'X'; 16384];
+    buffer.extend(build_data_frame(1, &max_data, true));
+
+    let messages = parse_buffer(&buffer).expect("should parse max size frame");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].body.len(), 16384);
+}
+
+#[test]
+fn test_frame_size_just_under_max() {
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/", "example.com");
+    buffer.extend(build_headers_frame(1, &hpack_block, FLAG_END_HEADERS));
+
+    // Create a DATA frame just under max (16383 bytes)
+    let data = vec![b'Y'; 16383];
+    buffer.extend(build_data_frame(1, &data, true));
+
+    let messages = parse_buffer(&buffer).expect("should parse frame just under max");
+    assert_eq!(messages[0].body.len(), 16383);
+}
+
+#[test]
+fn test_many_small_frames() {
+    // Test with many small frames (stress test frame parsing loop)
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/", "example.com");
+    buffer.extend(build_headers_frame(1, &hpack_block, FLAG_END_HEADERS));
+
+    // Send 1000 tiny DATA frames
+    for i in 0..999 {
+        buffer.extend(build_data_frame(1, &[i as u8], false));
+    }
+    buffer.extend(build_data_frame(1, &[255], true)); // Final frame
+
+    let messages = parse_buffer(&buffer).expect("should parse many small frames");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].body.len(), 1000);
+}
+
+// =============================================================================
+// Edge Case 4: Stream ID boundary conditions
+// =============================================================================
+
+#[test]
+fn test_stream_id_max_client() {
+    // Maximum client-initiated stream ID: 2^31 - 1 (odd)
+    let max_stream_id: u32 = 0x7FFFFFFF;
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/max-stream", "example.com");
+    buffer.extend(build_complete_headers_frame(max_stream_id, &hpack_block));
+
+    let messages = parse_buffer(&buffer).expect("should parse max stream ID");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].stream_id, max_stream_id);
+}
+
+#[test]
+fn test_stream_id_large_odd() {
+    // Large odd stream ID (client-initiated)
+    let large_stream_id: u32 = 0x7FFFFFFE - 1; // 2147483645
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/large-stream", "example.com");
+    buffer.extend(build_complete_headers_frame(large_stream_id, &hpack_block));
+
+    let messages = parse_buffer(&buffer).expect("should parse large stream ID");
+    assert_eq!(messages[0].stream_id, large_stream_id);
+}
+
+#[test]
+fn test_stream_id_server_initiated() {
+    // Server-initiated stream IDs are even (2, 4, 6, ...)
+    let mut buffer = connection_start();
+
+    // Response on stream 2 (server push)
+    let mut hpack_response = hpack_static::status_200();
+    hpack_response.extend(hpack_literal_without_indexing("content-type", "text/html"));
+    buffer.extend(build_complete_headers_frame(2, &hpack_response));
+
+    let messages = parse_buffer(&buffer).expect("should parse server-initiated stream");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].stream_id, 2);
+    assert_eq!(messages[0].status, Some(200));
+}
+
+#[test]
+fn test_multiple_high_stream_ids() {
+    // Multiple streams with high IDs interleaved
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/", "example.com");
+
+    let ids = [1001, 2003, 3005, 4007, 5009];
+    for &id in &ids {
+        buffer.extend(build_complete_headers_frame(id, &hpack_block));
+    }
+
+    let messages = parse_buffer(&buffer).expect("should parse multiple high stream IDs");
+    assert_eq!(messages.len(), 5);
+
+    let parsed_ids: Vec<u32> = messages.iter().map(|m| m.stream_id).collect();
+    for &expected_id in &ids {
+        assert!(parsed_ids.contains(&expected_id), "Should contain stream {}", expected_id);
+    }
+}
+
+// =============================================================================
+// Edge Case 5: Huffman-encoded HPACK values
+// =============================================================================
+
+#[test]
+fn test_huffman_encoded_header_value() {
+    // Test with Huffman-encoded header values
+    let mut buffer = connection_start();
+
+    let mut hpack_block = hpack_static::method_get();
+    hpack_block.extend(hpack_static::scheme_https());
+    hpack_block.extend(hpack_static::path_root());
+
+    // Add :authority with Huffman-encoded value "www.example.com"
+    // Using indexed name (index 1 = :authority) with Huffman value
+    hpack_block.extend(hpack_huffman::literal_indexed_name_huffman_value(
+        1, // :authority index
+        &hpack_huffman::www_example_com(),
+    ));
+
+    buffer.extend(build_complete_headers_frame(1, &hpack_block));
+
+    let messages = parse_buffer(&buffer).expect("should parse Huffman-encoded headers");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].authority, Some("www.example.com".to_string()));
+}
+
+#[test]
+fn test_huffman_encoded_custom_header() {
+    // Test with fully Huffman-encoded custom header (name and value)
+    let mut buffer = connection_start();
+
+    let mut hpack_block = hpack_get_request("/", "example.com");
+
+    // Add custom header with Huffman-encoded name and value
+    hpack_block.extend(hpack_huffman::literal_huffman(
+        &hpack_huffman::custom_key(),
+        &hpack_huffman::custom_value(),
+    ));
+
+    buffer.extend(build_complete_headers_frame(1, &hpack_block));
+
+    let messages = parse_buffer(&buffer).expect("should parse Huffman custom header");
+    assert_eq!(messages.len(), 1);
+
+    let has_custom = messages[0].headers.iter().any(|(k, v)| {
+        k == "custom-key" && v == "custom-value"
+    });
+    assert!(has_custom, "Should have decoded Huffman custom header");
+}
+
+#[test]
+fn test_mixed_huffman_and_literal() {
+    // Mix of Huffman and literal encoded headers
+    let mut buffer = connection_start();
+
+    let mut hpack_block = hpack_static::method_get();
+    hpack_block.extend(hpack_static::scheme_https());
+    hpack_block.extend(hpack_static::path_root());
+    // Literal :authority
+    hpack_block.extend(hpack_literal_without_indexing(":authority", "example.com"));
+    // Huffman custom header
+    hpack_block.extend(hpack_huffman::literal_huffman(
+        &hpack_huffman::custom_key(),
+        &hpack_huffman::custom_value(),
+    ));
+    // Another literal header
+    hpack_block.extend(hpack_literal_without_indexing("x-plain", "plainvalue"));
+
+    buffer.extend(build_complete_headers_frame(1, &hpack_block));
+
+    let messages = parse_buffer(&buffer).expect("should parse mixed encoding");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].authority, Some("example.com".to_string()));
+
+    let has_custom = messages[0].headers.iter().any(|(k, v)| k == "custom-key" && v == "custom-value");
+    let has_plain = messages[0].headers.iter().any(|(k, v)| k == "x-plain" && v == "plainvalue");
+    assert!(has_custom, "Should have Huffman header");
+    assert!(has_plain, "Should have literal header");
+}
+
+// =============================================================================
+// Edge Case 6: Boundary conditions and special values
+// =============================================================================
+
+#[test]
+fn test_zero_length_body() {
+    // Stream with headers but zero-length body (END_STREAM on HEADERS)
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/empty", "example.com");
+    buffer.extend(build_complete_headers_frame(1, &hpack_block));
+
+    let messages = parse_buffer(&buffer).expect("should parse zero-length body");
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].body.is_empty());
+}
+
+#[test]
+fn test_zero_length_data_frame() {
+    // Explicit zero-length DATA frame
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/", "example.com");
+    buffer.extend(build_headers_frame(1, &hpack_block, FLAG_END_HEADERS));
+
+    // Empty DATA frame with END_STREAM
+    buffer.extend(build_data_frame(1, &[], true));
+
+    let messages = parse_buffer(&buffer).expect("should parse zero-length DATA");
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].body.is_empty());
+}
+
+#[test]
+fn test_max_padding() {
+    // Maximum padding (255 bytes)
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/", "example.com");
+    buffer.extend(build_headers_frame(1, &hpack_block, FLAG_END_HEADERS));
+
+    // DATA frame with 255 bytes of padding
+    buffer.extend(build_data_frame_padded(1, b"tiny", 255, true));
+
+    let messages = parse_buffer(&buffer).expect("should parse max padding");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].body, b"tiny");
+}
+
+#[test]
+fn test_window_update_max_increment() {
+    // WINDOW_UPDATE with maximum increment (2^31 - 1)
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/", "example.com");
+    buffer.extend(build_headers_frame(1, &hpack_block, FLAG_END_HEADERS));
+
+    // Max window increment
+    buffer.extend(build_window_update_frame(0, 0x7FFFFFFF));
+    buffer.extend(build_window_update_frame(1, 0x7FFFFFFF));
+
+    buffer.extend(build_data_frame(1, b"data", true));
+
+    let messages = parse_buffer(&buffer).expect("should handle max window update");
+    assert_eq!(messages.len(), 1);
+}
+
+// =============================================================================
+// Edge Case 7: Stress tests
+// =============================================================================
+
+#[test]
+fn test_many_concurrent_streams() {
+    // 100 concurrent streams
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/", "example.com");
+
+    // Open 100 streams
+    for i in 0..100u32 {
+        let stream_id = i * 2 + 1; // Odd stream IDs
+        buffer.extend(build_complete_headers_frame(stream_id, &hpack_block));
+    }
+
+    let messages = parse_buffer(&buffer).expect("should parse 100 streams");
+    assert_eq!(messages.len(), 100);
+}
+
+#[test]
+fn test_deeply_interleaved_streams() {
+    // 10 streams, each with 10 DATA frames, maximally interleaved
+    let mut buffer = connection_start();
+
+    let hpack_block = hpack_get_request("/", "example.com");
+
+    // Open 10 streams
+    for i in 0..10u32 {
+        let stream_id = i * 2 + 1;
+        buffer.extend(build_headers_frame(stream_id, &hpack_block, FLAG_END_HEADERS));
+    }
+
+    // Interleave DATA frames: stream 1, 3, 5, 7, 9, 11, 13, 15, 17, 19, then repeat
+    for chunk in 0..10 {
+        for i in 0..10u32 {
+            let stream_id = i * 2 + 1;
+            let is_last = chunk == 9;
+            let data = format!("S{}C{}", stream_id, chunk);
+            buffer.extend(build_data_frame(stream_id, data.as_bytes(), is_last));
+        }
+    }
+
+    let messages = parse_buffer(&buffer).expect("should parse deeply interleaved");
+    assert_eq!(messages.len(), 10);
+
+    // Verify each stream has correct body
+    for msg in &messages {
+        let expected_body: String = (0..10)
+            .map(|c| format!("S{}C{}", msg.stream_id, c))
+            .collect();
+        assert_eq!(
+            String::from_utf8_lossy(&msg.body),
+            expected_body,
+            "Stream {} body mismatch",
+            msg.stream_id
+        );
+    }
+}

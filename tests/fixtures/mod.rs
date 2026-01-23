@@ -95,6 +95,95 @@ pub fn build_headers_frame_with_body(stream_id: u32, hpack_block: &[u8]) -> Vec<
     build_headers_frame(stream_id, hpack_block, FLAG_END_HEADERS)
 }
 
+/// Build a HEADERS frame with PADDED flag
+pub fn build_headers_frame_padded(
+    stream_id: u32,
+    hpack_block: &[u8],
+    padding_len: u8,
+    end_stream: bool,
+    end_headers: bool,
+) -> Vec<u8> {
+    let mut flags = FLAG_PADDED;
+    if end_stream {
+        flags |= FLAG_END_STREAM;
+    }
+    if end_headers {
+        flags |= FLAG_END_HEADERS;
+    }
+    let total_len = 1 + hpack_block.len() + padding_len as usize;
+    let mut frame = build_frame_header(total_len as u32, FRAME_TYPE_HEADERS, flags, stream_id);
+    frame.push(padding_len);
+    frame.extend_from_slice(hpack_block);
+    frame.extend(std::iter::repeat(0u8).take(padding_len as usize));
+    frame
+}
+
+/// Build a HEADERS frame with PRIORITY flag
+/// Priority: 5 bytes = [E (1 bit) + Stream Dependency (31 bits)] + [Weight (8 bits)]
+pub fn build_headers_frame_priority(
+    stream_id: u32,
+    hpack_block: &[u8],
+    stream_dependency: u32,
+    exclusive: bool,
+    weight: u8,
+    end_stream: bool,
+    end_headers: bool,
+) -> Vec<u8> {
+    let mut flags = FLAG_PRIORITY;
+    if end_stream {
+        flags |= FLAG_END_STREAM;
+    }
+    if end_headers {
+        flags |= FLAG_END_HEADERS;
+    }
+    let total_len = 5 + hpack_block.len();
+    let mut frame = build_frame_header(total_len as u32, FRAME_TYPE_HEADERS, flags, stream_id);
+    // Stream dependency with exclusive bit
+    let dep = if exclusive {
+        stream_dependency | 0x80000000
+    } else {
+        stream_dependency
+    };
+    frame.extend_from_slice(&dep.to_be_bytes());
+    frame.push(weight);
+    frame.extend_from_slice(hpack_block);
+    frame
+}
+
+/// Build a HEADERS frame with both PADDED and PRIORITY flags
+pub fn build_headers_frame_padded_priority(
+    stream_id: u32,
+    hpack_block: &[u8],
+    padding_len: u8,
+    stream_dependency: u32,
+    exclusive: bool,
+    weight: u8,
+    end_stream: bool,
+    end_headers: bool,
+) -> Vec<u8> {
+    let mut flags = FLAG_PADDED | FLAG_PRIORITY;
+    if end_stream {
+        flags |= FLAG_END_STREAM;
+    }
+    if end_headers {
+        flags |= FLAG_END_HEADERS;
+    }
+    // Layout: [Pad Length (1)] [E + Stream Dep (4)] [Weight (1)] [Header Block] [Padding]
+    let total_len = 1 + 5 + hpack_block.len() + padding_len as usize;
+    let mut frame = build_frame_header(total_len as u32, FRAME_TYPE_HEADERS, flags, stream_id);
+    frame.push(padding_len);
+    let dep = if exclusive {
+        stream_dependency | 0x80000000
+    } else {
+        stream_dependency
+    };
+    frame.extend_from_slice(&dep.to_be_bytes());
+    frame.push(weight);
+    frame.extend_from_slice(hpack_block);
+    frame.extend(std::iter::repeat(0u8).take(padding_len as usize));
+    frame
+}
+
 /// Build a CONTINUATION frame
 ///
 /// # Arguments
@@ -288,6 +377,100 @@ pub fn connection_start() -> Vec<u8> {
     data.extend_from_slice(CONNECTION_PREFACE);
     data.extend(build_empty_settings_frame());
     data
+}
+
+/// HPACK Huffman encoding module
+/// Pre-computed Huffman-encoded values for testing (RFC 7541 Appendix B)
+pub mod hpack_huffman {
+    /// Encode a string length with Huffman flag set (high bit = 1)
+    fn huffman_length(len: usize) -> Vec<u8> {
+        if len < 127 {
+            vec![0x80 | len as u8]
+        } else {
+            // For lengths >= 127, use multi-byte encoding
+            let mut result = vec![0xFF]; // 127 with huffman bit
+            let mut remaining = len - 127;
+            while remaining >= 128 {
+                result.push(0x80 | (remaining & 0x7F) as u8);
+                remaining >>= 7;
+            }
+            result.push(remaining as u8);
+            result
+        }
+    }
+
+    /// Huffman-encode "www.example.com" (pre-computed)
+    /// This is a common test value from RFC 7541 examples
+    pub fn www_example_com() -> Vec<u8> {
+        // Huffman encoding of "www.example.com" = f1e3c2e5f23a6ba0ab90f4ff
+        vec![0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]
+    }
+
+    /// Huffman-encode "no-cache" (pre-computed)
+    pub fn no_cache() -> Vec<u8> {
+        // Huffman encoding of "no-cache" = a8eb10649cbf
+        vec![0xa8, 0xeb, 0x10, 0x64, 0x9c, 0xbf]
+    }
+
+    /// Huffman-encode "custom-key" (pre-computed)
+    pub fn custom_key() -> Vec<u8> {
+        // Huffman encoding of "custom-key" = 25a849e95ba97d7f
+        vec![0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xa9, 0x7d, 0x7f]
+    }
+
+    /// Huffman-encode "custom-value" (pre-computed)
+    pub fn custom_value() -> Vec<u8> {
+        // Huffman encoding of "custom-value" = 25a849e95bb8e8b4bf
+        vec![0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xb8, 0xe8, 0xb4, 0xbf]
+    }
+
+    /// Build literal header with Huffman-encoded name and value (without indexing)
+    pub fn literal_huffman(name_huffman: &[u8], value_huffman: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        // Literal without indexing, new name
+        encoded.push(0x00);
+        // Name length with Huffman flag
+        encoded.extend(huffman_length(name_huffman.len()));
+        encoded.extend_from_slice(name_huffman);
+        // Value length with Huffman flag
+        encoded.extend(huffman_length(value_huffman.len()));
+        encoded.extend_from_slice(value_huffman);
+        encoded
+    }
+
+    /// Build literal header with Huffman-encoded value only (indexed name)
+    /// Uses static table index for the name
+    pub fn literal_indexed_name_huffman_value(name_index: u8, value_huffman: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        // Literal without indexing, indexed name (4-bit prefix)
+        encoded.push(0x00 | (name_index & 0x0F));
+        // Value length with Huffman flag
+        encoded.extend(huffman_length(value_huffman.len()));
+        encoded.extend_from_slice(value_huffman);
+        encoded
+    }
+}
+
+/// Build a large HPACK block that will fill the dynamic table
+/// Creates entries until we exceed the given table size
+pub fn hpack_fill_dynamic_table(table_size: usize) -> Vec<u8> {
+    let mut block = Vec::new();
+    let mut total_size = 0;
+    let mut i = 0;
+
+    // Each entry overhead is 32 bytes (RFC 7541 Section 4.1)
+    // Entry size = name length + value length + 32
+    while total_size < table_size + 100 {
+        let name = format!("x-header-{:04}", i);
+        let value = format!("value-{:04}", i);
+        let entry_size = name.len() + value.len() + 32;
+
+        block.extend(super::hpack_literal_with_indexing(&name, &value));
+        total_size += entry_size;
+        i += 1;
+    }
+
+    block
 }
 
 #[cfg(test)]

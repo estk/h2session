@@ -214,7 +214,7 @@ fn handle_settings_frame(
 }
 
 fn decode_headers_into_stream(
-    decoder: &mut hpack::Decoder<'static>,
+    decoder: &mut loona_hpack::Decoder<'static>,
     stream: &mut StreamState,
     header_block: &[u8],
 ) -> Result<(), ParseError> {

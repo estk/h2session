@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-hpack = "0.3.0"
+loona-hpack = "0.4"
 dashmap = "6.1.0"
 
 [dev-dependencies]

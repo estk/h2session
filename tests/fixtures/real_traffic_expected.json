@@ -1,0 +1,40 @@
+{
+  "message_count": 5,
+  "streams": [
+    {
+      "stream_id": 0,
+      "method": "GET",
+      "path": "/small",
+      "status": 200,
+      "body_size": 100
+    },
+    {
+      "stream_id": 0,
+      "method": "GET",
+      "path": "/medium",
+      "status": 200,
+      "body_size": 1000
+    },
+    {
+      "stream_id": 0,
+      "method": "GET",
+      "path": "/large",
+      "status": 200,
+      "body_size": 10000
+    },
+    {
+      "stream_id": 0,
+      "method": "GET",
+      "path": "/path1",
+      "status": 200,
+      "body_size": 500
+    },
+    {
+      "stream_id": 0,
+      "method": "GET",
+      "path": "/path2",
+      "status": 200,
+      "body_size": 500
+    }
+  ]
+}

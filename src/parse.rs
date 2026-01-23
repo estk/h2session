@@ -72,16 +72,16 @@ fn handle_headers_frame(
         .or_insert_with(|| StreamState::new(stream_id));
 
     // Handle PADDED flag
+    // Padded frame format: [Pad Length (1 byte)] [Header Block] [Padding]
     let (header_block, _padding_len) = if header.flags & FLAG_PADDED != 0 {
         if payload.is_empty() {
             return Err(ParseError::Http2BufferTooSmall);
         }
         let pad_len = payload[0] as usize;
-        let payload_len = payload.len() - 1;
-        if pad_len >= payload_len {
+        if pad_len >= payload.len() {
             return Err(ParseError::Http2BufferTooSmall);
         }
-        (&payload[1..payload_len - pad_len], pad_len)
+        (&payload[1..payload.len() - pad_len], pad_len)
     } else {
         (payload, 0)
     };
@@ -154,16 +154,17 @@ fn handle_data_frame(
         .ok_or(ParseError::Http2BufferTooSmall)?;
 
     // Handle PADDED flag
+    // Padded frame format: [Pad Length (1 byte)] [Data] [Padding]
     let data = if header.flags & FLAG_PADDED != 0 {
         if payload.is_empty() {
             return Err(ParseError::Http2BufferTooSmall);
         }
         let pad_len = payload[0] as usize;
-        let payload_len = payload.len() - 1;
-        if pad_len >= payload_len {
+        // Data length = total - pad_length_byte - padding
+        if pad_len >= payload.len() {
             return Err(ParseError::Http2BufferTooSmall);
         }
-        &payload[1..payload_len - pad_len]
+        &payload[1..payload.len() - pad_len]
     } else {
         payload
     };

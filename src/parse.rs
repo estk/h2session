@@ -101,15 +101,14 @@ fn handle_headers_frame(
     // Check END_HEADERS flag
     if header.flags & FLAG_END_HEADERS != 0 {
         // Complete header block - decode now
-        let full_block = if stream.continuation_buffer.is_empty() {
-            header_block
+        let full_block: Vec<u8> = if stream.continuation_buffer.is_empty() {
+            header_block.to_vec()
         } else {
             stream.continuation_buffer.extend_from_slice(header_block);
-            &stream.continuation_buffer
+            std::mem::take(&mut stream.continuation_buffer)
         };
 
-        decode_headers_into_stream(state, stream, full_block)?;
-        stream.continuation_buffer.clear();
+        decode_headers_into_stream(&mut state.decoder, stream, &full_block)?;
         stream.end_headers_seen = true;
     } else {
         // Incomplete header block - wait for CONTINUATION
@@ -137,7 +136,7 @@ fn handle_continuation_frame(
     stream.header_size += FRAME_HEADER_SIZE + payload.len();
 
     if header.flags & FLAG_END_HEADERS != 0 {
-        decode_headers_into_stream(state, stream, &stream.continuation_buffer.clone())?;
+        decode_headers_into_stream(&mut state.decoder, stream, &stream.continuation_buffer.clone())?;
         stream.continuation_buffer.clear();
         stream.end_headers_seen = true;
     }
@@ -214,11 +213,11 @@ fn handle_settings_frame(
 }
 
 fn decode_headers_into_stream(
-    state: &mut H2ConnectionState,
+    decoder: &mut hpack::Decoder<'static>,
     stream: &mut StreamState,
     header_block: &[u8],
 ) -> Result<(), ParseError> {
-    let decoded = state.decoder
+    let decoded = decoder
         .decode(header_block)
         .map_err(|e| ParseError::Http2HpackError(format!("{:?}", e)))?;
 

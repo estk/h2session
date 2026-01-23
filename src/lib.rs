@@ -60,7 +60,7 @@ impl<K: Hash + Eq + Clone> H2SessionCache<K> {
     }
 }
 
-impl<K> Default for H2SessionCache<K> {
+impl<K: Hash + Eq + Clone> Default for H2SessionCache<K> {
     fn default() -> Self {
         Self::new()
     }

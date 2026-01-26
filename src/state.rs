@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 
-/// Connection-level HTTP/2 state (internal to crate)
-pub(crate) struct H2ConnectionState {
+/// Connection-level HTTP/2 state
+///
+/// Maintains HPACK decoder state and active stream tracking for a single
+/// HTTP/2 connection. Create one instance per direction (request/response)
+/// when parsing bidirectional traffic.
+pub struct H2ConnectionState {
     /// Persistent HPACK decoder with dynamic table
     pub(crate) decoder: loona_hpack::Decoder<'static>,
 
@@ -115,6 +119,18 @@ pub struct ParsedH2Message {
     pub stream_id: u32,
     pub header_size: usize,
     pub body: Vec<u8>,
+}
+
+impl ParsedH2Message {
+    /// Returns true if this message is a request (has :method pseudo-header)
+    pub fn is_request(&self) -> bool {
+        self.method.is_some()
+    }
+
+    /// Returns true if this message is a response (has :status pseudo-header)
+    pub fn is_response(&self) -> bool {
+        self.status.is_some()
+    }
 }
 
 /// Error type for parsing (public API)

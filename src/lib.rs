@@ -5,10 +5,10 @@ mod state;
 mod parse;
 mod frame;
 
-pub use state::{ParsedH2Message, ParseError};
-
-use state::H2ConnectionState;
-use parse::parse_frames_stateful;
+// Public re-exports for direct state management
+pub use state::{H2ConnectionState, ParsedH2Message, ParseError};
+pub use parse::parse_frames_stateful;
+pub use frame::{is_http2_preface, looks_like_http2_frame, CONNECTION_PREFACE};
 use dashmap::DashMap;
 use std::hash::Hash;
 

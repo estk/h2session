@@ -2,7 +2,11 @@ use crate::state::{H2ConnectionState, StreamState, ParsedH2Message, ParseError};
 use crate::frame::*;
 
 /// Parse HTTP/2 frames with connection-level state
-pub(crate) fn parse_frames_stateful(
+///
+/// Processes the buffer for HTTP/2 frames and returns completed messages.
+/// State is accumulated across calls for HPACK decoding and stream tracking.
+/// Returns `Err(ParseError::Http2BufferTooSmall)` if no complete messages yet.
+pub fn parse_frames_stateful(
     buffer: &[u8],
     state: &mut H2ConnectionState,
 ) -> Result<Vec<ParsedH2Message>, ParseError> {

@@ -58,7 +58,12 @@ pub fn build_data_frame(stream_id: u32, data: &[u8], end_stream: bool) -> Vec<u8
 }
 
 /// Build a DATA frame with padding
-pub fn build_data_frame_padded(stream_id: u32, data: &[u8], padding_len: u8, end_stream: bool) -> Vec<u8> {
+pub fn build_data_frame_padded(
+    stream_id: u32,
+    data: &[u8],
+    padding_len: u8,
+    end_stream: bool,
+) -> Vec<u8> {
     let mut flags = FLAG_PADDED;
     if end_stream {
         flags |= FLAG_END_STREAM;
@@ -78,7 +83,12 @@ pub fn build_data_frame_padded(stream_id: u32, data: &[u8], padding_len: u8, end
 /// * `hpack_block` - HPACK-encoded header block
 /// * `flags` - Frame flags (END_STREAM, END_HEADERS, PADDED, PRIORITY)
 pub fn build_headers_frame(stream_id: u32, hpack_block: &[u8], flags: u8) -> Vec<u8> {
-    let mut frame = build_frame_header(hpack_block.len() as u32, FRAME_TYPE_HEADERS, flags, stream_id);
+    let mut frame = build_frame_header(
+        hpack_block.len() as u32,
+        FRAME_TYPE_HEADERS,
+        flags,
+        stream_id,
+    );
     frame.extend_from_slice(hpack_block);
     frame
 }
@@ -192,7 +202,12 @@ pub fn build_headers_frame_padded_priority(
 /// * `end_headers` - Whether to set END_HEADERS flag
 pub fn build_continuation_frame(stream_id: u32, hpack_block: &[u8], end_headers: bool) -> Vec<u8> {
     let flags = if end_headers { FLAG_END_HEADERS } else { 0 };
-    let mut frame = build_frame_header(hpack_block.len() as u32, FRAME_TYPE_CONTINUATION, flags, stream_id);
+    let mut frame = build_frame_header(
+        hpack_block.len() as u32,
+        FRAME_TYPE_CONTINUATION,
+        flags,
+        stream_id,
+    );
     frame.extend_from_slice(hpack_block);
     frame
 }
@@ -308,31 +323,57 @@ pub fn hpack_indexed(index: u8) -> Vec<u8> {
 /// HPACK helper: Encode common pseudo-headers using static table
 pub mod hpack_static {
     /// :method: GET (index 2)
-    pub fn method_get() -> Vec<u8> { vec![0x82] }
+    pub fn method_get() -> Vec<u8> {
+        vec![0x82]
+    }
     /// :method: POST (index 3)
-    pub fn method_post() -> Vec<u8> { vec![0x83] }
+    pub fn method_post() -> Vec<u8> {
+        vec![0x83]
+    }
     /// :path: / (index 4)
-    pub fn path_root() -> Vec<u8> { vec![0x84] }
+    pub fn path_root() -> Vec<u8> {
+        vec![0x84]
+    }
     /// :path: /index.html (index 5)
-    pub fn path_index_html() -> Vec<u8> { vec![0x85] }
+    pub fn path_index_html() -> Vec<u8> {
+        vec![0x85]
+    }
     /// :scheme: http (index 6)
-    pub fn scheme_http() -> Vec<u8> { vec![0x86] }
+    pub fn scheme_http() -> Vec<u8> {
+        vec![0x86]
+    }
     /// :scheme: https (index 7)
-    pub fn scheme_https() -> Vec<u8> { vec![0x87] }
+    pub fn scheme_https() -> Vec<u8> {
+        vec![0x87]
+    }
     /// :status: 200 (index 8)
-    pub fn status_200() -> Vec<u8> { vec![0x88] }
+    pub fn status_200() -> Vec<u8> {
+        vec![0x88]
+    }
     /// :status: 204 (index 9)
-    pub fn status_204() -> Vec<u8> { vec![0x89] }
+    pub fn status_204() -> Vec<u8> {
+        vec![0x89]
+    }
     /// :status: 206 (index 10)
-    pub fn status_206() -> Vec<u8> { vec![0x8a] }
+    pub fn status_206() -> Vec<u8> {
+        vec![0x8a]
+    }
     /// :status: 304 (index 11)
-    pub fn status_304() -> Vec<u8> { vec![0x8b] }
+    pub fn status_304() -> Vec<u8> {
+        vec![0x8b]
+    }
     /// :status: 400 (index 12)
-    pub fn status_400() -> Vec<u8> { vec![0x8c] }
+    pub fn status_400() -> Vec<u8> {
+        vec![0x8c]
+    }
     /// :status: 404 (index 13)
-    pub fn status_404() -> Vec<u8> { vec![0x8d] }
+    pub fn status_404() -> Vec<u8> {
+        vec![0x8d]
+    }
     /// :status: 500 (index 14)
-    pub fn status_500() -> Vec<u8> { vec![0x8e] }
+    pub fn status_500() -> Vec<u8> {
+        vec![0x8e]
+    }
 }
 
 /// Build a minimal valid HPACK block for a GET request
@@ -403,7 +444,9 @@ pub mod hpack_huffman {
     /// This is a common test value from RFC 7541 examples
     pub fn www_example_com() -> Vec<u8> {
         // Huffman encoding of "www.example.com" = f1e3c2e5f23a6ba0ab90f4ff
-        vec![0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff]
+        vec![
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ]
     }
 
     /// Huffman-encode "no-cache" (pre-computed)

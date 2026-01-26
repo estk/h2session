@@ -1,17 +1,20 @@
-use crate::state::{H2ConnectionState, StreamState, ParsedH2Message, ParseError};
+use std::collections::HashMap;
+
 use crate::frame::*;
+use crate::state::{H2ConnectionState, ParseError, ParsedH2Message, StreamState};
 
 /// Parse HTTP/2 frames with connection-level state
 ///
-/// Processes the buffer for HTTP/2 frames and returns completed messages.
-/// State is accumulated across calls for HPACK decoding and stream tracking.
+/// Processes the buffer for HTTP/2 frames and returns completed messages
+/// indexed by stream_id. State is accumulated across calls for HPACK decoding
+/// and stream tracking.
 /// Returns `Err(ParseError::Http2BufferTooSmall)` if no complete messages yet.
 pub fn parse_frames_stateful(
     buffer: &[u8],
     state: &mut H2ConnectionState,
-) -> Result<Vec<ParsedH2Message>, ParseError> {
+) -> Result<HashMap<u32, ParsedH2Message>, ParseError> {
     let mut pos = 0;
-    let mut completed_messages = Vec::new();
+    let mut completed_messages = HashMap::new();
 
     // Skip connection preface if not yet seen
     if !state.preface_received {
@@ -71,7 +74,8 @@ fn handle_headers_frame(
     let stream_id = header.stream_id;
 
     // Create stream if new
-    let stream = state.active_streams
+    let stream = state
+        .active_streams
         .entry(stream_id)
         .or_insert_with(|| StreamState::new(stream_id));
 
@@ -132,7 +136,8 @@ fn handle_continuation_frame(
     header: &FrameHeader,
     payload: &[u8],
 ) -> Result<(), ParseError> {
-    let stream = state.active_streams
+    let stream = state
+        .active_streams
         .get_mut(&header.stream_id)
         .ok_or(ParseError::Http2HeadersIncomplete)?;
 
@@ -140,7 +145,11 @@ fn handle_continuation_frame(
     stream.header_size += FRAME_HEADER_SIZE + payload.len();
 
     if header.flags & FLAG_END_HEADERS != 0 {
-        decode_headers_into_stream(&mut state.decoder, stream, &stream.continuation_buffer.clone())?;
+        decode_headers_into_stream(
+            &mut state.decoder,
+            stream,
+            &stream.continuation_buffer.clone(),
+        )?;
         stream.continuation_buffer.clear();
         stream.end_headers_seen = true;
     }
@@ -153,7 +162,8 @@ fn handle_data_frame(
     header: &FrameHeader,
     payload: &[u8],
 ) -> Result<(), ParseError> {
-    let stream = state.active_streams
+    let stream = state
+        .active_streams
         .get_mut(&header.stream_id)
         .ok_or(ParseError::Http2BufferTooSmall)?;
 
@@ -246,24 +256,27 @@ fn decode_headers_into_stream(
 
 fn extract_completed_streams(
     state: &mut H2ConnectionState,
-    completed: &mut Vec<ParsedH2Message>,
+    completed: &mut HashMap<u32, ParsedH2Message>,
 ) {
     let mut to_remove = Vec::new();
 
     for (stream_id, stream) in &state.active_streams {
         // Stream is complete if: headers decoded AND END_STREAM seen
         if stream.end_headers_seen && stream.end_stream_seen {
-            completed.push(ParsedH2Message {
-                method: stream.method.clone(),
-                path: stream.path.clone(),
-                authority: stream.authority.clone(),
-                scheme: stream.scheme.clone(),
-                status: stream.status,
-                headers: stream.headers.clone(),
-                stream_id: *stream_id,
-                header_size: stream.header_size,
-                body: stream.body.clone(),
-            });
+            completed.insert(
+                *stream_id,
+                ParsedH2Message {
+                    method: stream.method.clone(),
+                    path: stream.path.clone(),
+                    authority: stream.authority.clone(),
+                    scheme: stream.scheme.clone(),
+                    status: stream.status,
+                    headers: stream.headers.clone(),
+                    stream_id: *stream_id,
+                    header_size: stream.header_size,
+                    body: stream.body.clone(),
+                },
+            );
             to_remove.push(*stream_id);
         }
     }

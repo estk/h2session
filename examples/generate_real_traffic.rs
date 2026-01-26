@@ -132,10 +132,7 @@ async fn handle_connection(socket: TcpStream) -> Result<(), Box<dyn Error + Send
                 _ => 500,
             };
 
-            let response = Response::builder()
-                .status(StatusCode::OK)
-                .body(())
-                .unwrap();
+            let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
 
             let mut send = respond.send_response(response, false).unwrap();
 

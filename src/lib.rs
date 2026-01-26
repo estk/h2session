@@ -1,15 +1,16 @@
 // HTTP/2 session management crate
 // Provides connection-level state tracking for HTTP/2 parsing
 
-mod state;
-mod parse;
 mod frame;
+mod parse;
+mod state;
 
 // Public re-exports for direct state management
-pub use state::{H2ConnectionState, ParsedH2Message, ParseError};
-pub use parse::parse_frames_stateful;
-pub use frame::{is_http2_preface, looks_like_http2_frame, CONNECTION_PREFACE};
 use dashmap::DashMap;
+pub use frame::{is_http2_preface, looks_like_http2_frame, CONNECTION_PREFACE};
+pub use parse::parse_frames_stateful;
+pub use state::{H2ConnectionState, ParseError, ParsedH2Message};
+use std::collections::HashMap;
 use std::hash::Hash;
 
 /// HTTP/2 session cache with generic connection keys
@@ -28,10 +29,16 @@ impl<K: Hash + Eq + Clone> H2SessionCache<K> {
     /// Parse buffer with connection state
     ///
     /// If the connection key doesn't exist, creates new state automatically.
-    /// Returns completed HTTP/2 messages (may be empty if parsing incomplete).
-    pub fn parse(&self, key: K, buffer: &[u8]) -> Result<Vec<ParsedH2Message>, ParseError> {
+    /// Returns completed HTTP/2 messages indexed by stream_id (may be empty if
+    /// parsing incomplete).
+    pub fn parse(
+        &self,
+        key: K,
+        buffer: &[u8],
+    ) -> Result<HashMap<u32, ParsedH2Message>, ParseError> {
         // Get or create connection state
-        let mut state_ref = self.connections
+        let mut state_ref = self
+            .connections
             .entry(key)
             .or_insert_with(H2ConnectionState::new);
 
@@ -83,10 +90,15 @@ mod tests {
     // Helper to create a minimal HEADERS frame with END_HEADERS and END_STREAM flags
     fn create_headers_frame(stream_id: u32, header_block: &[u8]) -> Vec<u8> {
         let mut frame = vec![
-            0x00, 0x00, header_block.len() as u8, // Length
-            0x01, // Type: HEADERS
-            0x05, // Flags: END_STREAM | END_HEADERS
-            0x00, 0x00, 0x00, stream_id as u8, // Stream ID
+            0x00,
+            0x00,
+            header_block.len() as u8, // Length
+            0x01,                     // Type: HEADERS
+            0x05,                     // Flags: END_STREAM | END_HEADERS
+            0x00,
+            0x00,
+            0x00,
+            stream_id as u8, // Stream ID
         ];
         frame.extend_from_slice(header_block);
         frame
@@ -172,9 +184,9 @@ mod tests {
         let result = cache.parse(key.clone(), &buffer);
         assert!(result.is_ok());
 
-        // Should return multiple messages (one per completed stream)
+        // Should return multiple messages (one per completed stream), keyed by stream_id
         let messages = result.unwrap();
-        assert!(messages.len() >= 1); // At least one message completed
+        assert!(!messages.is_empty()); // At least one message completed
     }
 
     #[test]
@@ -204,5 +216,33 @@ mod tests {
         assert!(result.is_ok() || matches!(result, Err(ParseError::Http2BufferTooSmall)));
         assert!(cache.contains(&(1234, 5678)));
     }
-}
 
+    #[test]
+    fn test_parse_returns_hashmap_keyed_by_stream_id() {
+        let cache = H2SessionCache::new();
+        let key = "conn1".to_string();
+
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+        buffer.extend_from_slice(&create_settings_frame());
+
+        // Stream 1 HEADERS
+        let header_block1 = vec![0x82]; // :method: GET
+        buffer.extend_from_slice(&create_headers_frame(1, &header_block1));
+
+        // Stream 3 HEADERS
+        let header_block2 = vec![0x82]; // :method: GET
+        buffer.extend_from_slice(&create_headers_frame(3, &header_block2));
+
+        let result = cache.parse(key.clone(), &buffer);
+        assert!(result.is_ok());
+
+        let messages = result.unwrap();
+        // Verify messages are keyed by stream_id
+        assert!(messages.contains_key(&1) || messages.contains_key(&3));
+
+        // Verify stream_id matches the key
+        for (stream_id, msg) in &messages {
+            assert_eq!(*stream_id, msg.stream_id);
+        }
+    }
+}

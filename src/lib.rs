@@ -2,12 +2,14 @@
 // Provides connection-level state tracking for HTTP/2 parsing
 
 mod frame;
+mod http_types;
 mod parse;
 mod state;
 
 // Public re-exports for direct state management
 use dashmap::DashMap;
 pub use frame::{is_http2_preface, looks_like_http2_frame, CONNECTION_PREFACE};
+pub use http_types::{HttpRequest, HttpResponse};
 pub use parse::parse_frames_stateful;
 pub use state::{H2ConnectionState, ParseError, ParsedH2Message};
 use std::collections::HashMap;

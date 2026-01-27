@@ -36,8 +36,6 @@ pub struct H2ConnectionState {
 
 /// Per-stream state (internal to crate)
 pub(crate) struct StreamState {
-    pub(crate) stream_id: u32,
-
     /// Accumulated headers (from HEADERS + CONTINUATION)
     pub(crate) headers: Vec<(String, String)>,
 
@@ -149,9 +147,8 @@ impl H2ConnectionState {
 }
 
 impl StreamState {
-    pub(crate) fn new(stream_id: u32, timestamp_ns: u64) -> Self {
+    pub(crate) fn new(_stream_id: u32, timestamp_ns: u64) -> Self {
         Self {
-            stream_id,
             headers: Vec::new(),
             method: None,
             path: None,
@@ -241,6 +238,33 @@ impl ParsedH2Message {
         }
 
         header_map
+    }
+
+    /// Convert this HTTP/2 message to an HttpRequest
+    ///
+    /// Returns None if this is not a valid request (missing :method or :path).
+    /// Uses end_stream_timestamp_ns as the request timestamp (when request was fully sent).
+    pub fn to_http_request(&self) -> Option<crate::HttpRequest> {
+        Some(crate::HttpRequest {
+            method: self.http_method()?,
+            uri: self.http_uri()?,
+            headers: self.http_headers(),
+            body: self.body.clone(),
+            timestamp_ns: self.end_stream_timestamp_ns,
+        })
+    }
+
+    /// Convert this HTTP/2 message to an HttpResponse
+    ///
+    /// Returns None if this is not a valid response (missing :status).
+    /// Uses first_frame_timestamp_ns as the response timestamp (when response started arriving).
+    pub fn to_http_response(&self) -> Option<crate::HttpResponse> {
+        Some(crate::HttpResponse {
+            status: self.http_status()?,
+            headers: self.http_headers(),
+            body: self.body.clone(),
+            timestamp_ns: self.first_frame_timestamp_ns,
+        })
     }
 }
 

@@ -134,10 +134,13 @@ fn handle_headers_frame(
     let stream_id = header.stream_id;
 
     // Create stream if new, recording the timestamp of first frame
-    let stream = state
-        .active_streams
-        .entry(stream_id)
-        .or_insert_with(|| StreamState::new(stream_id, timestamp_ns));
+    // Also track highest stream ID for protocol validation
+    let stream = state.active_streams.entry(stream_id).or_insert_with(|| {
+        if stream_id > state.highest_stream_id {
+            state.highest_stream_id = stream_id;
+        }
+        StreamState::new(stream_id, timestamp_ns)
+    });
 
     // Handle PADDED flag
     // Padded frame format: [Pad Length (1 byte)] [Header Block] [Padding]

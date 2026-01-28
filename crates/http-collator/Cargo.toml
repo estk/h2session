@@ -1,0 +1,9 @@
+[package]
+name = "http-collator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+h2session.workspace = true
+http.workspace = true
+httparse.workspace = true

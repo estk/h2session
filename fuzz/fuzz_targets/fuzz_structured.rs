@@ -6,9 +6,9 @@
 
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
-use arbitrary::{Arbitrary, Unstructured};
+use arbitrary::Arbitrary;
 use h2session::H2SessionCache;
+use libfuzzer_sys::fuzz_target;
 
 /// HTTP/2 connection preface
 const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
@@ -17,12 +17,8 @@ const CONNECTION_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 const FRAME_TYPE_DATA: u8 = 0x00;
 const FRAME_TYPE_HEADERS: u8 = 0x01;
 const FRAME_TYPE_SETTINGS: u8 = 0x04;
-const FRAME_TYPE_WINDOW_UPDATE: u8 = 0x08;
-const FRAME_TYPE_CONTINUATION: u8 = 0x09;
 
 /// Frame flags
-const FLAG_END_STREAM: u8 = 0x01;
-const FLAG_END_HEADERS: u8 = 0x04;
 const FLAG_PADDED: u8 = 0x08;
 const FLAG_PRIORITY: u8 = 0x20;
 

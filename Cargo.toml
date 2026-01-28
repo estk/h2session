@@ -1,21 +1,15 @@
-[package]
-name = "h2session"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = ["crates/h2session", "crates/http-collator"]
+resolver = "2"
 
-[dependencies]
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+
+[workspace.dependencies]
+http = "1"
+httparse = "1"
 loona-hpack = "0.4"
 dashmap = "6.1.0"
-http = "1"
-
-[dev-dependencies]
-h2 = "0.4"
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-bytes = "1"
-http = "1"
-
-[[example]]
-name = "generate_real_traffic"
-path = "examples/generate_real_traffic.rs"
+h2session = { path = "crates/h2session" }
+http-collator = { path = "crates/http-collator" }

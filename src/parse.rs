@@ -9,12 +9,16 @@ use crate::state::{H2ConnectionState, ParseError, ParsedH2Message, StreamState};
 /// indexed by stream_id. State is accumulated across calls for HPACK decoding
 /// and stream tracking.
 /// Returns `Err(ParseError::Http2BufferTooSmall)` if no complete messages yet.
+///
+/// NOTE: This function re-parses the entire buffer from the beginning each call.
+/// For incremental parsing, use `H2ConnectionState::feed()` instead.
 pub fn parse_frames_stateful(
     buffer: &[u8],
     state: &mut H2ConnectionState,
 ) -> Result<HashMap<u32, ParsedH2Message>, ParseError> {
     let mut pos = 0;
     let mut completed_messages = HashMap::new();
+    let timestamp_ns = state.current_timestamp_ns;
 
     // Skip connection preface if not yet seen
     if !state.preface_received && buffer.starts_with(CONNECTION_PREFACE) {
@@ -35,10 +39,10 @@ pub fn parse_frames_stateful(
 
         match header.frame_type {
             FRAME_TYPE_DATA => {
-                handle_data_frame(state, &header, frame_payload)?;
+                handle_data_frame(state, &header, frame_payload, timestamp_ns)?;
             }
             FRAME_TYPE_HEADERS => {
-                handle_headers_frame(state, &header, frame_payload)?;
+                handle_headers_frame(state, &header, frame_payload, timestamp_ns)?;
             }
             FRAME_TYPE_CONTINUATION => {
                 handle_continuation_frame(state, &header, frame_payload)?;
@@ -54,7 +58,7 @@ pub fn parse_frames_stateful(
         pos += frame_total_size;
 
         // Check for completed streams
-        extract_completed_streams(state, &mut completed_messages);
+        extract_completed_streams_to_map(state, &mut completed_messages);
     }
 
     if completed_messages.is_empty() {
@@ -64,18 +68,76 @@ pub fn parse_frames_stateful(
     }
 }
 
+/// Parse the internal buffer incrementally, called by H2ConnectionState::feed()
+pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<(), ParseError> {
+    let mut pos = 0;
+    let timestamp_ns = state.current_timestamp_ns;
+
+    // Skip connection preface if not yet seen
+    if !state.preface_received && state.buffer.starts_with(CONNECTION_PREFACE) {
+        pos += CONNECTION_PREFACE.len();
+        state.preface_received = true;
+    }
+
+    // Parse complete frames from buffer
+    while pos + FRAME_HEADER_SIZE <= state.buffer.len() {
+        let header = match parse_frame_header(&state.buffer[pos..]) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        let frame_total_size = FRAME_HEADER_SIZE + header.length as usize;
+
+        if pos + frame_total_size > state.buffer.len() {
+            break; // Incomplete frame - wait for more data
+        }
+
+        let frame_payload = state.buffer[pos + FRAME_HEADER_SIZE..pos + frame_total_size].to_vec();
+
+        match header.frame_type {
+            FRAME_TYPE_DATA => {
+                handle_data_frame(state, &header, &frame_payload, timestamp_ns)?;
+            }
+            FRAME_TYPE_HEADERS => {
+                handle_headers_frame(state, &header, &frame_payload, timestamp_ns)?;
+            }
+            FRAME_TYPE_CONTINUATION => {
+                handle_continuation_frame(state, &header, &frame_payload)?;
+            }
+            FRAME_TYPE_SETTINGS => {
+                handle_settings_frame(state, &header, &frame_payload)?;
+            }
+            _ => {
+                // Skip other frame types
+            }
+        }
+
+        pos += frame_total_size;
+
+        // Extract completed streams to the internal completed queue
+        extract_completed_streams_to_queue(state);
+    }
+
+    // Remove consumed bytes from buffer, keeping any partial frame data
+    if pos > 0 {
+        state.buffer.drain(..pos);
+    }
+
+    Ok(())
+}
+
 fn handle_headers_frame(
     state: &mut H2ConnectionState,
     header: &FrameHeader,
     payload: &[u8],
+    timestamp_ns: u64,
 ) -> Result<(), ParseError> {
     let stream_id = header.stream_id;
 
-    // Create stream if new
+    // Create stream if new, recording the timestamp of first frame
     let stream = state
         .active_streams
         .entry(stream_id)
-        .or_insert_with(|| StreamState::new(stream_id));
+        .or_insert_with(|| StreamState::new(stream_id, timestamp_ns));
 
     // Handle PADDED flag
     // Padded frame format: [Pad Length (1 byte)] [Header Block] [Padding]
@@ -124,6 +186,7 @@ fn handle_headers_frame(
     // Check END_STREAM flag
     if header.flags & FLAG_END_STREAM != 0 {
         stream.end_stream_seen = true;
+        stream.end_stream_timestamp_ns = timestamp_ns;
     }
 
     Ok(())
@@ -159,6 +222,7 @@ fn handle_data_frame(
     state: &mut H2ConnectionState,
     header: &FrameHeader,
     payload: &[u8],
+    timestamp_ns: u64,
 ) -> Result<(), ParseError> {
     let stream = state
         .active_streams
@@ -185,6 +249,7 @@ fn handle_data_frame(
 
     if header.flags & FLAG_END_STREAM != 0 {
         stream.end_stream_seen = true;
+        stream.end_stream_timestamp_ns = timestamp_ns;
     }
 
     Ok(())
@@ -252,7 +317,8 @@ fn decode_headers_into_stream(
     Ok(())
 }
 
-fn extract_completed_streams(
+/// Extract completed streams to a HashMap (for parse_frames_stateful compatibility)
+fn extract_completed_streams_to_map(
     state: &mut H2ConnectionState,
     completed: &mut HashMap<u32, ParsedH2Message>,
 ) {
@@ -273,8 +339,42 @@ fn extract_completed_streams(
                     stream_id: *stream_id,
                     header_size: stream.header_size,
                     body: stream.body.clone(),
+                    first_frame_timestamp_ns: stream.first_frame_timestamp_ns,
+                    end_stream_timestamp_ns: stream.end_stream_timestamp_ns,
                 },
             );
+            to_remove.push(*stream_id);
+        }
+    }
+
+    for stream_id in to_remove {
+        state.active_streams.remove(&stream_id);
+    }
+}
+
+/// Extract completed streams to the internal completed queue (for incremental API)
+fn extract_completed_streams_to_queue(state: &mut H2ConnectionState) {
+    let mut to_remove = Vec::new();
+
+    for (stream_id, stream) in &state.active_streams {
+        // Stream is complete if: headers decoded AND END_STREAM seen
+        if stream.end_headers_seen && stream.end_stream_seen {
+            state.completed.push_back((
+                *stream_id,
+                ParsedH2Message {
+                    method: stream.method.clone(),
+                    path: stream.path.clone(),
+                    authority: stream.authority.clone(),
+                    scheme: stream.scheme.clone(),
+                    status: stream.status,
+                    headers: stream.headers.clone(),
+                    stream_id: *stream_id,
+                    header_size: stream.header_size,
+                    body: stream.body.clone(),
+                    first_frame_timestamp_ns: stream.first_frame_timestamp_ns,
+                    end_stream_timestamp_ns: stream.end_stream_timestamp_ns,
+                },
+            ));
             to_remove.push(*stream_id);
         }
     }

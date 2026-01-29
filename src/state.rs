@@ -1,10 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 /// Connection-level HTTP/2 state
 ///
 /// Maintains HPACK decoder state and active stream tracking for a single
 /// HTTP/2 connection. Create one instance per direction (request/response)
 /// when parsing bidirectional traffic.
+///
+/// Use `feed()` to incrementally add data with timestamps, and `try_pop()`
+/// to retrieve completed messages.
 pub struct H2ConnectionState {
     /// Persistent HPACK decoder with dynamic table
     pub(crate) decoder: loona_hpack::Decoder<'static>,
@@ -20,6 +23,15 @@ pub struct H2ConnectionState {
 
     /// Highest stream ID seen (for protocol validation)
     pub(crate) highest_stream_id: u32,
+
+    /// Internal buffer for incremental parsing
+    pub(crate) buffer: Vec<u8>,
+
+    /// Completed messages ready to be popped, stored as (stream_id, message)
+    pub(crate) completed: VecDeque<(u32, ParsedH2Message)>,
+
+    /// Current timestamp for frame processing (set by feed())
+    pub(crate) current_timestamp_ns: u64,
 }
 
 /// Per-stream state (internal to crate)
@@ -50,6 +62,12 @@ pub(crate) struct StreamState {
     /// Flags
     pub(crate) end_stream_seen: bool,
     pub(crate) end_headers_seen: bool,
+
+    /// Timestamp when first frame for this stream was received
+    pub(crate) first_frame_timestamp_ns: u64,
+
+    /// Timestamp when END_STREAM was received
+    pub(crate) end_stream_timestamp_ns: u64,
 }
 
 /// HTTP/2 connection settings (internal to crate)
@@ -84,6 +102,9 @@ impl Default for H2ConnectionState {
             settings: H2Settings::default(),
             preface_received: false,
             highest_stream_id: 0,
+            buffer: Vec::new(),
+            completed: VecDeque::new(),
+            current_timestamp_ns: 0,
         }
     }
 }
@@ -92,10 +113,43 @@ impl H2ConnectionState {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Feed new data for incremental parsing with a timestamp.
+    ///
+    /// The timestamp is used to track when frames arrive for latency measurement.
+    /// Call this method as data arrives, then use `try_pop()` to retrieve
+    /// completed messages.
+    ///
+    /// Returns Ok(()) if data was processed (even if no messages completed yet).
+    /// Returns Err only for fatal parse errors.
+    pub fn feed(&mut self, data: &[u8], timestamp_ns: u64) -> Result<(), ParseError> {
+        self.buffer.extend_from_slice(data);
+        self.current_timestamp_ns = timestamp_ns;
+        crate::parse::parse_buffer_incremental(self)
+    }
+
+    /// Pop a completed message if available.
+    ///
+    /// Returns the stream_id and parsed message for a completed HTTP/2 stream.
+    /// Messages are returned in the order they completed.
+    pub fn try_pop(&mut self) -> Option<(u32, ParsedH2Message)> {
+        self.completed.pop_front()
+    }
+
+    /// Check if any completed messages are ready to be popped.
+    pub fn has_completed(&self) -> bool {
+        !self.completed.is_empty()
+    }
+
+    /// Clear the internal buffer (e.g., when connection resets).
+    /// Preserves HPACK decoder state for connection persistence.
+    pub fn clear_buffer(&mut self) {
+        self.buffer.clear();
+    }
 }
 
 impl StreamState {
-    pub(crate) fn new(stream_id: u32) -> Self {
+    pub(crate) fn new(stream_id: u32, timestamp_ns: u64) -> Self {
         Self {
             stream_id,
             headers: Vec::new(),
@@ -109,6 +163,8 @@ impl StreamState {
             header_size: 0,
             end_stream_seen: false,
             end_headers_seen: false,
+            first_frame_timestamp_ns: timestamp_ns,
+            end_stream_timestamp_ns: 0,
         }
     }
 }
@@ -125,6 +181,10 @@ pub struct ParsedH2Message {
     pub stream_id: u32,
     pub header_size: usize,
     pub body: Vec<u8>,
+    /// Timestamp when first frame for this stream was received
+    pub first_frame_timestamp_ns: u64,
+    /// Timestamp when stream completed (END_STREAM received)
+    pub end_stream_timestamp_ns: u64,
 }
 
 impl ParsedH2Message {

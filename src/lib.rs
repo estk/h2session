@@ -37,10 +37,7 @@ impl<K: Hash + Eq + Clone> H2SessionCache<K> {
         buffer: &[u8],
     ) -> Result<HashMap<u32, ParsedH2Message>, ParseError> {
         // Get or create connection state
-        let mut state_ref = self
-            .connections
-            .entry(key)
-            .or_insert_with(H2ConnectionState::new);
+        let mut state_ref = self.connections.entry(key).or_default();
 
         // Parse with state
         parse_frames_stateful(buffer, state_ref.value_mut())

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 loona-hpack = "0.4"
 dashmap = "6.1.0"
+http = "1"
 
 [dev-dependencies]
 h2 = "0.4"

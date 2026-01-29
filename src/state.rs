@@ -76,8 +76,8 @@ impl Default for H2Settings {
     }
 }
 
-impl H2ConnectionState {
-    pub fn new() -> Self {
+impl Default for H2ConnectionState {
+    fn default() -> Self {
         Self {
             decoder: loona_hpack::Decoder::new(),
             active_streams: HashMap::new(),
@@ -85,6 +85,12 @@ impl H2ConnectionState {
             preface_received: false,
             highest_stream_id: 0,
         }
+    }
+}
+
+impl H2ConnectionState {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -130,6 +136,51 @@ impl ParsedH2Message {
     /// Returns true if this message is a response (has :status pseudo-header)
     pub fn is_response(&self) -> bool {
         self.status.is_some()
+    }
+
+    /// Convert :method pseudo-header to http::Method
+    pub fn http_method(&self) -> Option<http::Method> {
+        self.method
+            .as_ref()
+            .and_then(|m| http::Method::from_bytes(m.as_bytes()).ok())
+    }
+
+    /// Convert :path pseudo-header to http::Uri (defaults to "/" if missing)
+    pub fn http_uri(&self) -> Option<http::Uri> {
+        let path = self.path.as_deref().unwrap_or("/");
+        path.parse().ok()
+    }
+
+    /// Convert :status pseudo-header to http::StatusCode
+    pub fn http_status(&self) -> Option<http::StatusCode> {
+        self.status.and_then(|s| http::StatusCode::from_u16(s).ok())
+    }
+
+    /// Convert headers to http::HeaderMap, including :authority as Host header
+    pub fn http_headers(&self) -> http::HeaderMap {
+        let mut header_map = http::HeaderMap::new();
+
+        // Convert :authority to Host header
+        if let Some(authority) = &self.authority {
+            if let Ok(v) = http::HeaderValue::from_str(authority) {
+                header_map.insert(http::header::HOST, v);
+            }
+        }
+
+        // Convert regular headers (skip pseudo-headers)
+        for (name, value) in &self.headers {
+            if name.starts_with(':') {
+                continue;
+            }
+            if let (Ok(n), Ok(v)) = (
+                http::header::HeaderName::from_bytes(name.as_bytes()),
+                http::HeaderValue::from_str(value),
+            ) {
+                header_map.insert(n, v);
+            }
+        }
+
+        header_map
     }
 }
 

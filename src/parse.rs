@@ -17,11 +17,9 @@ pub fn parse_frames_stateful(
     let mut completed_messages = HashMap::new();
 
     // Skip connection preface if not yet seen
-    if !state.preface_received {
-        if buffer.starts_with(CONNECTION_PREFACE) {
-            pos += CONNECTION_PREFACE.len();
-            state.preface_received = true;
-        }
+    if !state.preface_received && buffer.starts_with(CONNECTION_PREFACE) {
+        pos += CONNECTION_PREFACE.len();
+        state.preface_received = true;
     }
 
     // Parse frames

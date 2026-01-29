@@ -58,7 +58,7 @@ pub fn looks_like_http2_frame(buffer: &[u8]) -> bool {
         return false;
     }
 
-    if frame_type == FRAME_TYPE_SETTINGS && stream_id == 0 && length % 6 != 0 {
+    if frame_type == FRAME_TYPE_SETTINGS && stream_id == 0 && !length.is_multiple_of(6) {
         return false;
     }
 

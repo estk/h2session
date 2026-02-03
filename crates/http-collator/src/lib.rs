@@ -34,9 +34,7 @@ pub mod h1;
 mod traits;
 
 pub use connection::{Connection, DataChunk, Protocol};
-pub use exchange::{
-    CollationEvent, CollatorConfig, Exchange, MessageMetadata, ParsedHttpMessage,
-};
+pub use exchange::{CollationEvent, CollatorConfig, Exchange, MessageMetadata, ParsedHttpMessage};
 pub use h1::{HttpRequest, HttpResponse};
 pub use traits::{DataEvent, Direction};
 
@@ -161,7 +159,7 @@ impl<E: DataEvent> Collator<E> {
                         try_parse_http1_request_chunks(conn);
                     }
                     Protocol::Http2 => {
-                        parse_http2_request_chunks(conn);
+                        parse_http2_chunks(conn, direction);
                     }
                     _ => {}
                 }
@@ -180,7 +178,7 @@ impl<E: DataEvent> Collator<E> {
                         try_parse_http1_response_chunks(conn);
                     }
                     Protocol::Http2 => {
-                        parse_http2_response_chunks(conn);
+                        parse_http2_chunks(conn, direction);
                     }
                     _ => {}
                 }
@@ -351,8 +349,7 @@ fn reset_connection_after_exchange(conn: &mut Conn) {
     //             clear chunks but keep remaining pending messages
     conn.request_chunks.clear();
     conn.response_chunks.clear();
-    conn.h2_request_state.clear_buffer();
-    conn.h2_response_state.clear_buffer();
+    conn.h2_state.clear_buffer();
     conn.request_complete = false;
     conn.response_complete = false;
 
@@ -390,43 +387,34 @@ fn detect_protocol(data: &[u8]) -> Protocol {
     Protocol::Unknown
 }
 
-/// Feed the latest request chunk to h2session for incremental parsing.
-/// Uses the new feed() API which maintains internal buffer and parses incrementally.
-fn parse_http2_request_chunks(conn: &mut Conn) {
-    // Get the latest chunk that was just added
-    let chunk = match conn.request_chunks.last() {
+/// Feed chunk to h2session, classify by content after parsing.
+///
+/// Uses a unified H2ConnectionState for both directions, classifying messages
+/// by their pseudo-headers (:method = request, :status = response) rather than
+/// by direction. This allows correct handling of both client-side monitoring
+/// (Write=request, Read=response) and server-side monitoring (Read=request,
+/// Write=response).
+fn parse_http2_chunks(conn: &mut Conn, direction: Direction) {
+    let chunks = match direction {
+        Direction::Write => &conn.request_chunks,
+        Direction::Read => &conn.response_chunks,
+        Direction::Other => return,
+    };
+
+    let chunk = match chunks.last() {
         Some(c) => c,
         None => return,
     };
 
-    // Feed the new data to h2session with its timestamp
+    // Feed the new data to unified h2session state with its timestamp
     // Parse errors are non-fatal, continue
-    let _ = conn.h2_request_state.feed(&chunk.data, chunk.timestamp_ns);
+    let _ = conn.h2_state.feed(&chunk.data, chunk.timestamp_ns);
 
-    // Pop any completed messages and add to pending
-    while let Some((stream_id, msg)) = conn.h2_request_state.try_pop() {
+    // Pop completed messages and classify by content, not direction
+    while let Some((stream_id, msg)) = conn.h2_state.try_pop() {
         if msg.is_request() {
             conn.pending_requests.insert(stream_id, msg);
-        }
-    }
-}
-
-/// Feed the latest response chunk to h2session for incremental parsing.
-/// Uses the new feed() API which maintains internal buffer and parses incrementally.
-fn parse_http2_response_chunks(conn: &mut Conn) {
-    // Get the latest chunk that was just added
-    let chunk = match conn.response_chunks.last() {
-        Some(c) => c,
-        None => return,
-    };
-
-    // Feed the new data to h2session with its timestamp
-    // Parse errors are non-fatal, continue
-    let _ = conn.h2_response_state.feed(&chunk.data, chunk.timestamp_ns);
-
-    // Pop any completed messages and add to pending
-    while let Some((stream_id, msg)) = conn.h2_response_state.try_pop() {
-        if msg.is_response() {
+        } else if msg.is_response() {
             conn.pending_responses.insert(stream_id, msg);
         }
     }
@@ -711,8 +699,8 @@ mod tests {
         block.push(0x82); // :method: GET (static index 2)
         block.push(0x87); // :scheme: https (static index 7)
         block.push(0x84); // :path: / (static index 4)
-                          // :authority literal without indexing (0x00 + name index 1 (from :authority))
-                          // Index 1 is :authority in static table, so use 0x01 for indexed name
+        // :authority literal without indexing (0x00 + name index 1 (from :authority))
+        // Index 1 is :authority in static table, so use 0x01 for indexed name
         block.push(0x01); // Indexed name :authority (index 1)
         block.push(0x0b); // Value length 11
         block.extend_from_slice(b"example.com");
@@ -1107,5 +1095,121 @@ mod tests {
         let event3 = make_event(Direction::Write, 1, 1234, 8080, 3_000_000, b"");
         let events3 = collator.add_event(&event3);
         assert!(events3.is_empty(), "Empty payload should not emit");
+    }
+
+    // =========================================================================
+    // Server-side monitoring (direction inverted from client-side)
+    // =========================================================================
+
+    #[test]
+    fn test_h2_server_side_monitoring() {
+        // Server-side monitoring: Read = request (from client), Write = response (to client)
+        // This is inverted from client-side monitoring where Write = request, Read = response
+        let mut collator: Collator<TestEvent> = Collator::new();
+        let conn_id = 77777u64;
+        let process_id = 3000u32;
+
+        // Server receives request on Read (from client)
+        let mut request = H2_PREFACE.to_vec();
+        request.extend(build_settings_frame());
+        // HEADERS with END_HEADERS | END_STREAM (0x05)
+        let hpack = hpack_get_request();
+        let mut headers = vec![
+            (hpack.len() >> 16) as u8,
+            (hpack.len() >> 8) as u8,
+            hpack.len() as u8,
+            0x01, // HEADERS
+            0x05, // END_HEADERS | END_STREAM
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Stream 1
+        ];
+        headers.extend(&hpack);
+        request.extend(headers);
+
+        // Request arrives on Read direction (server receiving from client)
+        let req_event = make_event(
+            Direction::Read, // Server reads request FROM client
+            conn_id,
+            process_id,
+            443,
+            1_000_000_000,
+            &request,
+        );
+        let events = collator.add_event(&req_event);
+
+        // Should have emitted a request Message event
+        let request_msg = events.iter().find_map(|e| {
+            if let Some((msg, _)) = e.as_message() {
+                if msg.is_request() {
+                    return Some(msg.clone());
+                }
+            }
+            None
+        });
+        assert!(
+            request_msg.is_some(),
+            "Server should see request on Read direction"
+        );
+
+        // Server sends response on Write (to client)
+        let response_hpack = hpack_status_200();
+        let mut response = vec![
+            (response_hpack.len() >> 16) as u8,
+            (response_hpack.len() >> 8) as u8,
+            response_hpack.len() as u8,
+            0x01, // HEADERS
+            0x05, // END_HEADERS | END_STREAM
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Stream 1
+        ];
+        response.extend(&response_hpack);
+
+        // Response sent on Write direction (server writing to client)
+        let resp_event = make_event(
+            Direction::Write, // Server writes response TO client
+            conn_id,
+            process_id,
+            443,
+            1_050_000_000,
+            &response,
+        );
+        let events = collator.add_event(&resp_event);
+
+        // Should have an Exchange event
+        let exchange = events
+            .iter()
+            .find_map(|e| e.as_exchange())
+            .expect("Should produce a complete exchange with inverted directions");
+
+        // Verify the exchange is correct
+        assert_eq!(
+            exchange.request.method,
+            http::Method::GET,
+            "Request method should be GET"
+        );
+        assert_eq!(
+            exchange.response.status,
+            http::StatusCode::OK,
+            "Response status should be 200 OK"
+        );
+
+        // Verify latency is calculated correctly even with inverted directions
+        assert!(
+            exchange.latency_ns > 0,
+            "Latency should be > 0, got {} ns",
+            exchange.latency_ns
+        );
+
+        let expected_latency = 50_000_000u64; // 50ms
+        assert!(
+            exchange.latency_ns >= expected_latency - 1_000_000
+                && exchange.latency_ns <= expected_latency + 1_000_000,
+            "Expected latency ~50ms, got {} ns",
+            exchange.latency_ns
+        );
     }
 }

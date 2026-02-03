@@ -8,7 +8,7 @@ mod state;
 
 // Public re-exports for direct state management
 use dashmap::DashMap;
-pub use frame::{is_http2_preface, looks_like_http2_frame, CONNECTION_PREFACE};
+pub use frame::{CONNECTION_PREFACE, is_http2_preface, looks_like_http2_frame};
 pub use http_types::{HttpRequest, HttpResponse};
 pub use parse::parse_frames_stateful;
 pub use state::{H2ConnectionState, ParseError, ParsedH2Message};

@@ -3,7 +3,7 @@
 use crate::h1::{HttpRequest, HttpResponse};
 use crate::traits::Direction;
 use h2session::{H2ConnectionState, ParsedH2Message};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Protocol detected for a connection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +37,10 @@ pub struct Connection {
     pub(crate) h1_request: Option<HttpRequest>,
     pub(crate) h1_response: Option<HttpResponse>,
 
+    // HTTP/1 emission tracking - have we already emitted Message events for these?
+    pub(crate) h1_request_emitted: bool,
+    pub(crate) h1_response_emitted: bool,
+
     // HTTP/2 state (separate per direction for HPACK persistence)
     pub(crate) h2_request_state: H2ConnectionState,
     pub(crate) h2_response_state: H2ConnectionState,
@@ -44,6 +48,10 @@ pub struct Connection {
     // Completed messages from h2session, keyed by stream_id
     pub(crate) pending_requests: HashMap<u32, ParsedH2Message>,
     pub(crate) pending_responses: HashMap<u32, ParsedH2Message>,
+
+    // HTTP/2 emission tracking - which stream_ids have we emitted Message events for?
+    pub(crate) h2_emitted_requests: HashSet<u32>,
+    pub(crate) h2_emitted_responses: HashSet<u32>,
 }
 
 impl Connection {
@@ -64,10 +72,14 @@ impl Connection {
             response_complete: false,
             h1_request: None,
             h1_response: None,
+            h1_request_emitted: false,
+            h1_response_emitted: false,
             h2_request_state: H2ConnectionState::new(),
             h2_response_state: H2ConnectionState::new(),
             pending_requests: HashMap::new(),
             pending_responses: HashMap::new(),
+            h2_emitted_requests: HashSet::new(),
+            h2_emitted_responses: HashSet::new(),
         }
     }
 }

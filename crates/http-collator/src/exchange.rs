@@ -1,7 +1,143 @@
-//! HTTP exchange (request/response pair)
+//! HTTP exchange (request/response pair) and collation events
 
 use crate::connection::Protocol;
 use crate::h1::{HttpRequest, HttpResponse};
+
+/// Classification of parsed HTTP message
+#[derive(Debug, Clone)]
+pub enum ParsedHttpMessage {
+    Request(HttpRequest),
+    Response(HttpResponse),
+}
+
+impl ParsedHttpMessage {
+    /// Returns true if this is a request
+    pub fn is_request(&self) -> bool {
+        matches!(self, Self::Request(_))
+    }
+
+    /// Returns true if this is a response
+    pub fn is_response(&self) -> bool {
+        matches!(self, Self::Response(_))
+    }
+
+    /// Get the request if this is a request, None otherwise
+    pub fn as_request(&self) -> Option<&HttpRequest> {
+        match self {
+            Self::Request(req) => Some(req),
+            Self::Response(_) => None,
+        }
+    }
+
+    /// Get the response if this is a response, None otherwise
+    pub fn as_response(&self) -> Option<&HttpResponse> {
+        match self {
+            Self::Request(_) => None,
+            Self::Response(resp) => Some(resp),
+        }
+    }
+}
+
+/// Metadata about a parsed message
+#[derive(Debug, Clone)]
+pub struct MessageMetadata {
+    /// Connection identifier (0 if unavailable, falls back to process_id)
+    pub connection_id: u64,
+    /// Process ID for connection tracking
+    pub process_id: u32,
+    /// Timestamp in nanoseconds
+    pub timestamp_ns: u64,
+    /// Stream ID for HTTP/2 (None for HTTP/1)
+    pub stream_id: Option<u32>,
+    /// Remote port (None if unavailable)
+    pub remote_port: Option<u16>,
+    /// Protocol detected for this connection
+    pub protocol: Protocol,
+}
+
+/// Events emitted by the collator
+#[derive(Debug)]
+pub enum CollationEvent {
+    /// Individual message parsed and ready for processing
+    Message {
+        message: ParsedHttpMessage,
+        metadata: MessageMetadata,
+    },
+    /// Complete exchange with latency (request + response matched)
+    Exchange(Exchange),
+}
+
+impl CollationEvent {
+    /// Returns true if this is a Message event
+    pub fn is_message(&self) -> bool {
+        matches!(self, Self::Message { .. })
+    }
+
+    /// Returns true if this is an Exchange event
+    pub fn is_exchange(&self) -> bool {
+        matches!(self, Self::Exchange(_))
+    }
+
+    /// Get the message if this is a Message event
+    pub fn as_message(&self) -> Option<(&ParsedHttpMessage, &MessageMetadata)> {
+        match self {
+            Self::Message { message, metadata } => Some((message, metadata)),
+            Self::Exchange(_) => None,
+        }
+    }
+
+    /// Get the exchange if this is an Exchange event
+    pub fn as_exchange(&self) -> Option<&Exchange> {
+        match self {
+            Self::Message { .. } => None,
+            Self::Exchange(ex) => Some(ex),
+        }
+    }
+}
+
+/// Configuration for what the collator emits
+#[derive(Debug, Clone)]
+pub struct CollatorConfig {
+    /// Emit Message events when individual requests/responses are parsed
+    pub emit_messages: bool,
+    /// Emit Exchange events when request/response pairs complete
+    pub emit_exchanges: bool,
+    /// Maximum buffer size per chunk
+    pub max_buf_size: usize,
+    /// Connection timeout for cleanup in nanoseconds
+    pub timeout_ns: u64,
+}
+
+impl Default for CollatorConfig {
+    fn default() -> Self {
+        Self {
+            emit_messages: true,
+            emit_exchanges: true,
+            max_buf_size: 16384,
+            timeout_ns: 5_000_000_000,
+        }
+    }
+}
+
+impl CollatorConfig {
+    /// Create config that only emits messages (for immediate adjudication)
+    pub fn messages_only() -> Self {
+        Self {
+            emit_messages: true,
+            emit_exchanges: false,
+            ..Default::default()
+        }
+    }
+
+    /// Create config that only emits exchanges (for monitoring/APM)
+    pub fn exchanges_only() -> Self {
+        Self {
+            emit_messages: false,
+            emit_exchanges: true,
+            ..Default::default()
+        }
+    }
+}
 
 /// A complete request/response exchange
 #[derive(Debug)]

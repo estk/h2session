@@ -34,7 +34,9 @@ pub mod h1;
 mod traits;
 
 pub use connection::{Connection, DataChunk, Protocol};
-pub use exchange::Exchange;
+pub use exchange::{
+    CollationEvent, CollatorConfig, Exchange, MessageMetadata, ParsedHttpMessage,
+};
 pub use h1::{HttpRequest, HttpResponse};
 pub use traits::{DataEvent, Direction};
 
@@ -54,10 +56,8 @@ pub struct Collator<E: DataEvent> {
     connections: HashMap<u64, Conn>,
     /// SSL connections tracked by process_id (no conn_id available)
     ssl_connections: HashMap<u32, Conn>,
-    /// Connection timeout in nanoseconds (5 seconds)
-    timeout_ns: u64,
-    /// Maximum buffer size for payloads
-    max_buf_size: usize,
+    /// Configuration for what events to emit
+    config: CollatorConfig,
     /// Phantom data for the event type
     _phantom: PhantomData<E>,
 }
@@ -69,35 +69,46 @@ impl<E: DataEvent> Default for Collator<E> {
 }
 
 impl<E: DataEvent> Collator<E> {
-    /// Create a new collator with default settings
+    /// Create a new collator with default settings (emits both messages and exchanges)
     pub fn new() -> Self {
+        Self::with_config(CollatorConfig::default())
+    }
+
+    /// Create a new collator with custom configuration
+    pub fn with_config(config: CollatorConfig) -> Self {
         Self {
             connections: HashMap::new(),
             ssl_connections: HashMap::new(),
-            timeout_ns: 5_000_000_000, // 5 seconds
-            max_buf_size: MAX_BUF_SIZE,
+            config,
             _phantom: PhantomData,
         }
     }
 
     /// Create a new collator with a custom maximum buffer size
     pub fn with_max_buf_size(max_buf_size: usize) -> Self {
-        Self {
-            connections: HashMap::new(),
-            ssl_connections: HashMap::new(),
-            timeout_ns: 5_000_000_000,
+        Self::with_config(CollatorConfig {
             max_buf_size,
-            _phantom: PhantomData,
-        }
+            ..Default::default()
+        })
     }
 
-    /// Add a data event and potentially return a complete exchange
-    pub fn add_event(&mut self, event: &E) -> Option<Exchange> {
+    /// Get a reference to the current configuration
+    pub fn config(&self) -> &CollatorConfig {
+        &self.config
+    }
+
+    /// Process a data event, returning all resulting collation events
+    ///
+    /// Returns Vec because:
+    /// - HTTP/2 can have multiple streams complete in one buffer
+    /// - A single buffer might contain complete request AND start of next
+    /// - Config might emit both messages AND exchanges
+    pub fn add_event(&mut self, event: &E) -> Vec<CollationEvent> {
         let payload = event.payload();
-        let safe_len = payload.len().min(self.max_buf_size);
+        let safe_len = payload.len().min(self.config.max_buf_size);
 
         if safe_len == 0 {
-            return None;
+            return Vec::new();
         }
 
         let buf = &payload[..safe_len];
@@ -105,7 +116,7 @@ impl<E: DataEvent> Collator<E> {
 
         // Skip non-data events
         if direction == Direction::Other {
-            return None;
+            return Vec::new();
         }
 
         let chunk = DataChunk {
@@ -181,7 +192,7 @@ impl<E: DataEvent> Collator<E> {
             }
             Direction::Other => {
                 // Already handled above
-                return None;
+                return Vec::new();
             }
         }
 
@@ -192,45 +203,172 @@ impl<E: DataEvent> Collator<E> {
             conn.response_complete = true;
         }
 
-        // If both request and response are complete, emit exchange
-        if conn.request_complete && conn.response_complete {
-            let exchange = build_exchange(conn);
+        // Collect events to emit based on config
+        let mut events = Vec::new();
 
-            // Reset connection for next exchange
-            // For HTTP/1: clear everything including parsed messages
-            // For HTTP/2: only the matched pair was removed in build_exchange;
-            //             clear chunks but keep remaining pending messages
-            conn.request_chunks.clear();
-            conn.response_chunks.clear();
-            conn.h2_request_state.clear_buffer();
-            conn.h2_response_state.clear_buffer();
-            conn.request_complete = false;
-            conn.response_complete = false;
-
-            if conn.protocol == Protocol::Http1 {
-                conn.h1_request = None;
-                conn.h1_response = None;
-                conn.protocol = Protocol::Unknown;
-            }
-            // Note: For HTTP/2, don't clear pending_requests/pending_responses
-            //       as they may contain other streams. The matched pair was
-            //       already removed in build_exchange().
-            // Note: Keep h2_*_state HPACK decoder for connection persistence.
-
-            return exchange;
+        // Emit Message events for newly parsed messages
+        if self.config.emit_messages {
+            emit_message_events(conn, conn_id, event.process_id(), &mut events);
         }
 
-        None
+        // Emit Exchange event if both request and response are complete
+        if self.config.emit_exchanges && conn.request_complete && conn.response_complete {
+            if let Some(exchange) = build_exchange(conn) {
+                events.push(CollationEvent::Exchange(exchange));
+            }
+
+            // Reset connection for next exchange
+            reset_connection_after_exchange(conn);
+        }
+
+        events
     }
 
     /// Clean up stale connections
     #[allow(dead_code)]
     pub fn cleanup(&mut self, current_time_ns: u64) {
         self.connections
-            .retain(|_, conn| current_time_ns - conn.last_activity_ns < self.timeout_ns);
+            .retain(|_, conn| current_time_ns - conn.last_activity_ns < self.config.timeout_ns);
         self.ssl_connections
-            .retain(|_, conn| current_time_ns - conn.last_activity_ns < self.timeout_ns);
+            .retain(|_, conn| current_time_ns - conn.last_activity_ns < self.config.timeout_ns);
     }
+
+    /// Remove a connection explicitly (e.g., on connection close)
+    ///
+    /// Call this when a connection is closed to free resources immediately.
+    /// If connection_id is 0, removes based on process_id from SSL connections.
+    pub fn remove_connection(&mut self, connection_id: u64, process_id: u32) {
+        if connection_id != 0 {
+            self.connections.remove(&connection_id);
+        } else {
+            self.ssl_connections.remove(&process_id);
+        }
+    }
+}
+
+/// Emit Message events for any newly parsed messages that haven't been emitted yet
+fn emit_message_events(
+    conn: &mut Conn,
+    conn_id: u64,
+    process_id: u32,
+    events: &mut Vec<CollationEvent>,
+) {
+    match conn.protocol {
+        Protocol::Http1 => {
+            // Emit request if parsed and not yet emitted
+            if let Some(ref req) = conn.h1_request {
+                if !conn.h1_request_emitted {
+                    let metadata = MessageMetadata {
+                        connection_id: conn_id,
+                        process_id,
+                        timestamp_ns: req.timestamp_ns,
+                        stream_id: None,
+                        remote_port: conn.remote_port,
+                        protocol: conn.protocol,
+                    };
+                    events.push(CollationEvent::Message {
+                        message: ParsedHttpMessage::Request(req.clone()),
+                        metadata,
+                    });
+                    conn.h1_request_emitted = true;
+                }
+            }
+
+            // Emit response if parsed and not yet emitted
+            if let Some(ref resp) = conn.h1_response {
+                if !conn.h1_response_emitted {
+                    let metadata = MessageMetadata {
+                        connection_id: conn_id,
+                        process_id,
+                        timestamp_ns: resp.timestamp_ns,
+                        stream_id: None,
+                        remote_port: conn.remote_port,
+                        protocol: conn.protocol,
+                    };
+                    events.push(CollationEvent::Message {
+                        message: ParsedHttpMessage::Response(resp.clone()),
+                        metadata,
+                    });
+                    conn.h1_response_emitted = true;
+                }
+            }
+        }
+        Protocol::Http2 => {
+            // Emit newly parsed HTTP/2 requests
+            for (&stream_id, msg) in &conn.pending_requests {
+                if !conn.h2_emitted_requests.contains(&stream_id) {
+                    if let Some(req) = msg.to_http_request() {
+                        let metadata = MessageMetadata {
+                            connection_id: conn_id,
+                            process_id,
+                            timestamp_ns: msg.end_stream_timestamp_ns,
+                            stream_id: Some(stream_id),
+                            remote_port: conn.remote_port,
+                            protocol: conn.protocol,
+                        };
+                        events.push(CollationEvent::Message {
+                            message: ParsedHttpMessage::Request(req),
+                            metadata,
+                        });
+                    }
+                }
+            }
+            // Mark all current pending requests as emitted
+            conn.h2_emitted_requests
+                .extend(conn.pending_requests.keys().copied());
+
+            // Emit newly parsed HTTP/2 responses
+            for (&stream_id, msg) in &conn.pending_responses {
+                if !conn.h2_emitted_responses.contains(&stream_id) {
+                    if let Some(resp) = msg.to_http_response() {
+                        let metadata = MessageMetadata {
+                            connection_id: conn_id,
+                            process_id,
+                            timestamp_ns: msg.first_frame_timestamp_ns,
+                            stream_id: Some(stream_id),
+                            remote_port: conn.remote_port,
+                            protocol: conn.protocol,
+                        };
+                        events.push(CollationEvent::Message {
+                            message: ParsedHttpMessage::Response(resp),
+                            metadata,
+                        });
+                    }
+                }
+            }
+            // Mark all current pending responses as emitted
+            conn.h2_emitted_responses
+                .extend(conn.pending_responses.keys().copied());
+        }
+        Protocol::Unknown => {}
+    }
+}
+
+/// Reset connection state after emitting an exchange
+fn reset_connection_after_exchange(conn: &mut Conn) {
+    // For HTTP/1: clear everything including parsed messages
+    // For HTTP/2: only the matched pair was removed in build_exchange;
+    //             clear chunks but keep remaining pending messages
+    conn.request_chunks.clear();
+    conn.response_chunks.clear();
+    conn.h2_request_state.clear_buffer();
+    conn.h2_response_state.clear_buffer();
+    conn.request_complete = false;
+    conn.response_complete = false;
+
+    if conn.protocol == Protocol::Http1 {
+        conn.h1_request = None;
+        conn.h1_response = None;
+        conn.h1_request_emitted = false;
+        conn.h1_response_emitted = false;
+        conn.protocol = Protocol::Unknown;
+    }
+    // Note: For HTTP/2, don't clear pending_requests/pending_responses
+    //       as they may contain other streams. The matched pair was
+    //       already removed in build_exchange().
+    // Note: Keep h2_*_state HPACK decoder for connection persistence.
+    // Note: h2_emitted_* sets are cleaned up in build_exchange when
+    //       the stream_id is removed from pending.
 }
 
 fn detect_protocol(data: &[u8]) -> Protocol {
@@ -363,6 +501,10 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
             let sid = find_complete_h2_stream(conn)?;
             let msg_req = conn.pending_requests.remove(&sid)?;
             let msg_resp = conn.pending_responses.remove(&sid)?;
+
+            // Clean up emission tracking for this stream
+            conn.h2_emitted_requests.remove(&sid);
+            conn.h2_emitted_responses.remove(&sid);
 
             // For HTTP/2, use per-stream timestamps from the parsed messages
             // Request complete time: when END_STREAM was seen on request
@@ -701,12 +843,13 @@ mod tests {
             1_050_000_000, // Response received at 1.05 seconds
             &response,
         );
-        let exchange = collator.add_event(&resp_event);
+        let events = collator.add_event(&resp_event);
 
-        // Should have a complete exchange
-        assert!(exchange.is_some(), "Should produce a complete exchange");
-
-        let exchange = exchange.unwrap();
+        // Find the exchange event
+        let exchange = events
+            .iter()
+            .find_map(|e| e.as_exchange())
+            .expect("Should produce a complete exchange");
 
         // Latency should be ~50ms (50_000_000 ns)
         // The per-stream timestamps should give us accurate latency
@@ -785,5 +928,184 @@ mod tests {
             display.contains("Port: 8080"),
             "Should display actual port number"
         );
+    }
+
+    // =========================================================================
+    // CollatorConfig tests
+    // =========================================================================
+
+    #[test]
+    fn test_messages_only_config() {
+        let config = CollatorConfig::messages_only();
+        assert!(config.emit_messages);
+        assert!(!config.emit_exchanges);
+    }
+
+    #[test]
+    fn test_exchanges_only_config() {
+        let config = CollatorConfig::exchanges_only();
+        assert!(!config.emit_messages);
+        assert!(config.emit_exchanges);
+    }
+
+    #[test]
+    fn test_default_config_emits_both() {
+        let config = CollatorConfig::default();
+        assert!(config.emit_messages);
+        assert!(config.emit_exchanges);
+    }
+
+    // =========================================================================
+    // Message emission tests
+    // =========================================================================
+
+    #[test]
+    fn test_http1_emits_request_message() {
+        let mut collator: Collator<TestEvent> =
+            Collator::with_config(CollatorConfig::messages_only());
+
+        let event = make_event(
+            Direction::Write,
+            1,
+            1234,
+            8080,
+            1_000_000,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        );
+
+        let events = collator.add_event(&event);
+
+        // Should emit a Message event for the request
+        assert_eq!(events.len(), 1);
+        let (msg, metadata) = events[0].as_message().expect("Should be a Message event");
+        assert!(msg.is_request());
+        assert_eq!(metadata.protocol, Protocol::Http1);
+        assert_eq!(metadata.connection_id, 1);
+        assert_eq!(metadata.process_id, 1234);
+    }
+
+    #[test]
+    fn test_http1_emits_response_message() {
+        let mut collator: Collator<TestEvent> =
+            Collator::with_config(CollatorConfig::messages_only());
+
+        let event = make_event(
+            Direction::Read,
+            1,
+            1234,
+            8080,
+            1_000_000,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        );
+
+        let events = collator.add_event(&event);
+
+        // Should emit a Message event for the response
+        assert_eq!(events.len(), 1);
+        let (msg, metadata) = events[0].as_message().expect("Should be a Message event");
+        assert!(msg.is_response());
+        assert_eq!(metadata.protocol, Protocol::Http1);
+    }
+
+    #[test]
+    fn test_http1_complete_exchange_emits_both_types() {
+        // With default config, should emit both Message and Exchange events
+        let mut collator: Collator<TestEvent> = Collator::new();
+
+        // Send request
+        let req_event = make_event(
+            Direction::Write,
+            1,
+            1234,
+            8080,
+            1_000_000,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        );
+        let events = collator.add_event(&req_event);
+        assert_eq!(events.len(), 1, "Request should emit 1 Message event");
+        assert!(events[0].is_message());
+
+        // Send response
+        let resp_event = make_event(
+            Direction::Read,
+            1,
+            1234,
+            8080,
+            2_000_000,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        );
+        let events = collator.add_event(&resp_event);
+
+        // Should have response Message + Exchange
+        assert_eq!(events.len(), 2, "Response should emit Message + Exchange");
+        assert!(events.iter().any(|e| e.is_message()));
+        assert!(events.iter().any(|e| e.is_exchange()));
+    }
+
+    #[test]
+    fn test_exchanges_only_skips_message_events() {
+        let mut collator: Collator<TestEvent> =
+            Collator::with_config(CollatorConfig::exchanges_only());
+
+        // Send request
+        let req_event = make_event(
+            Direction::Write,
+            1,
+            1234,
+            8080,
+            1_000_000,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        );
+        let events = collator.add_event(&req_event);
+        assert!(events.is_empty(), "Should not emit Message events");
+
+        // Send response
+        let resp_event = make_event(
+            Direction::Read,
+            1,
+            1234,
+            8080,
+            2_000_000,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+        );
+        let events = collator.add_event(&resp_event);
+
+        // Should only have Exchange, no Message
+        assert_eq!(events.len(), 1);
+        assert!(events[0].is_exchange());
+    }
+
+    #[test]
+    fn test_message_not_emitted_twice() {
+        let mut collator: Collator<TestEvent> =
+            Collator::with_config(CollatorConfig::messages_only());
+
+        // Send request in two chunks
+        let event1 = make_event(
+            Direction::Write,
+            1,
+            1234,
+            8080,
+            1_000_000,
+            b"GET / HTTP/1.1\r\n",
+        );
+        let events1 = collator.add_event(&event1);
+        assert!(events1.is_empty(), "Incomplete request should not emit");
+
+        let event2 = make_event(
+            Direction::Write,
+            1,
+            1234,
+            8080,
+            2_000_000,
+            b"Host: example.com\r\n\r\n",
+        );
+        let events2 = collator.add_event(&event2);
+        assert_eq!(events2.len(), 1, "Complete request should emit once");
+
+        // Another chunk on same connection (no new request data)
+        let event3 = make_event(Direction::Write, 1, 1234, 8080, 3_000_000, b"");
+        let events3 = collator.add_event(&event3);
+        assert!(events3.is_empty(), "Empty payload should not emit");
     }
 }

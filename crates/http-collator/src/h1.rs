@@ -44,10 +44,11 @@ pub fn try_parse_http1_request(data: &[u8], timestamp_ns: u64) -> Option<HttpReq
 
     let mut header_map = HeaderMap::new();
     for h in req.headers.iter() {
-        if let (Ok(name), Ok(value)) = (
+        let parsed = (
             HeaderName::from_bytes(h.name.as_bytes()),
             HeaderValue::from_bytes(h.value),
-        ) {
+        );
+        if let (Ok(name), Ok(value)) = parsed {
             header_map.insert(name, value);
         }
     }
@@ -82,10 +83,11 @@ pub fn try_parse_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpRe
 
     let mut header_map = HeaderMap::new();
     for h in res.headers.iter() {
-        if let (Ok(name), Ok(value)) = (
+        let parsed = (
             HeaderName::from_bytes(h.name.as_bytes()),
             HeaderValue::from_bytes(h.value),
-        ) {
+        );
+        if let (Ok(name), Ok(value)) = parsed {
             header_map.insert(name, value);
         }
     }

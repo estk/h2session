@@ -229,10 +229,11 @@ impl ParsedH2Message {
             if name.starts_with(':') {
                 continue;
             }
-            if let (Ok(n), Ok(v)) = (
+            let parsed = (
                 http::header::HeaderName::from_bytes(name.as_bytes()),
                 http::HeaderValue::from_str(value),
-            ) {
+            );
+            if let (Ok(n), Ok(v)) = parsed {
                 header_map.insert(n, v);
             }
         }

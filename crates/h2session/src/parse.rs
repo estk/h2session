@@ -69,9 +69,16 @@ pub fn parse_frames_stateful(
 }
 
 /// Parse the internal buffer incrementally, called by H2ConnectionState::feed()
+///
+/// Frame-level errors (missing stream for DATA, padding errors) are non-fatal:
+/// the offending frame is skipped and parsing continues. HPACK errors corrupt
+/// the decoder's dynamic table and are fatal — parsing stops immediately.
+/// The buffer is always drained up to the last consumed position regardless
+/// of errors, preventing re-processing of already-consumed frames.
 pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<(), ParseError> {
     let mut pos = 0;
     let timestamp_ns = state.current_timestamp_ns;
+    let mut fatal_error: Option<ParseError> = None;
 
     // Skip connection preface if not yet seen
     if !state.preface_received && state.buffer.starts_with(CONNECTION_PREFACE) {
@@ -93,25 +100,32 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
 
         let frame_payload = state.buffer[pos + FRAME_HEADER_SIZE..pos + frame_total_size].to_vec();
 
-        match header.frame_type {
+        let result = match header.frame_type {
             FRAME_TYPE_DATA => {
-                handle_data_frame(state, &header, &frame_payload, timestamp_ns)?;
+                handle_data_frame(state, &header, &frame_payload, timestamp_ns)
             }
             FRAME_TYPE_HEADERS => {
-                handle_headers_frame(state, &header, &frame_payload, timestamp_ns)?;
+                handle_headers_frame(state, &header, &frame_payload, timestamp_ns)
             }
             FRAME_TYPE_CONTINUATION => {
-                handle_continuation_frame(state, &header, &frame_payload)?;
+                handle_continuation_frame(state, &header, &frame_payload)
             }
-            FRAME_TYPE_SETTINGS => {
-                handle_settings_frame(state, &header, &frame_payload)?;
-            }
-            _ => {
-                // Skip other frame types
-            }
-        }
+            FRAME_TYPE_SETTINGS => handle_settings_frame(state, &header, &frame_payload),
+            _ => Ok(()),
+        };
 
+        // Always advance past the frame so it won't be re-processed
         pos += frame_total_size;
+
+        if let Err(e) = result {
+            // HPACK errors corrupt the decoder's dynamic table — stop parsing
+            if matches!(e, ParseError::Http2HpackError(_)) {
+                fatal_error = Some(e);
+                break;
+            }
+            // Other errors (missing stream, padding) are non-fatal: skip frame
+            continue;
+        }
 
         // Extract completed streams to the internal completed queue
         extract_completed_streams_to_queue(state);
@@ -122,7 +136,10 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
         state.buffer.drain(..pos);
     }
 
-    Ok(())
+    match fatal_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn handle_headers_frame(

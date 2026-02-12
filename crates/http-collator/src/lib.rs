@@ -39,7 +39,7 @@ pub use h1::{HttpRequest, HttpResponse};
 pub use traits::{DataEvent, Direction};
 
 use connection::Connection as Conn;
-use h2session::{is_http2_preface, looks_like_http2_frame};
+use h2session::{is_http2_preface, looks_like_http2_frame, H2ConnectionState};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
@@ -103,13 +103,12 @@ impl<E: DataEvent> Collator<E> {
     /// - Config might emit both messages AND exchanges
     pub fn add_event(&mut self, event: &E) -> Vec<CollationEvent> {
         let payload = event.payload();
-        let safe_len = payload.len().min(self.config.max_buf_size);
 
-        if safe_len == 0 {
+        if payload.is_empty() {
             return Vec::new();
         }
 
-        let buf = &payload[..safe_len];
+        let buf = payload;
         let direction = event.direction();
 
         // Skip non-data events
@@ -349,7 +348,8 @@ fn reset_connection_after_exchange(conn: &mut Conn) {
     //             clear chunks but keep remaining pending messages
     conn.request_chunks.clear();
     conn.response_chunks.clear();
-    conn.h2_state.clear_buffer();
+    conn.h2_write_state.clear_buffer();
+    conn.h2_read_state.clear_buffer();
     conn.request_complete = false;
     conn.response_complete = false;
 
@@ -389,15 +389,46 @@ fn detect_protocol(data: &[u8]) -> Protocol {
 
 /// Feed chunk to h2session, classify by content after parsing.
 ///
-/// Uses a unified H2ConnectionState for both directions, classifying messages
-/// by their pseudo-headers (:method = request, :status = response) rather than
-/// by direction. This allows correct handling of both client-side monitoring
-/// (Write=request, Read=response) and server-side monitoring (Read=request,
-/// Write=response).
+/// Uses separate H2ConnectionState per direction to avoid corrupting frame
+/// boundaries when Read and Write events interleave (e.g., WINDOW_UPDATEs
+/// between DATA frames). Messages are classified by their pseudo-headers
+/// (:method = request, :status = response), supporting both client-side
+/// monitoring (Write=request, Read=response) and server-side monitoring
+/// (Read=request, Write=response).
 fn parse_http2_chunks(conn: &mut Conn, direction: Direction) {
-    let chunks = match direction {
-        Direction::Write => &conn.request_chunks,
-        Direction::Read => &conn.response_chunks,
+    // Check for fd-reuse: a new h2 connection preface on a connection that
+    // already processed one means the kernel reused the file descriptor for
+    // a new TCP connection. We must reset BOTH directions' parsers since the
+    // new connection has fresh HPACK context on both sides.
+    let last_chunk_is_preface = match direction {
+        Direction::Write => conn
+            .request_chunks
+            .last()
+            .map_or(false, |c| is_http2_preface(&c.data)),
+        Direction::Read => conn
+            .response_chunks
+            .last()
+            .map_or(false, |c| is_http2_preface(&c.data)),
+        Direction::Other => false,
+    };
+    let current_state_has_preface = match direction {
+        Direction::Write => conn.h2_write_state.preface_received,
+        Direction::Read => conn.h2_read_state.preface_received,
+        Direction::Other => false,
+    };
+
+    if last_chunk_is_preface && current_state_has_preface {
+        conn.h2_write_state = H2ConnectionState::new();
+        conn.h2_read_state = H2ConnectionState::new();
+        conn.pending_requests.clear();
+        conn.pending_responses.clear();
+        conn.h2_emitted_requests.clear();
+        conn.h2_emitted_responses.clear();
+    }
+
+    let (chunks, h2_state) = match direction {
+        Direction::Write => (&conn.request_chunks, &mut conn.h2_write_state),
+        Direction::Read => (&conn.response_chunks, &mut conn.h2_read_state),
         Direction::Other => return,
     };
 
@@ -406,12 +437,11 @@ fn parse_http2_chunks(conn: &mut Conn, direction: Direction) {
         None => return,
     };
 
-    // Feed the new data to unified h2session state with its timestamp
-    // Parse errors are non-fatal, continue
-    let _ = conn.h2_state.feed(&chunk.data, chunk.timestamp_ns);
+    // Feed to direction-specific h2 parser; errors are non-fatal
+    let _ = h2_state.feed(&chunk.data, chunk.timestamp_ns);
 
     // Pop completed messages and classify by content, not direction
-    while let Some((stream_id, msg)) = conn.h2_state.try_pop() {
+    while let Some((stream_id, msg)) = h2_state.try_pop() {
         if msg.is_request() {
             conn.pending_requests.insert(stream_id, msg);
         } else if msg.is_response() {
@@ -767,6 +797,364 @@ mod tests {
             request.body, b"helloworld",
             "Body should not be duplicated when parsing incrementally"
         );
+    }
+
+    // =========================================================================
+    // Large payload: body exceeding max_buf_size should still be captured
+    // =========================================================================
+
+    #[test]
+    fn test_h2_large_payload_exceeding_max_buf_size() {
+        let mut collator: Collator<TestEvent> = Collator::new();
+        let conn_id = 54321u64;
+        let process_id = 4000u32;
+
+        // Build a single buffer containing: preface + settings + headers + 32KB DATA
+        let body = vec![0x41u8; 32768]; // 32KB of 'A'
+        let mut payload = H2_PREFACE.to_vec();
+        payload.extend(build_settings_frame());
+        payload.extend(build_headers_frame(1, &hpack_get_request()));
+        payload.extend(build_data_frame(1, &body, true)); // END_STREAM
+
+        // The total payload is ~32KB+ which exceeds MAX_BUF_SIZE (16384).
+        // The collator must not truncate this, or the h2 parser will see
+        // an incomplete DATA frame and fail to finalize the request.
+        assert!(
+            payload.len() > MAX_BUF_SIZE,
+            "Test payload ({} bytes) must exceed MAX_BUF_SIZE ({MAX_BUF_SIZE})",
+            payload.len()
+        );
+
+        let event = make_event(
+            Direction::Write,
+            conn_id,
+            process_id,
+            8080,
+            1_000_000,
+            &payload,
+        );
+        let events = collator.add_event(&event);
+
+        // Should have emitted a request Message with the full 32KB body
+        let request_msg = events.iter().find_map(|e| {
+            if let Some((msg, _)) = e.as_message() {
+                if msg.is_request() {
+                    return Some(msg.clone());
+                }
+            }
+            None
+        });
+
+        let request = request_msg.expect("Large payload request should be parsed and emitted");
+        match request {
+            ParsedHttpMessage::Request(req) => {
+                assert_eq!(
+                    req.body.len(),
+                    32768,
+                    "Body should be 32KB, got {} bytes",
+                    req.body.len()
+                );
+                assert!(
+                    req.body.iter().all(|&b| b == 0x41),
+                    "Body content should be all 'A' bytes"
+                );
+            }
+            _ => panic!("Expected a request message"),
+        }
+    }
+
+    // =========================================================================
+    // FD reuse: same connection_id with a new h2 preface after GOAWAY
+    // =========================================================================
+
+    #[test]
+    fn test_h2_fd_reuse_resets_parser_on_new_preface() {
+        let mut collator: Collator<TestEvent> = Collator::new();
+        let conn_id = 88888u64;
+        let process_id = 5000u32;
+
+        // --- First exchange on this connection_id ---
+        // Request: preface + settings + headers(END_STREAM)
+        let hpack = hpack_get_request();
+        let mut req1 = H2_PREFACE.to_vec();
+        req1.extend(build_settings_frame());
+        let mut headers = vec![
+            (hpack.len() >> 16) as u8,
+            (hpack.len() >> 8) as u8,
+            hpack.len() as u8,
+            0x01, // HEADERS
+            0x05, // END_HEADERS | END_STREAM
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Stream 1
+        ];
+        headers.extend(&hpack);
+        req1.extend(headers);
+
+        let req1_event =
+            make_event(Direction::Read, conn_id, process_id, 80, 1_000_000, &req1);
+        let _ = collator.add_event(&req1_event);
+
+        // Response: HEADERS with :status 200 (END_STREAM)
+        let resp_hpack = hpack_status_200();
+        let mut resp1 = vec![
+            (resp_hpack.len() >> 16) as u8,
+            (resp_hpack.len() >> 8) as u8,
+            resp_hpack.len() as u8,
+            0x01,
+            0x05,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+        ];
+        resp1.extend(&resp_hpack);
+
+        let resp1_event = make_event(
+            Direction::Write,
+            conn_id,
+            process_id,
+            80,
+            2_000_000,
+            &resp1,
+        );
+        let events1 = collator.add_event(&resp1_event);
+        assert!(
+            events1.iter().any(|e| e.is_exchange()),
+            "First exchange should complete"
+        );
+
+        // --- Second exchange: same conn_id, new h2 preface (fd reused) ---
+        // Build a large request: preface + settings + headers + 32KB DATA
+        let body = vec![0x42u8; 32768]; // 32KB of 'B'
+        let mut req2 = H2_PREFACE.to_vec();
+        req2.extend(build_settings_frame());
+        req2.extend(build_headers_frame(1, &hpack_get_request()));
+        req2.extend(build_data_frame(1, &body, true));
+
+        let req2_event = make_event(
+            Direction::Read,
+            conn_id,
+            process_id,
+            80,
+            3_000_000,
+            &req2,
+        );
+        let events2 = collator.add_event(&req2_event);
+
+        // Should have emitted a request Message for the second connection
+        let request_msg = events2.iter().find_map(|e| {
+            if let Some((msg, _)) = e.as_message() {
+                if msg.is_request() {
+                    return Some(msg.clone());
+                }
+            }
+            None
+        });
+        let request = request_msg.expect(
+            "Second h2 connection on reused fd should parse successfully",
+        );
+        match request {
+            ParsedHttpMessage::Request(req) => {
+                assert_eq!(
+                    req.body.len(),
+                    32768,
+                    "Body should be 32KB, got {} bytes",
+                    req.body.len()
+                );
+            }
+            _ => panic!("Expected a request message"),
+        }
+    }
+
+    // =========================================================================
+    // FD reuse: body split across many chunks (mirrors real e2e data flow)
+    // =========================================================================
+
+    #[test]
+    fn test_h2_fd_reuse_split_chunks_with_response() {
+        let mut collator: Collator<TestEvent> = Collator::new();
+        let conn_id = 88889u64;
+        let process_id = 5001u32;
+
+        // --- First exchange: small GET on stream 1 (server-side monitoring) ---
+        // Read = client→server (request), Write = server→client (response)
+        let hpack = hpack_get_request();
+        let mut req1 = H2_PREFACE.to_vec();
+        req1.extend(build_settings_frame());
+        let mut headers = vec![
+            (hpack.len() >> 16) as u8,
+            (hpack.len() >> 8) as u8,
+            hpack.len() as u8,
+            0x01, // HEADERS
+            0x05, // END_HEADERS | END_STREAM
+            0x00,
+            0x00,
+            0x00,
+            0x01, // Stream 1
+        ];
+        headers.extend(&hpack);
+        req1.extend(headers);
+
+        let req1_event =
+            make_event(Direction::Read, conn_id, process_id, 80, 1_000_000, &req1);
+        let _ = collator.add_event(&req1_event);
+
+        // Response on Write direction
+        let resp_hpack = hpack_status_200();
+        let mut resp1 = vec![
+            (resp_hpack.len() >> 16) as u8,
+            (resp_hpack.len() >> 8) as u8,
+            resp_hpack.len() as u8,
+            0x01,
+            0x05,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+        ];
+        resp1.extend(&resp_hpack);
+
+        let resp1_event = make_event(
+            Direction::Write,
+            conn_id,
+            process_id,
+            80,
+            2_000_000,
+            &resp1,
+        );
+        let events1 = collator.add_event(&resp1_event);
+        assert!(
+            events1.iter().any(|e| e.is_exchange()),
+            "First exchange should complete"
+        );
+
+        // --- GOAWAY on Read direction (server sends to client) ---
+        // GOAWAY: type=0x07, flags=0, stream_id=0, payload: last_stream_id(4) + error_code(4)
+        let goaway = vec![
+            0x00, 0x00, 0x08, // length = 8
+            0x07, // type = GOAWAY
+            0x00, // flags
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            0x00, 0x00, 0x00, 0x01, // last_stream_id = 1
+            0x00, 0x00, 0x00, 0x00, // error_code = NO_ERROR
+        ];
+        let goaway_event = make_event(
+            Direction::Read,
+            conn_id,
+            process_id,
+            80,
+            2_500_000,
+            &goaway,
+        );
+        let _ = collator.add_event(&goaway_event);
+
+        // --- Second exchange: same conn_id (fd reused), large POST body ---
+        // Build the full request data, then split it into realistic chunks
+        let body = vec![0x42u8; 32768]; // 32KB of 'B'
+
+        // Use a POST request HPACK block
+        let mut post_hpack = Vec::new();
+        post_hpack.push(0x83); // :method: POST (static index 3)
+        post_hpack.push(0x87); // :scheme: https (static index 7)
+        post_hpack.push(0x84); // :path: / (static index 4)
+        post_hpack.push(0x01); // :authority indexed name
+        post_hpack.push(0x0b); // value length 11
+        post_hpack.extend_from_slice(b"example.com");
+
+        let mut full_request = H2_PREFACE.to_vec();
+        full_request.extend(build_settings_frame());
+        full_request.extend(build_headers_frame(1, &post_hpack));
+        // Split body into 2 DATA frames (max_frame_size=16384 default)
+        full_request.extend(build_data_frame(1, &body[..16384], false));
+        full_request.extend(build_data_frame(1, &body[16384..], true));
+
+        // Split the full request into chunks that mimic kernel read() splits:
+        // chunk 1: preface + settings + headers + start of first DATA frame
+        // chunk 2-N: remaining data in small pieces
+        let split_points = [
+            200,   // preface + settings + headers + partial DATA header
+            2000,  // more DATA payload
+            8000,  // more DATA payload
+            16400, // crosses first DATA frame boundary
+            20000, // middle of second DATA frame
+            32000, // near end
+        ];
+
+        let mut prev = 0;
+        let mut ts = 3_000_000u64;
+        for &split in &split_points {
+            let end = split.min(full_request.len());
+            if prev >= full_request.len() {
+                break;
+            }
+            let chunk = &full_request[prev..end];
+            let event = make_event(Direction::Read, conn_id, process_id, 80, ts, chunk);
+            let _ = collator.add_event(&event);
+            prev = end;
+            ts += 100_000;
+        }
+        // Send remaining data
+        if prev < full_request.len() {
+            let chunk = &full_request[prev..];
+            let event = make_event(Direction::Read, conn_id, process_id, 80, ts, chunk);
+            let _ = collator.add_event(&event);
+            ts += 100_000;
+        }
+
+        // Verify the request was parsed
+        let conn = collator.connections.get(&conn_id).unwrap();
+        assert!(
+            conn.pending_requests.contains_key(&1),
+            "Second exchange request should be in pending_requests"
+        );
+        let req = conn.pending_requests.get(&1).unwrap();
+        assert_eq!(
+            req.body.len(),
+            32768,
+            "Body should be 32KB, got {} bytes",
+            req.body.len()
+        );
+
+        // Now send response on Write direction (fresh HPACK context)
+        let resp2_hpack = hpack_status_200();
+        let mut resp2 = vec![
+            (resp2_hpack.len() >> 16) as u8,
+            (resp2_hpack.len() >> 8) as u8,
+            resp2_hpack.len() as u8,
+            0x01,
+            0x05,
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+        ];
+        resp2.extend(&resp2_hpack);
+
+        let resp2_event = make_event(
+            Direction::Write,
+            conn_id,
+            process_id,
+            80,
+            ts,
+            &resp2,
+        );
+        let events2 = collator.add_event(&resp2_event);
+
+        // Should produce a complete exchange
+        let exchange = events2
+            .iter()
+            .find_map(|e| e.as_exchange())
+            .expect("Second exchange should complete after fd-reuse with split chunks");
+
+        assert_eq!(exchange.request.method, http::Method::POST);
+        assert_eq!(
+            exchange.request.body.len(),
+            32768,
+            "Exchange body should be 32KB"
+        );
+        assert_eq!(exchange.response.status, http::StatusCode::OK);
     }
 
     // =========================================================================

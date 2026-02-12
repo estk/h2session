@@ -19,7 +19,7 @@ pub struct H2ConnectionState {
     pub(crate) settings: H2Settings,
 
     /// Whether the connection preface has been seen
-    pub(crate) preface_received: bool,
+    pub preface_received: bool,
 
     /// Highest stream ID seen (for protocol validation)
     pub(crate) highest_stream_id: u32,

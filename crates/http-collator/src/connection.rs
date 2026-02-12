@@ -41,8 +41,10 @@ pub struct Connection {
     pub(crate) h1_request_emitted: bool,
     pub(crate) h1_response_emitted: bool,
 
-    // HTTP/2 state (unified for content-based classification)
-    pub(crate) h2_state: H2ConnectionState,
+    // HTTP/2 state: separate parsers per direction to avoid corrupting
+    // frame boundaries when Read and Write events interleave.
+    pub(crate) h2_write_state: H2ConnectionState,
+    pub(crate) h2_read_state: H2ConnectionState,
 
     // Completed messages from h2session, keyed by stream_id
     pub(crate) pending_requests: HashMap<u32, ParsedH2Message>,
@@ -73,7 +75,8 @@ impl Connection {
             h1_response: None,
             h1_request_emitted: false,
             h1_response_emitted: false,
-            h2_state: H2ConnectionState::new(),
+            h2_write_state: H2ConnectionState::new(),
+            h2_read_state: H2ConnectionState::new(),
             pending_requests: HashMap::new(),
             pending_responses: HashMap::new(),
             h2_emitted_requests: HashSet::new(),

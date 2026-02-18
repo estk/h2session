@@ -1,5 +1,7 @@
 //! Connection state tracking for HTTP collation
 
+use bytes::Bytes;
+
 use crate::h1::{HttpRequest, HttpResponse};
 use crate::traits::Direction;
 use h2session::{H2ConnectionState, ParsedH2Message};
@@ -16,7 +18,7 @@ pub enum Protocol {
 /// A chunk of data received from a data source
 #[derive(Debug, Clone)]
 pub struct DataChunk {
-    pub data: Vec<u8>,
+    pub data: Bytes,
     pub timestamp_ns: u64,
     pub direction: Direction,
 }

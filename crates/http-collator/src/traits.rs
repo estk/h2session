@@ -3,6 +3,8 @@
 //! These traits allow the collator to work with any data source that provides
 //! the necessary information about network traffic direction and payload.
 
+use bytes::Bytes;
+
 /// Direction of data flow for a network event.
 ///
 /// `Read` and `Write` correspond to the socket operation (recv/send) observed
@@ -43,4 +45,16 @@ pub trait DataEvent {
 
     /// Remote port (0 if unknown)
     fn remote_port(&self) -> u16;
+
+    /// Consume self and return the payload as `Bytes`.
+    ///
+    /// The default implementation copies via `payload().to_vec()`. Implementors
+    /// that already own a `Bytes` (or `Vec<u8>`) should override this to avoid
+    /// the copy.
+    fn into_payload(self) -> Bytes
+    where
+        Self: Sized,
+    {
+        Bytes::from(self.payload().to_vec())
+    }
 }

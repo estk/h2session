@@ -23,7 +23,7 @@
 //! }
 //!
 //! let mut collator = Collator::new();
-//! if let Some(exchange) = collator.add_event(&my_event) {
+//! if let Some(exchange) = collator.add_event(my_event) {
 //!     println!("Complete exchange: {}", exchange);
 //! }
 //! ```
@@ -39,8 +39,8 @@ pub use h1::{HttpRequest, HttpResponse};
 pub use traits::{DataEvent, Direction};
 
 use connection::Connection as Conn;
+use dashmap::DashMap;
 use h2session::{H2ConnectionState, is_http2_preface, looks_like_http2_frame};
-use std::collections::HashMap;
 use std::marker::PhantomData;
 
 /// Default maximum buffer size for data events (TLS record size)
@@ -49,11 +49,13 @@ pub const MAX_BUF_SIZE: usize = 16384;
 /// Collates individual data events into complete request/response exchanges.
 ///
 /// Generic over the event type `E` which must implement [`DataEvent`].
+/// Uses per-connection locking via `DashMap` so concurrent HTTP/2 connections
+/// do not serialize through a single mutex.
 pub struct Collator<E: DataEvent> {
     /// Connections tracked by conn_id (for socket events)
-    connections: HashMap<u64, Conn>,
+    connections: DashMap<u64, Conn>,
     /// SSL connections tracked by process_id (no conn_id available)
-    ssl_connections: HashMap<u32, Conn>,
+    ssl_connections: DashMap<u32, Conn>,
     /// Configuration for what events to emit
     config: CollatorConfig,
     /// Phantom data for the event type
@@ -75,8 +77,8 @@ impl<E: DataEvent> Collator<E> {
     /// Create a new collator with custom configuration
     pub fn with_config(config: CollatorConfig) -> Self {
         Self {
-            connections: HashMap::new(),
-            ssl_connections: HashMap::new(),
+            connections: DashMap::new(),
+            ssl_connections: DashMap::new(),
             config,
             _phantom: PhantomData,
         }
@@ -95,49 +97,93 @@ impl<E: DataEvent> Collator<E> {
         &self.config
     }
 
-    /// Process a data event, returning all resulting collation events
+    /// Process a data event, returning all resulting collation events.
+    ///
+    /// Takes ownership of the event to enable zero-copy transfer of the
+    /// payload into `DataChunk` via `into_payload()`.
     ///
     /// Returns Vec because:
     /// - HTTP/2 can have multiple streams complete in one buffer
     /// - A single buffer might contain complete request AND start of next
     /// - Config might emit both messages AND exchanges
-    pub fn add_event(&mut self, event: &E) -> Vec<CollationEvent> {
-        let payload = event.payload();
+    pub fn add_event(&self, event: E) -> Vec<CollationEvent> {
+        // Extract all scalar metadata before consuming the event
+        let direction = event.direction();
+        let timestamp_ns = event.timestamp_ns();
+        let conn_id = event.connection_id();
+        let process_id = event.process_id();
+        let remote_port = event.remote_port();
+        let is_empty = event.payload().is_empty();
 
-        if payload.is_empty() {
+        if is_empty {
             return Vec::new();
         }
-
-        let buf = payload;
-        let direction = event.direction();
 
         // Skip non-data events
         if direction == Direction::Other {
             return Vec::new();
         }
 
+        // Move payload ownership via into_payload() — avoids cloning for
+        // implementors that already hold a Bytes or Vec<u8>.
+        let data = event.into_payload();
+
         let chunk = DataChunk {
-            data: buf.to_vec(),
-            timestamp_ns: event.timestamp_ns(),
+            data,
+            timestamp_ns,
             direction,
         };
 
-        // Use conn_id for socket events, process_id for SSL events
-        let conn_id = event.connection_id();
-        let conn = if conn_id != 0 {
-            self.connections
+        // DashMap entry() locks only the shard for this connection, allowing
+        // concurrent access to other connections.
+        if conn_id != 0 {
+            let mut conn = self
+                .connections
                 .entry(conn_id)
-                .or_insert_with(|| Conn::new(event.process_id(), event.remote_port()))
+                .or_insert_with(|| Conn::new(process_id, remote_port));
+            Self::process_event_for_conn(
+                &mut conn,
+                chunk,
+                direction,
+                timestamp_ns,
+                remote_port,
+                conn_id,
+                process_id,
+                &self.config,
+            )
         } else {
-            self.ssl_connections
-                .entry(event.process_id())
-                .or_insert_with(|| Conn::new(event.process_id(), event.remote_port()))
-        };
+            let mut conn = self
+                .ssl_connections
+                .entry(process_id)
+                .or_insert_with(|| Conn::new(process_id, remote_port));
+            Self::process_event_for_conn(
+                &mut conn,
+                chunk,
+                direction,
+                timestamp_ns,
+                remote_port,
+                conn_id,
+                process_id,
+                &self.config,
+            )
+        }
+    }
 
-        conn.last_activity_ns = event.timestamp_ns();
+    /// Core event processing logic, called with a mutable reference to the
+    /// connection (obtained from a `DashMap` entry guard).
+    fn process_event_for_conn(
+        conn: &mut Conn,
+        chunk: DataChunk,
+        direction: Direction,
+        timestamp_ns: u64,
+        remote_port: u16,
+        conn_id: u64,
+        process_id: u32,
+        config: &CollatorConfig,
+    ) -> Vec<CollationEvent> {
+        let buf: &[u8] = &chunk.data;
 
-        // Update port if we have a non-zero value (SSL events have 0)
-        let remote_port = event.remote_port();
+        conn.last_activity_ns = timestamp_ns;
         if remote_port != 0 && conn.remote_port.is_none() {
             conn.remote_port = Some(remote_port);
         }
@@ -148,8 +194,6 @@ impl<E: DataEvent> Collator<E> {
         }
 
         // Detect protocol change on an established connection (FD reuse).
-        // If the connection has a known protocol but incoming data suggests a
-        // different one, reset the connection and start fresh.
         if conn.protocol != Protocol::Unknown {
             let incoming_protocol = detect_protocol(buf);
             if incoming_protocol != Protocol::Unknown && incoming_protocol != conn.protocol {
@@ -160,20 +204,17 @@ impl<E: DataEvent> Collator<E> {
         // Add chunk to appropriate buffer based on direction
         match direction {
             Direction::Write => {
-                // Track accumulated body size and enforce limit
                 conn.request_body_size += buf.len();
-                if conn.request_body_size > self.config.max_body_size {
+                if conn.request_body_size > config.max_body_size {
                     reset_connection_body_limit(conn);
                     return Vec::new();
                 }
 
-                // Append to HTTP/1 growable buffer (avoids O(n²) reconstruction)
                 if conn.protocol == Protocol::Http1 {
                     conn.h1_request_buffer.extend_from_slice(buf);
                 }
                 conn.request_chunks.push(chunk);
 
-                // Parse incrementally based on protocol
                 match conn.protocol {
                     Protocol::Http1 if conn.h1_request.is_none() => {
                         try_parse_http1_request_chunks(conn);
@@ -184,26 +225,22 @@ impl<E: DataEvent> Collator<E> {
                     _ => {}
                 }
 
-                // Check if request is complete
                 if is_request_complete(conn) {
                     conn.request_complete = true;
                 }
             }
             Direction::Read => {
-                // Track accumulated body size and enforce limit
                 conn.response_body_size += buf.len();
-                if conn.response_body_size > self.config.max_body_size {
+                if conn.response_body_size > config.max_body_size {
                     reset_connection_body_limit(conn);
                     return Vec::new();
                 }
 
-                // Append to HTTP/1 growable buffer (avoids O(n²) reconstruction)
                 if conn.protocol == Protocol::Http1 {
                     conn.h1_response_buffer.extend_from_slice(buf);
                 }
                 conn.response_chunks.push(chunk);
 
-                // Parse incrementally based on protocol
                 match conn.protocol {
                     Protocol::Http1 if conn.h1_response.is_none() => {
                         try_parse_http1_response_chunks(conn);
@@ -214,39 +251,31 @@ impl<E: DataEvent> Collator<E> {
                     _ => {}
                 }
 
-                // Check if response is complete
                 if is_response_complete(conn) {
                     conn.response_complete = true;
                 }
             }
             Direction::Other => {
-                // Already handled above
                 return Vec::new();
             }
         }
 
         // For HTTP/2, a complete stream pair can be detected on either event.
-        // Ensure both flags are set when a complete pair exists.
         if conn.protocol == Protocol::Http2 && find_complete_h2_stream(conn).is_some() {
             conn.request_complete = true;
             conn.response_complete = true;
         }
 
-        // Collect events to emit based on config
         let mut events = Vec::new();
 
-        // Emit Message events for newly parsed messages
-        if self.config.emit_messages {
-            emit_message_events(conn, conn_id, event.process_id(), &mut events);
+        if config.emit_messages {
+            emit_message_events(conn, conn_id, process_id, &mut events);
         }
 
-        // Emit Exchange event if both request and response are complete
-        if self.config.emit_exchanges && conn.request_complete && conn.response_complete {
+        if config.emit_exchanges && conn.request_complete && conn.response_complete {
             if let Some(exchange) = build_exchange(conn) {
                 events.push(CollationEvent::Exchange(exchange));
             }
-
-            // Reset connection for next exchange
             reset_connection_after_exchange(conn);
         }
 
@@ -257,20 +286,20 @@ impl<E: DataEvent> Collator<E> {
     ///
     /// Callers should invoke this periodically to bound memory usage from
     /// abandoned connections and incomplete HTTP/2 streams.
-    pub fn cleanup(&mut self, current_time_ns: u64) {
+    pub fn cleanup(&self, current_time_ns: u64) {
         self.connections
             .retain(|_, conn| current_time_ns - conn.last_activity_ns < self.config.timeout_ns);
         self.ssl_connections
             .retain(|_, conn| current_time_ns - conn.last_activity_ns < self.config.timeout_ns);
 
         // Evict stale H2 streams within surviving connections
-        for conn in self.connections.values_mut() {
-            conn.h2_write_state.evict_stale_streams(current_time_ns);
-            conn.h2_read_state.evict_stale_streams(current_time_ns);
+        for mut entry in self.connections.iter_mut() {
+            entry.h2_write_state.evict_stale_streams(current_time_ns);
+            entry.h2_read_state.evict_stale_streams(current_time_ns);
         }
-        for conn in self.ssl_connections.values_mut() {
-            conn.h2_write_state.evict_stale_streams(current_time_ns);
-            conn.h2_read_state.evict_stale_streams(current_time_ns);
+        for mut entry in self.ssl_connections.iter_mut() {
+            entry.h2_write_state.evict_stale_streams(current_time_ns);
+            entry.h2_read_state.evict_stale_streams(current_time_ns);
         }
     }
 
@@ -278,7 +307,7 @@ impl<E: DataEvent> Collator<E> {
     ///
     /// Call this when a connection is closed to free resources immediately.
     /// If connection_id is 0, removes based on process_id from SSL connections.
-    pub fn remove_connection(&mut self, connection_id: u64, process_id: u32) {
+    pub fn remove_connection(&self, connection_id: u64, process_id: u32) {
         if connection_id != 0 {
             self.connections.remove(&connection_id);
         } else {
@@ -470,7 +499,7 @@ fn reset_connection_for_protocol_change(conn: &mut Conn, new_protocol: Protocol)
     conn.protocol = new_protocol;
 }
 
-fn detect_protocol(data: &[u8]) -> Protocol {
+pub fn detect_protocol(data: &[u8]) -> Protocol {
     // Check for HTTP/2 preface
     if is_http2_preface(data) {
         return Protocol::Http2;
@@ -725,7 +754,7 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
         );
 
-        let _ = collator.add_event(&event);
+        let _ = collator.add_event(event);
 
         // Verify the connection was created with None for remote_port
         let conn = collator.ssl_connections.get(&1234).unwrap();
@@ -746,7 +775,7 @@ mod tests {
             b"GET / HTTP/1.1\r\n",
         );
 
-        let _ = collator.add_event(&event1);
+        let _ = collator.add_event(event1);
         assert_eq!(
             collator.ssl_connections.get(&1234).unwrap().remote_port,
             None
@@ -762,7 +791,7 @@ mod tests {
             b"Host: example.com\r\n\r\n",
         );
 
-        let _ = collator.add_event(&event2);
+        let _ = collator.add_event(event2);
 
         // Port should now be updated
         assert_eq!(
@@ -860,7 +889,7 @@ mod tests {
             1_000_000,
             &request_chunk1,
         );
-        let _ = collator.add_event(&event1);
+        let _ = collator.add_event(event1);
 
         // Second chunk: DATA frame with body "hello"
         let data_frame1 = build_data_frame(1, b"hello", false);
@@ -872,7 +901,7 @@ mod tests {
             2_000_000,
             &data_frame1,
         );
-        let _ = collator.add_event(&event2);
+        let _ = collator.add_event(event2);
 
         // Third chunk: DATA frame with body "world" and END_STREAM
         let data_frame2 = build_data_frame(1, b"world", true);
@@ -884,7 +913,7 @@ mod tests {
             3_000_000,
             &data_frame2,
         );
-        let _ = collator.add_event(&event3);
+        let _ = collator.add_event(event3);
 
         // Check the pending request body
         let conn = collator.connections.get(&conn_id).unwrap();
@@ -931,7 +960,7 @@ mod tests {
             1_000_000,
             &payload,
         );
-        let events = collator.add_event(&event);
+        let events = collator.add_event(event);
 
         // Should have emitted a request Message with the full 32KB body
         let request_msg = events.iter().find_map(|e| {
@@ -991,7 +1020,7 @@ mod tests {
         req1.extend(headers);
 
         let req1_event = make_event(Direction::Read, conn_id, process_id, 80, 1_000_000, &req1);
-        let _ = collator.add_event(&req1_event);
+        let _ = collator.add_event(req1_event);
 
         // Response: HEADERS with :status 200 (END_STREAM)
         let resp_hpack = hpack_status_200();
@@ -1009,7 +1038,7 @@ mod tests {
         resp1.extend(&resp_hpack);
 
         let resp1_event = make_event(Direction::Write, conn_id, process_id, 80, 2_000_000, &resp1);
-        let events1 = collator.add_event(&resp1_event);
+        let events1 = collator.add_event(resp1_event);
         assert!(
             events1.iter().any(|e| e.is_exchange()),
             "First exchange should complete"
@@ -1024,7 +1053,7 @@ mod tests {
         req2.extend(build_data_frame(1, &body, true));
 
         let req2_event = make_event(Direction::Read, conn_id, process_id, 80, 3_000_000, &req2);
-        let events2 = collator.add_event(&req2_event);
+        let events2 = collator.add_event(req2_event);
 
         // Should have emitted a request Message for the second connection
         let request_msg = events2.iter().find_map(|e| {
@@ -1080,7 +1109,7 @@ mod tests {
         req1.extend(headers);
 
         let req1_event = make_event(Direction::Read, conn_id, process_id, 80, 1_000_000, &req1);
-        let _ = collator.add_event(&req1_event);
+        let _ = collator.add_event(req1_event);
 
         // Response on Write direction
         let resp_hpack = hpack_status_200();
@@ -1098,7 +1127,7 @@ mod tests {
         resp1.extend(&resp_hpack);
 
         let resp1_event = make_event(Direction::Write, conn_id, process_id, 80, 2_000_000, &resp1);
-        let events1 = collator.add_event(&resp1_event);
+        let events1 = collator.add_event(resp1_event);
         assert!(
             events1.iter().any(|e| e.is_exchange()),
             "First exchange should complete"
@@ -1115,7 +1144,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, // error_code = NO_ERROR
         ];
         let goaway_event = make_event(Direction::Read, conn_id, process_id, 80, 2_500_000, &goaway);
-        let _ = collator.add_event(&goaway_event);
+        let _ = collator.add_event(goaway_event);
 
         // --- Second exchange: same conn_id (fd reused), large POST body ---
         // Build the full request data, then split it into realistic chunks
@@ -1158,7 +1187,7 @@ mod tests {
             }
             let chunk = &full_request[prev..end];
             let event = make_event(Direction::Read, conn_id, process_id, 80, ts, chunk);
-            let _ = collator.add_event(&event);
+            let _ = collator.add_event(event);
             prev = end;
             ts += 100_000;
         }
@@ -1166,7 +1195,7 @@ mod tests {
         if prev < full_request.len() {
             let chunk = &full_request[prev..];
             let event = make_event(Direction::Read, conn_id, process_id, 80, ts, chunk);
-            let _ = collator.add_event(&event);
+            let _ = collator.add_event(event);
             ts += 100_000;
         }
 
@@ -1200,7 +1229,7 @@ mod tests {
         resp2.extend(&resp2_hpack);
 
         let resp2_event = make_event(Direction::Write, conn_id, process_id, 80, ts, &resp2);
-        let events2 = collator.add_event(&resp2_event);
+        let events2 = collator.add_event(resp2_event);
 
         // Should produce a complete exchange
         let exchange = events2
@@ -1254,7 +1283,7 @@ mod tests {
             1_000_000_000, // Request sent at 1 second
             &request,
         );
-        let _ = collator.add_event(&req_event);
+        let _ = collator.add_event(req_event);
 
         // Response at t=1_050_000_000 (1.05 seconds = 50ms later)
         let response_hpack = hpack_status_200();
@@ -1279,7 +1308,7 @@ mod tests {
             1_050_000_000, // Response received at 1.05 seconds
             &response,
         );
-        let events = collator.add_event(&resp_event);
+        let events = collator.add_event(resp_event);
 
         // Find the exchange event
         let exchange = events
@@ -1409,7 +1438,7 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
         );
 
-        let events = collator.add_event(&event);
+        let events = collator.add_event(event);
 
         // Should emit a Message event for the request
         assert_eq!(events.len(), 1);
@@ -1434,7 +1463,7 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
         );
 
-        let events = collator.add_event(&event);
+        let events = collator.add_event(event);
 
         // Should emit a Message event for the response
         assert_eq!(events.len(), 1);
@@ -1457,7 +1486,7 @@ mod tests {
             1_000_000,
             b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
         );
-        let events = collator.add_event(&req_event);
+        let events = collator.add_event(req_event);
         assert_eq!(events.len(), 1, "Request should emit 1 Message event");
         assert!(events[0].is_message());
 
@@ -1470,7 +1499,7 @@ mod tests {
             2_000_000,
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
         );
-        let events = collator.add_event(&resp_event);
+        let events = collator.add_event(resp_event);
 
         // Should have response Message + Exchange
         assert_eq!(events.len(), 2, "Response should emit Message + Exchange");
@@ -1492,7 +1521,7 @@ mod tests {
             1_000_000,
             b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
         );
-        let events = collator.add_event(&req_event);
+        let events = collator.add_event(req_event);
         assert!(events.is_empty(), "Should not emit Message events");
 
         // Send response
@@ -1504,7 +1533,7 @@ mod tests {
             2_000_000,
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
         );
-        let events = collator.add_event(&resp_event);
+        let events = collator.add_event(resp_event);
 
         // Should only have Exchange, no Message
         assert_eq!(events.len(), 1);
@@ -1525,7 +1554,7 @@ mod tests {
             1_000_000,
             b"GET / HTTP/1.1\r\n",
         );
-        let events1 = collator.add_event(&event1);
+        let events1 = collator.add_event(event1);
         assert!(events1.is_empty(), "Incomplete request should not emit");
 
         let event2 = make_event(
@@ -1536,12 +1565,12 @@ mod tests {
             2_000_000,
             b"Host: example.com\r\n\r\n",
         );
-        let events2 = collator.add_event(&event2);
+        let events2 = collator.add_event(event2);
         assert_eq!(events2.len(), 1, "Complete request should emit once");
 
         // Another chunk on same connection (no new request data)
         let event3 = make_event(Direction::Write, 1, 1234, 8080, 3_000_000, b"");
-        let events3 = collator.add_event(&event3);
+        let events3 = collator.add_event(event3);
         assert!(events3.is_empty(), "Empty payload should not emit");
     }
 
@@ -1585,7 +1614,7 @@ mod tests {
             1_000_000_000,
             &request,
         );
-        let events = collator.add_event(&req_event);
+        let events = collator.add_event(req_event);
 
         // Should have emitted a request Message event
         let request_msg = events.iter().find_map(|e| {
@@ -1625,7 +1654,7 @@ mod tests {
             1_050_000_000,
             &response,
         );
-        let events = collator.add_event(&resp_event);
+        let events = collator.add_event(resp_event);
 
         // Should have an Exchange event
         let exchange = events
@@ -1682,7 +1711,7 @@ mod tests {
             1_000_000_000,
             b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
         );
-        let _ = collator.add_event(&event);
+        let _ = collator.add_event(event);
         assert_eq!(collator.connections.len(), 1);
 
         // Cleanup at t=3s — connection is only 2s old, should survive
@@ -1734,7 +1763,7 @@ mod tests {
             1_000_000_000,
             &payload,
         );
-        let _ = collator.add_event(&event);
+        let _ = collator.add_event(event);
 
         // Verify stream is active
         let conn = collator.connections.get(&conn_id).unwrap();
@@ -1782,12 +1811,12 @@ mod tests {
 
         // First chunk: headers + partial body (under limit)
         let event1 = make_event(Direction::Write, 1, 1234, 8080, 1_000_000, &payload[..80]);
-        let events1 = collator.add_event(&event1);
+        let events1 = collator.add_event(event1);
         assert!(events1.is_empty());
 
         // Second chunk: remaining body (exceeds limit)
         let event2 = make_event(Direction::Write, 1, 1234, 8080, 2_000_000, &payload[80..]);
-        let events2 = collator.add_event(&event2);
+        let events2 = collator.add_event(event2);
         assert!(
             events2.is_empty(),
             "Should not emit after body limit exceeded"
@@ -1817,7 +1846,7 @@ mod tests {
             1_000_000,
             b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
         );
-        let events = collator.add_event(&event);
+        let events = collator.add_event(event);
         assert_eq!(events.len(), 1, "Normal request should parse fine");
         assert!(events[0].is_message());
     }
@@ -1850,7 +1879,7 @@ mod tests {
         h2_req.extend(headers);
 
         let h2_event = make_event(Direction::Write, conn_id, 1000, 80, 1_000_000, &h2_req);
-        let _ = collator.add_event(&h2_event);
+        let _ = collator.add_event(h2_event);
 
         // Connection is now HTTP/2
         assert_eq!(
@@ -1861,7 +1890,7 @@ mod tests {
         // Now: HTTP/1 data arrives on the same fd (protocol change)
         let h1_req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let h1_event = make_event(Direction::Write, conn_id, 1000, 80, 2_000_000, h1_req);
-        let events = collator.add_event(&h1_event);
+        let events = collator.add_event(h1_event);
 
         // Should have reset to HTTP/1 and parsed the request
         let conn = collator.connections.get(&conn_id).unwrap();

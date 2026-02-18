@@ -126,8 +126,15 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
         // H4: validate CONTINUATION ordering (non-fatal: skip unexpected frame)
         if let Some(expected_stream) = state.expecting_continuation {
             if header.frame_type != FRAME_TYPE_CONTINUATION || header.stream_id != expected_stream {
-                pos += frame_total_size;
-                continue;
+                crate::trace_warn!(
+                    "expected CONTINUATION for stream {expected_stream}, got frame type {} on stream {}; \
+                     abandoning incomplete header block",
+                    header.frame_type,
+                    header.stream_id
+                );
+                state.expecting_continuation = None;
+                state.active_streams.remove(&expected_stream);
+                // Fall through to process this frame normally
             }
         }
 
@@ -369,7 +376,13 @@ fn handle_settings_frame(
             0x02 => state.settings.enable_push = value != 0,
             0x03 => state.settings.max_concurrent_streams = value,
             0x04 => state.settings.initial_window_size = value,
-            0x05 => state.settings.max_frame_size = value,
+            0x05 => {
+                // RFC 7540 §6.5.2: valid range is [16384, 16777215]
+                if (16_384..=16_777_215).contains(&value) {
+                    state.settings.max_frame_size = value;
+                }
+                // Ignore out-of-range values (passive monitor shouldn't disconnect)
+            }
             0x06 => state.settings.max_header_list_size = value,
             _ => {} // Unknown setting
         }

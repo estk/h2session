@@ -54,13 +54,13 @@ impl<K: Hash + Eq + Clone> H2SessionCache<K> {
         key: K,
         buffer: &[u8],
     ) -> Result<HashMap<u32, ParsedH2Message>, ParseError> {
-        // Ensure entry exists (brief shard write lock)
-        if !self.connections.contains_key(&key) {
-            self.connections
-                .insert(key.clone(), Mutex::new(H2ConnectionState::default()));
-        }
+        // Atomic insert-if-absent
+        self.connections
+            .entry(key.clone())
+            .or_insert_with(|| Mutex::new(H2ConnectionState::default()));
+
         // Get shared shard read lock + per-key mutex lock
-        let entry = self.connections.get(&key).expect("just ensured exists");
+        let entry = self.connections.get(&key).expect("entry was just ensured");
         let mut state = entry.lock().unwrap_or_else(|e| e.into_inner());
         parse::parse_frames_stateful(buffer, &mut state)
     }
@@ -1269,6 +1269,162 @@ mod tests {
         assert!(
             result.is_ok(),
             "Post-concurrent parse should succeed with intact HPACK state"
+        );
+    }
+
+    // =========================================================================
+    // FIX-1: Broken CONTINUATION doesn't poison connection (incremental path)
+    // =========================================================================
+
+    #[test]
+    fn test_broken_continuation_does_not_poison_connection() {
+        // After a broken CONTINUATION sequence via feed(), the connection should
+        // recover and parse subsequent valid frames normally.
+        let mut state = H2ConnectionState::new();
+
+        // Feed preface + settings
+        let mut init = frame::CONNECTION_PREFACE.to_vec();
+        init.extend_from_slice(&create_settings_frame());
+        let result = state.feed(&init, 1_000_000);
+        assert!(result.is_ok());
+
+        // HEADERS without END_HEADERS on stream 1 (expecting CONTINUATION)
+        let hpack = vec![0x82]; // :method: GET
+        let mut headers = vec![
+            0x00,
+            0x00,
+            hpack.len() as u8,
+            0x01, // HEADERS
+            0x00, // No flags (no END_HEADERS, no END_STREAM)
+            0x00,
+            0x00,
+            0x00,
+            0x01, // stream 1
+        ];
+        headers.extend(&hpack);
+
+        // Instead of CONTINUATION, send a DATA frame (wrong frame type)
+        let data_frame = vec![
+            0x00, 0x00, 0x05, // length 5
+            0x00, // DATA
+            0x01, // END_STREAM
+            0x00, 0x00, 0x00, 0x03, // stream 3 (different stream too)
+            0x68, 0x65, 0x6c, 0x6c, 0x6f, // "hello"
+        ];
+
+        let mut buf = Vec::new();
+        buf.extend(headers);
+        buf.extend(data_frame);
+        let result = state.feed(&buf, 2_000_000);
+        assert!(
+            result.is_ok(),
+            "Broken CONTINUATION should be non-fatal via feed()"
+        );
+
+        // expecting_continuation should be cleared
+        assert!(
+            state.expecting_continuation.is_none(),
+            "expecting_continuation should be cleared after violation"
+        );
+        // Stream 1 (incomplete header block) should be removed
+        assert!(
+            !state.active_streams.contains_key(&1),
+            "Incomplete stream 1 should be removed"
+        );
+
+        // Now send a valid HEADERS frame on stream 5 — connection should NOT be poisoned
+        let hpack2 = vec![0x82]; // :method: GET
+        let valid_headers = create_headers_frame(5, &hpack2);
+        let result = state.feed(&valid_headers, 3_000_000);
+        assert!(
+            result.is_ok(),
+            "Valid HEADERS after broken CONTINUATION should succeed: {result:?}"
+        );
+        let msg = state.try_pop();
+        assert!(
+            msg.is_some(),
+            "Stream 5 should complete — connection is not poisoned"
+        );
+        let (stream_id, _) = msg.unwrap();
+        assert_eq!(stream_id, 5);
+    }
+
+    // =========================================================================
+    // FIX-3: max_frame_size SETTINGS range validation
+    // =========================================================================
+
+    #[test]
+    fn test_settings_max_frame_size_zero_ignored() {
+        // SETTINGS with max_frame_size = 0 should be ignored (default 16384 retained)
+        let mut state = H2ConnectionState::new();
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+
+        // SETTINGS: max_frame_size (0x05) = 0
+        let settings_frame = vec![
+            0x00, 0x00, 0x06, // length = 6
+            0x04, // type = SETTINGS
+            0x00, // flags
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            0x00, 0x05, // id = SETTINGS_MAX_FRAME_SIZE
+            0x00, 0x00, 0x00, 0x00, // value = 0
+        ];
+        buffer.extend(settings_frame);
+
+        let result = parse_frames_stateful(&buffer, &mut state);
+        assert!(result.is_ok());
+        assert_eq!(
+            state.settings.max_frame_size, 16_384,
+            "max_frame_size=0 should be ignored, default 16384 retained"
+        );
+    }
+
+    #[test]
+    fn test_settings_max_frame_size_u32_max_ignored() {
+        // SETTINGS with max_frame_size = u32::MAX should be ignored
+        let mut state = H2ConnectionState::new();
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+
+        // SETTINGS: max_frame_size (0x05) = 0xFFFFFFFF
+        let settings_frame = vec![
+            0x00, 0x00, 0x06, // length = 6
+            0x04, // type = SETTINGS
+            0x00, // flags
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            0x00, 0x05, // id = SETTINGS_MAX_FRAME_SIZE
+            0xFF, 0xFF, 0xFF, 0xFF, // value = u32::MAX
+        ];
+        buffer.extend(settings_frame);
+
+        let result = parse_frames_stateful(&buffer, &mut state);
+        assert!(result.is_ok());
+        assert_eq!(
+            state.settings.max_frame_size, 16_384,
+            "max_frame_size=u32::MAX should be ignored, default 16384 retained"
+        );
+    }
+
+    #[test]
+    fn test_settings_max_frame_size_valid_accepted() {
+        // SETTINGS with max_frame_size = 32768 (valid, within RFC range) should be accepted
+        let mut state = H2ConnectionState::new();
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+
+        // SETTINGS: max_frame_size (0x05) = 32768 (0x00008000)
+        let settings_frame = vec![
+            0x00, 0x00, 0x06, // length = 6
+            0x04, // type = SETTINGS
+            0x00, // flags
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            0x00, 0x05, // id = SETTINGS_MAX_FRAME_SIZE
+            0x00, 0x00, 0x80, 0x00, // value = 32768
+        ];
+        buffer.extend(settings_frame);
+
+        let result = parse_frames_stateful(&buffer, &mut state);
+        assert!(result.is_ok());
+        assert_eq!(
+            state.settings.max_frame_size, 32_768,
+            "max_frame_size=32768 should be accepted"
         );
     }
 }

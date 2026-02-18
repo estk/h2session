@@ -38,11 +38,20 @@ impl<K: Hash + Eq + Clone> H2SessionCache<K> {
         key: K,
         buffer: &[u8],
     ) -> Result<HashMap<u32, ParsedH2Message>, ParseError> {
-        // Get or create connection state
-        let mut state_ref = self.connections.entry(key).or_default();
+        // Take state out of map (or create default). This drops the shard lock
+        // immediately, avoiding holding it during the entire parse operation.
+        let mut state = self
+            .connections
+            .remove(&key)
+            .map(|(_, v)| v)
+            .unwrap_or_default();
 
-        // Parse with state
-        parse_frames_stateful(buffer, state_ref.value_mut())
+        let result = parse_frames_stateful(buffer, &mut state);
+
+        // Put state back (even on error, to preserve HPACK decoder state)
+        self.connections.insert(key, state);
+
+        result
     }
 
     /// Remove connection state (call when connection closes)
@@ -429,11 +438,41 @@ mod tests {
         buffer.extend(build_test_headers_frame(1, &hpack));
 
         let result = state.feed(&buffer, 1_000_000);
-        assert!(result.is_ok(), "Invalid UTF-8 should be non-fatal");
-        // Stream should not complete because invalid header set limit_exceeded
+        assert!(
+            result.is_ok(),
+            "Invalid UTF-8 should be non-fatal via feed()"
+        );
+        // Stream should not complete because encoding error drops it
         assert!(
             state.try_pop().is_none(),
             "Stream with invalid UTF-8 header should not complete"
+        );
+    }
+
+    #[test]
+    fn test_invalid_utf8_returns_encoding_error_variant() {
+        // Verify that parse_frames_stateful returns Http2InvalidHeaderEncoding
+        // (not Http2HeaderListTooLarge) for UTF-8 failures.
+        let mut hpack = Vec::new();
+        hpack.push(0x82); // :method: GET (static)
+        hpack.push(0x87); // :scheme: https (static)
+        hpack.push(0x84); // :path: / (static)
+        // Literal without indexing, new name "x-bad"
+        hpack.push(0x00);
+        hpack.push(0x05); // name length 5
+        hpack.extend_from_slice(b"x-bad");
+        hpack.push(0x03); // value length 3
+        hpack.extend_from_slice(&[0xFF, 0xFE, 0x41]); // invalid UTF-8
+
+        let mut state = H2ConnectionState::new();
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+        buffer.extend_from_slice(&create_settings_frame());
+        buffer.extend(build_test_headers_frame(1, &hpack));
+
+        let result = parse_frames_stateful(&buffer, &mut state);
+        assert!(
+            matches!(result, Err(ParseError::Http2InvalidHeaderEncoding)),
+            "Should return Http2InvalidHeaderEncoding, got: {result:?}"
         );
     }
 
@@ -612,6 +651,63 @@ mod tests {
             state.active_streams.len(),
             2,
             "Should still have only 2 streams"
+        );
+    }
+
+    #[test]
+    fn test_body_size_limit_drops_stream() {
+        let mut state = H2ConnectionState::with_limits(H2Limits {
+            max_body_size: 10, // Very small limit for testing
+            ..H2Limits::default()
+        });
+
+        let hpack = vec![0x82, 0x87, 0x84]; // GET, https, /
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+        buffer.extend_from_slice(&create_settings_frame());
+        // HEADERS with END_HEADERS only (0x04), NOT END_STREAM (body follows)
+        let hpack_len = hpack.len();
+        let mut headers_frame = vec![
+            (hpack_len >> 16) as u8,
+            (hpack_len >> 8) as u8,
+            hpack_len as u8,
+            0x01, // HEADERS
+            0x04, // END_HEADERS only
+            0x00,
+            0x00,
+            0x00,
+            0x01, // stream 1
+        ];
+        headers_frame.extend(&hpack);
+        buffer.extend(headers_frame);
+
+        // DATA frame with 20 bytes (exceeds 10 byte limit), END_STREAM
+        let body = vec![0x41u8; 20];
+        let body_len = body.len();
+        let mut data_frame = vec![
+            (body_len >> 16) as u8,
+            (body_len >> 8) as u8,
+            body_len as u8,
+            0x00, // DATA
+            0x01, // END_STREAM
+            0x00,
+            0x00,
+            0x00,
+            0x01, // stream 1
+        ];
+        data_frame.extend(&body);
+        buffer.extend(data_frame);
+
+        let result = parse_frames_stateful(&buffer, &mut state);
+        assert!(result.is_ok(), "Body size limit should be non-fatal");
+        // Stream should have been dropped, so no completed messages
+        assert!(
+            result.unwrap().is_empty(),
+            "Stream exceeding body size limit should be dropped"
+        );
+        assert_eq!(
+            state.active_streams.len(),
+            0,
+            "Stream should be removed after exceeding body limit"
         );
     }
 

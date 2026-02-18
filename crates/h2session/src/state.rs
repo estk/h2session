@@ -18,6 +18,9 @@ pub struct H2Limits {
     pub max_concurrent_streams: usize,
     /// Stream timeout in nanoseconds — streams older than this are evicted (default: 30s)
     pub stream_timeout_ns: u64,
+    /// Maximum accumulated body size per stream in bytes (default: 10 MiB).
+    /// Streams exceeding this limit are dropped to prevent memory exhaustion.
+    pub max_body_size: usize,
 }
 
 impl Default for H2Limits {
@@ -29,6 +32,7 @@ impl Default for H2Limits {
             max_table_size: 65536,
             max_concurrent_streams: 100,
             stream_timeout_ns: 30_000_000_000,
+            max_body_size: 10 * 1024 * 1024, // 10 MiB
         }
     }
 }
@@ -328,7 +332,7 @@ impl ParsedH2Message {
                 http::HeaderValue::from_str(value),
             );
             if let (Ok(n), Ok(v)) = parsed {
-                header_map.insert(n, v);
+                header_map.append(n, v);
             }
         }
 

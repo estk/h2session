@@ -57,9 +57,16 @@ pub fn parse_frames_stateful(
 
         pos += frame_total_size;
 
-        // Check for completed streams
-        extract_completed_streams_to_map(state, &mut completed_messages);
+        // Check only the stream that was just modified (stream_id 0 = connection-level)
+        if header.stream_id != 0
+            && let Some((id, msg)) = check_stream_completion(state, header.stream_id)
+        {
+            completed_messages.insert(id, msg);
+        }
     }
+
+    // Evict stale streams to bound memory usage
+    state.evict_stale_streams(timestamp_ns);
 
     Ok(completed_messages)
 }
@@ -109,6 +116,8 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
         // Always advance past the frame so it won't be re-processed
         pos += frame_total_size;
 
+        let stream_id = header.stream_id;
+
         if let Err(e) = result {
             // HPACK errors corrupt the decoder's dynamic table — stop parsing
             if matches!(e, ParseError::Http2HpackError(_)) {
@@ -119,8 +128,12 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
             continue;
         }
 
-        // Extract completed streams to the internal completed queue
-        extract_completed_streams_to_queue(state);
+        // Check only the stream that was just modified (stream_id 0 = connection-level)
+        if stream_id != 0
+            && let Some(pair) = check_stream_completion(state, stream_id)
+        {
+            state.completed.push_back(pair);
+        }
     }
 
     // Remove consumed bytes from buffer, keeping any partial frame data
@@ -228,13 +241,8 @@ fn handle_continuation_frame(
     stream.header_size += FRAME_HEADER_SIZE + payload.len();
 
     if header.flags & FLAG_END_HEADERS != 0 {
-        decode_headers_into_stream(
-            &mut state.decoder,
-            stream,
-            &stream.continuation_buffer.clone(),
-            &state.limits,
-        )?;
-        stream.continuation_buffer.clear();
+        let buf = std::mem::take(&mut stream.continuation_buffer);
+        decode_headers_into_stream(&mut state.decoder, stream, &buf, &state.limits)?;
         stream.end_headers_seen = true;
     }
 
@@ -247,12 +255,7 @@ fn handle_data_frame(
     payload: &[u8],
     timestamp_ns: u64,
 ) -> Result<(), ParseError> {
-    let stream = state
-        .active_streams
-        .get_mut(&header.stream_id)
-        .ok_or(ParseError::Http2StreamNotFound)?;
-
-    // Handle PADDED flag
+    // Handle PADDED flag before borrowing the stream
     // Padded frame format: [Pad Length (1 byte)] [Data] [Padding]
     let data = if header.flags & FLAG_PADDED != 0 {
         if payload.is_empty() {
@@ -267,6 +270,24 @@ fn handle_data_frame(
     } else {
         payload
     };
+
+    // Check body size limit before borrowing the stream mutably
+    {
+        let stream = state
+            .active_streams
+            .get(&header.stream_id)
+            .ok_or(ParseError::Http2StreamNotFound)?;
+        if stream.body.len() + data.len() > state.limits.max_body_size {
+            // Drop the stream rather than accumulating unbounded data
+            state.active_streams.remove(&header.stream_id);
+            return Ok(());
+        }
+    }
+
+    let stream = state
+        .active_streams
+        .get_mut(&header.stream_id)
+        .ok_or(ParseError::Http2StreamNotFound)?;
 
     stream.body.extend_from_slice(data);
 
@@ -323,10 +344,11 @@ fn decode_headers_into_stream(
     let mut total_size: usize = 0;
     let mut header_count: usize = 0;
     let mut limit_exceeded = false;
+    let mut encoding_error = false;
 
     decoder
         .decode_with_cb(header_block, |name, value| {
-            if limit_exceeded {
+            if limit_exceeded || encoding_error {
                 return;
             }
 
@@ -351,7 +373,7 @@ fn decode_headers_into_stream(
             let (Ok(name_str), Ok(value_str)) =
                 (std::str::from_utf8(&name), std::str::from_utf8(&value))
             else {
-                limit_exceeded = true;
+                encoding_error = true;
                 return;
             };
             let name_str = name_str.to_string();
@@ -368,6 +390,10 @@ fn decode_headers_into_stream(
         })
         .map_err(|e| ParseError::Http2HpackError(format!("{e:?}")))?;
 
+    if encoding_error {
+        return Err(ParseError::Http2InvalidHeaderEncoding);
+    }
+
     if limit_exceeded {
         return Err(ParseError::Http2HeaderListTooLarge);
     }
@@ -375,55 +401,34 @@ fn decode_headers_into_stream(
     Ok(())
 }
 
-/// Extract completed streams to a HashMap (for parse_frames_stateful compatibility)
-/// Build a `ParsedH2Message` from a completed stream.
-fn build_parsed_message(stream_id: u32, stream: &StreamState) -> ParsedH2Message {
+/// Build a `ParsedH2Message` by taking ownership of a completed stream's data.
+fn build_parsed_message_owned(stream_id: u32, stream: StreamState) -> ParsedH2Message {
     ParsedH2Message {
-        method: stream.method.clone(),
-        path: stream.path.clone(),
-        authority: stream.authority.clone(),
-        scheme: stream.scheme.clone(),
+        method: stream.method,
+        path: stream.path,
+        authority: stream.authority,
+        scheme: stream.scheme,
         status: stream.status,
-        headers: stream.headers.clone(),
+        headers: stream.headers,
         stream_id,
         header_size: stream.header_size,
-        body: stream.body.clone(),
+        body: stream.body,
         first_frame_timestamp_ns: stream.first_frame_timestamp_ns,
         end_stream_timestamp_ns: stream.end_stream_timestamp_ns,
     }
 }
 
-/// Drain all completed streams from active_streams, returning them as pairs.
-fn drain_completed_streams(state: &mut H2ConnectionState) -> Vec<(u32, ParsedH2Message)> {
-    let mut drained = Vec::new();
-    let mut to_remove = Vec::new();
-
-    for (&stream_id, stream) in &state.active_streams {
-        if stream.end_headers_seen && stream.end_stream_seen {
-            drained.push((stream_id, build_parsed_message(stream_id, stream)));
-            to_remove.push(stream_id);
-        }
-    }
-
-    for stream_id in to_remove {
-        state.active_streams.remove(&stream_id);
-    }
-
-    drained
-}
-
-fn extract_completed_streams_to_map(
+/// Check if the specified stream is complete and extract it if so.
+/// Only checks the single stream that was just modified, avoiding a full scan.
+fn check_stream_completion(
     state: &mut H2ConnectionState,
-    completed: &mut HashMap<u32, ParsedH2Message>,
-) {
-    for (stream_id, msg) in drain_completed_streams(state) {
-        completed.insert(stream_id, msg);
-    }
-}
-
-/// Extract completed streams to the internal completed queue (for incremental API)
-fn extract_completed_streams_to_queue(state: &mut H2ConnectionState) {
-    for pair in drain_completed_streams(state) {
-        state.completed.push_back(pair);
+    stream_id: u32,
+) -> Option<(u32, ParsedH2Message)> {
+    let stream = state.active_streams.get(&stream_id)?;
+    if stream.end_headers_seen && stream.end_stream_seen {
+        let stream = state.active_streams.remove(&stream_id)?;
+        Some((stream_id, build_parsed_message_owned(stream_id, stream)))
+    } else {
+        None
     }
 }

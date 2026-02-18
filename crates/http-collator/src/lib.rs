@@ -287,10 +287,12 @@ impl<E: DataEvent> Collator<E> {
     /// Callers should invoke this periodically to bound memory usage from
     /// abandoned connections and incomplete HTTP/2 streams.
     pub fn cleanup(&self, current_time_ns: u64) {
-        self.connections
-            .retain(|_, conn| current_time_ns - conn.last_activity_ns < self.config.timeout_ns);
-        self.ssl_connections
-            .retain(|_, conn| current_time_ns - conn.last_activity_ns < self.config.timeout_ns);
+        self.connections.retain(|_, conn| {
+            current_time_ns.saturating_sub(conn.last_activity_ns) < self.config.timeout_ns
+        });
+        self.ssl_connections.retain(|_, conn| {
+            current_time_ns.saturating_sub(conn.last_activity_ns) < self.config.timeout_ns
+        });
 
         // Evict stale H2 streams within surviving connections
         for mut entry in self.connections.iter_mut() {
@@ -314,6 +316,80 @@ impl<E: DataEvent> Collator<E> {
             self.ssl_connections.remove(&process_id);
         }
     }
+
+    /// Close a connection, finalizing any pending HTTP/1 response.
+    ///
+    /// For HTTP/1 responses without explicit framing (no Content-Length or
+    /// Transfer-Encoding), RFC 7230 §3.3.3 says the body extends until the
+    /// connection closes. This method finalizes such responses with whatever
+    /// body has accumulated so far, emits any resulting events, then removes
+    /// the connection.
+    pub fn close_connection(&self, connection_id: u64, process_id: u32) -> Vec<CollationEvent> {
+        let events = if connection_id != 0 {
+            match self.connections.get_mut(&connection_id) {
+                Some(mut guard) => {
+                    finalize_and_emit(&mut guard, connection_id, process_id, &self.config)
+                }
+                None => Vec::new(),
+            }
+        } else {
+            match self.ssl_connections.get_mut(&process_id) {
+                Some(mut guard) => {
+                    finalize_and_emit(&mut guard, connection_id, process_id, &self.config)
+                }
+                None => Vec::new(),
+            }
+        };
+
+        // Remove the connection after releasing the guard
+        if connection_id != 0 {
+            self.connections.remove(&connection_id);
+        } else {
+            self.ssl_connections.remove(&process_id);
+        }
+
+        events
+    }
+}
+
+/// Finalize any pending HTTP/1 response and emit events on connection close.
+fn finalize_and_emit(
+    conn: &mut Conn,
+    connection_id: u64,
+    process_id: u32,
+    config: &CollatorConfig,
+) -> Vec<CollationEvent> {
+    // Finalize any pending HTTP/1 response with body accumulated so far
+    if conn.protocol == Protocol::Http1
+        && conn.h1_response.is_none()
+        && !conn.h1_response_buffer.is_empty()
+    {
+        let timestamp = conn
+            .response_chunks
+            .first()
+            .map(|c| c.timestamp_ns)
+            .unwrap_or(0);
+        conn.h1_response = h1::try_finalize_http1_response(&conn.h1_response_buffer, timestamp);
+        if conn.h1_response.is_some() {
+            conn.response_complete = true;
+        }
+    }
+
+    let mut events = Vec::new();
+
+    if config.emit_messages {
+        emit_message_events(conn, connection_id, process_id, &mut events);
+    }
+
+    if config.emit_exchanges
+        && conn.request_complete
+        && conn.response_complete
+        && let Some(exchange) = build_exchange(conn)
+    {
+        events.push(CollationEvent::Exchange(exchange));
+    }
+
+    events
 }
 
 /// Emit Message events for any newly parsed messages that haven't been emitted yet
@@ -1199,19 +1275,22 @@ mod tests {
             ts += 100_000;
         }
 
-        // Verify the request was parsed
-        let conn = collator.connections.get(&conn_id).unwrap();
-        assert!(
-            conn.pending_requests.contains_key(&1),
-            "Second exchange request should be in pending_requests"
-        );
-        let req = conn.pending_requests.get(&1).unwrap();
-        assert_eq!(
-            req.body.len(),
-            32768,
-            "Body should be 32KB, got {} bytes",
-            req.body.len()
-        );
+        // Verify the request was parsed (scope the guard to release the read lock
+        // before calling add_event below, which needs a write lock on the same shard)
+        {
+            let conn = collator.connections.get(&conn_id).unwrap();
+            assert!(
+                conn.pending_requests.contains_key(&1),
+                "Second exchange request should be in pending_requests"
+            );
+            let req = conn.pending_requests.get(&1).unwrap();
+            assert_eq!(
+                req.body.len(),
+                32768,
+                "Body should be 32KB, got {} bytes",
+                req.body.len()
+            );
+        }
 
         // Now send response on Write direction (fresh HPACK context)
         let resp2_hpack = hpack_status_200();
@@ -1765,9 +1844,11 @@ mod tests {
         );
         let _ = collator.add_event(event);
 
-        // Verify stream is active
-        let conn = collator.connections.get(&conn_id).unwrap();
-        assert_eq!(conn.h2_write_state.active_stream_count(), 1);
+        // Verify stream is active (scope the guard to release the read lock)
+        {
+            let conn = collator.connections.get(&conn_id).unwrap();
+            assert_eq!(conn.h2_write_state.active_stream_count(), 1);
+        }
 
         // Cleanup at t=40s (> default 30s stream timeout) with a recent last_activity
         // First update last_activity so the connection itself survives
@@ -1902,6 +1983,91 @@ mod tests {
         assert!(
             events.iter().any(|e| e.is_message()),
             "HTTP/1 request should be parsed after protocol change"
+        );
+    }
+
+    // =========================================================================
+    // C-1: Clock skew in cleanup doesn't panic
+    // =========================================================================
+
+    #[test]
+    fn test_cleanup_clock_skew_no_panic() {
+        let config = CollatorConfig {
+            timeout_ns: 5_000_000_000,
+            ..CollatorConfig::default()
+        };
+        let collator: Collator<TestEvent> = Collator::with_config(config);
+
+        // Manually insert a connection with last_activity in the "future"
+        collator.connections.insert(1, Conn::new(1234, 8080));
+        collator.connections.get_mut(&1).unwrap().last_activity_ns = 10_000_000_000;
+
+        // Cleanup with a current_time BEFORE the last activity (clock skew).
+        // With unsigned subtraction this would panic; saturating_sub prevents it.
+        collator.cleanup(5_000_000_000);
+
+        // Connection should be retained (saturating_sub returns 0 < timeout)
+        assert_eq!(
+            collator.connections.len(),
+            1,
+            "Connection should survive clock skew"
+        );
+    }
+
+    // =========================================================================
+    // C-3: close_connection finalizes pending HTTP/1 responses
+    // =========================================================================
+
+    #[test]
+    fn test_close_connection_finalizes_http1_response() {
+        let collator: Collator<TestEvent> = Collator::new();
+
+        // Send request
+        let req_event = make_event(
+            Direction::Write,
+            1,
+            1234,
+            8080,
+            1_000_000,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        );
+        let _ = collator.add_event(req_event);
+
+        // Send response WITHOUT Content-Length (read-until-close body)
+        let resp_event = make_event(
+            Direction::Read,
+            1,
+            1234,
+            8080,
+            2_000_000,
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nHello World",
+        );
+        let events = collator.add_event(resp_event);
+        // Response should NOT be parsed yet (no framing = incomplete)
+        assert!(
+            !events
+                .iter()
+                .any(|e| { e.as_message().map_or(false, |(msg, _)| msg.is_response()) }),
+            "Response without framing should not be emitted yet"
+        );
+
+        // Close the connection — should finalize the response
+        let close_events = collator.close_connection(1, 1234);
+
+        // Should have emitted the response and/or exchange
+        let has_response = close_events
+            .iter()
+            .any(|e| e.as_message().map_or(false, |(msg, _)| msg.is_response()));
+        let has_exchange = close_events.iter().any(|e| e.is_exchange());
+        assert!(
+            has_response || has_exchange,
+            "close_connection should finalize the pending response"
+        );
+
+        // Connection should be removed
+        assert!(
+            collator.connections.get(&1).is_none(),
+            "Connection should be removed after close"
         );
     }
 }

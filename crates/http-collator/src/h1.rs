@@ -34,7 +34,7 @@ pub fn try_parse_http1_request(data: &[u8], timestamp_ns: u64) -> Option<HttpReq
     };
 
     let body_data = &data[body_offset..];
-    let body = match determine_body(req.headers, body_data) {
+    let body = match determine_body(req.headers, body_data, None) {
         BodyResult::Complete(b) => b,
         BodyResult::Incomplete => return None,
     };
@@ -49,7 +49,7 @@ pub fn try_parse_http1_request(data: &[u8], timestamp_ns: u64) -> Option<HttpReq
             HeaderValue::from_bytes(h.value),
         );
         if let (Ok(name), Ok(value)) = parsed {
-            header_map.insert(name, value);
+            header_map.append(name, value);
         }
     }
 
@@ -74,7 +74,7 @@ pub fn try_parse_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpRe
     };
 
     let body_data = &data[body_offset..];
-    let body = match determine_body(res.headers, body_data) {
+    let body = match determine_body(res.headers, body_data, res.code) {
         BodyResult::Complete(b) => b,
         BodyResult::Incomplete => return None,
     };
@@ -88,7 +88,43 @@ pub fn try_parse_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpRe
             HeaderValue::from_bytes(h.value),
         );
         if let (Ok(name), Ok(value)) = parsed {
-            header_map.insert(name, value);
+            header_map.append(name, value);
+        }
+    }
+
+    Some(HttpResponse {
+        status,
+        headers: header_map,
+        body,
+        timestamp_ns,
+    })
+}
+
+/// Finalize an HTTP/1.x response when the connection closes.
+///
+/// For responses without explicit framing (no Content-Length or Transfer-Encoding),
+/// RFC 7230 §3.3.3 says the body is everything until the connection closes.
+/// This function parses the headers and takes all remaining data as the body.
+pub fn try_finalize_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut res = httparse::Response::new(&mut headers);
+
+    let body_offset = match res.parse(data) {
+        Ok(httparse::Status::Complete(len)) => len,
+        _ => return None,
+    };
+
+    let body = data[body_offset..].to_vec();
+    let status = StatusCode::from_u16(res.code?).ok()?;
+
+    let mut header_map = HeaderMap::new();
+    for h in res.headers.iter() {
+        let parsed = (
+            HeaderName::from_bytes(h.name.as_bytes()),
+            HeaderValue::from_bytes(h.value),
+        );
+        if let (Ok(name), Ok(value)) = parsed {
+            header_map.append(name, value);
         }
     }
 
@@ -112,8 +148,16 @@ enum BodyResult {
 ///
 /// - Content-Length: body is exactly `body_data[..content_length]`
 /// - Transfer-Encoding: chunked: walks chunk boundaries to decode body
-/// - Neither: body is empty (no body expected, e.g., GET requests)
-fn determine_body(headers: &[httparse::Header<'_>], body_data: &[u8]) -> BodyResult {
+/// - Neither (request): body is empty (no body expected, e.g., GET requests)
+/// - Neither (response with body-bearing status): incomplete (RFC 7230 §3.3.3
+///   read-until-close semantics)
+///
+/// `response_status`: `None` for requests, `Some(code)` for responses.
+fn determine_body(
+    headers: &[httparse::Header<'_>],
+    body_data: &[u8],
+    response_status: Option<u16>,
+) -> BodyResult {
     // Look for Content-Length (case-insensitive via httparse)
     for h in headers.iter() {
         if h.name.eq_ignore_ascii_case("Content-Length") {
@@ -139,8 +183,17 @@ fn determine_body(headers: &[httparse::Header<'_>], body_data: &[u8]) -> BodyRes
         }
     }
 
-    // No Content-Length and not chunked — no body expected
-    BodyResult::Complete(Vec::new())
+    // No Content-Length and not chunked
+    match response_status {
+        // Requests have no body by default
+        None => BodyResult::Complete(Vec::new()),
+        // 1xx, 204, and 304 responses explicitly have no body (RFC 7230 §3.3.3)
+        Some(code) if (100..200).contains(&code) || code == 204 || code == 304 => {
+            BodyResult::Complete(Vec::new())
+        }
+        // Other responses: body is read until connection close
+        Some(_) => BodyResult::Incomplete,
+    }
 }
 
 /// Walk chunk boundaries to decode a chunked transfer-encoded body.
@@ -438,12 +491,23 @@ mod tests {
     }
 
     #[test]
-    fn test_try_parse_response_404() {
+    fn test_try_parse_response_404_without_content_length_is_incomplete() {
+        // 404 without Content-Length or Transfer-Encoding: body uses
+        // read-until-close semantics (RFC 7230 §3.3.3), so this is incomplete.
+        // Use close_connection / try_finalize_http1_response to finalize.
         let data = b"HTTP/1.1 404 Not Found\r\n\r\n";
-        let response = try_parse_http1_response(data, 0).unwrap();
+        assert!(
+            try_parse_http1_response(data, 0).is_none(),
+            "404 without framing should be incomplete (read-until-close)"
+        );
+    }
 
+    #[test]
+    fn test_try_parse_response_404_with_content_length() {
+        let data = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
+        let response = try_parse_http1_response(data, 0).unwrap();
         assert_eq!(response.status, StatusCode::NOT_FOUND);
-        assert!(response.body.is_empty());
+        assert_eq!(response.body, b"Not Found");
     }
 
     // =========================================================================
@@ -540,5 +604,88 @@ mod tests {
         let result = try_parse_http1_response(data, 0);
         assert!(result.is_some(), "Should parse complete chunked response");
         assert_eq!(result.unwrap().body, b"hello");
+    }
+
+    // =========================================================================
+    // C-2: Multi-valued headers preserved via append (not insert)
+    // =========================================================================
+
+    #[test]
+    fn test_multi_valued_headers_preserved_in_request() {
+        let data = b"GET / HTTP/1.1\r\nHost: example.com\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n";
+        let req = try_parse_http1_request(data, 0).unwrap();
+        let cookies: Vec<_> = req.headers.get_all("cookie").iter().collect();
+        assert_eq!(cookies.len(), 2, "Both Cookie headers should be preserved");
+    }
+
+    #[test]
+    fn test_multi_valued_headers_preserved_in_response() {
+        let data =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n";
+        let resp = try_parse_http1_response(data, 0).unwrap();
+        let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
+        assert_eq!(
+            cookies.len(),
+            2,
+            "Both Set-Cookie headers should be preserved"
+        );
+    }
+
+    // =========================================================================
+    // C-3: Response without framing uses read-until-close semantics
+    // =========================================================================
+
+    #[test]
+    fn test_response_without_framing_is_incomplete() {
+        // 200 OK with no Content-Length or Transfer-Encoding: body extends
+        // until connection close, so try_parse_http1_response should return None.
+        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npartial body";
+        assert!(
+            try_parse_http1_response(data, 0).is_none(),
+            "Response without framing should be incomplete"
+        );
+    }
+
+    #[test]
+    fn test_204_response_without_framing_is_complete() {
+        // 204 No Content explicitly has no body per RFC 7230 §3.3.3
+        let data = b"HTTP/1.1 204 No Content\r\n\r\n";
+        assert!(
+            try_parse_http1_response(data, 0).is_some(),
+            "204 should be complete without framing"
+        );
+    }
+
+    #[test]
+    fn test_304_response_without_framing_is_complete() {
+        // 304 Not Modified explicitly has no body per RFC 7230 §3.3.3
+        let data = b"HTTP/1.1 304 Not Modified\r\n\r\n";
+        assert!(
+            try_parse_http1_response(data, 0).is_some(),
+            "304 should be complete without framing"
+        );
+    }
+
+    #[test]
+    fn test_try_finalize_http1_response_takes_all_remaining_data() {
+        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nfull body here";
+        let resp = try_finalize_http1_response(data, 12345).unwrap();
+        assert_eq!(resp.status, StatusCode::OK);
+        assert_eq!(resp.body, b"full body here");
+        assert_eq!(resp.timestamp_ns, 12345);
+    }
+
+    #[test]
+    fn test_try_finalize_http1_response_empty_body() {
+        let data = b"HTTP/1.1 200 OK\r\n\r\n";
+        let resp = try_finalize_http1_response(data, 0).unwrap();
+        assert!(resp.body.is_empty());
+    }
+
+    #[test]
+    fn test_try_finalize_incomplete_headers_returns_none() {
+        // Headers not complete — can't finalize
+        let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n";
+        assert!(try_finalize_http1_response(data, 0).is_none());
     }
 }

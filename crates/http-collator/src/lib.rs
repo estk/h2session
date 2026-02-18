@@ -733,8 +733,8 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
             let request_complete_time = msg_req.end_stream_timestamp_ns;
             let response_start_time = msg_resp.first_frame_timestamp_ns;
 
-            let req = msg_req.to_http_request()?;
-            let resp = msg_resp.to_http_response()?;
+            let req = msg_req.into_http_request()?;
+            let resp = msg_resp.into_http_response()?;
 
             let latency = response_start_time.saturating_sub(request_complete_time);
             (req, resp, Some(sid), latency)

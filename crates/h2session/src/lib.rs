@@ -6,18 +6,34 @@ mod http_types;
 mod parse;
 mod state;
 
+#[cfg(feature = "tracing")]
+macro_rules! trace_warn {
+    ($($arg:tt)*) => { ::tracing::warn!($($arg)*) }
+}
+#[cfg(not(feature = "tracing"))]
+macro_rules! trace_warn {
+    ($($arg:tt)*) => {};
+}
+pub(crate) use trace_warn;
+
 // Public re-exports for direct state management
 use dashmap::DashMap;
 pub use frame::{CONNECTION_PREFACE, is_http2_preface, looks_like_http2_frame};
 pub use http_types::{HttpRequest, HttpResponse};
-pub use parse::parse_frames_stateful;
 pub use state::{H2ConnectionState, H2Limits, ParseError, ParsedH2Message};
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::Mutex;
 
-/// HTTP/2 session cache with generic connection keys
+/// HTTP/2 session cache with generic connection keys.
+///
+/// Uses `DashMap<K, Mutex<H2ConnectionState>>` to provide per-key serialization.
+/// The DashMap shard lock is held only briefly (to look up or insert the entry),
+/// while the per-key Mutex serializes concurrent same-key calls to `parse()`.
+/// This prevents the remove-and-reinsert race where two threads would both
+/// create default state for the same key, losing one thread's HPACK table.
 pub struct H2SessionCache<K> {
-    connections: DashMap<K, H2ConnectionState>,
+    connections: DashMap<K, Mutex<H2ConnectionState>>,
 }
 
 impl<K: Hash + Eq + Clone> H2SessionCache<K> {
@@ -38,25 +54,22 @@ impl<K: Hash + Eq + Clone> H2SessionCache<K> {
         key: K,
         buffer: &[u8],
     ) -> Result<HashMap<u32, ParsedH2Message>, ParseError> {
-        // Take state out of map (or create default). This drops the shard lock
-        // immediately, avoiding holding it during the entire parse operation.
-        let mut state = self
-            .connections
-            .remove(&key)
-            .map(|(_, v)| v)
-            .unwrap_or_default();
-
-        let result = parse_frames_stateful(buffer, &mut state);
-
-        // Put state back (even on error, to preserve HPACK decoder state)
-        self.connections.insert(key, state);
-
-        result
+        // Ensure entry exists (brief shard write lock)
+        if !self.connections.contains_key(&key) {
+            self.connections
+                .insert(key.clone(), Mutex::new(H2ConnectionState::default()));
+        }
+        // Get shared shard read lock + per-key mutex lock
+        let entry = self.connections.get(&key).expect("just ensured exists");
+        let mut state = entry.lock().unwrap_or_else(|e| e.into_inner());
+        parse::parse_frames_stateful(buffer, &mut state)
     }
 
     /// Remove connection state (call when connection closes)
     pub fn remove(&self, key: &K) -> Option<H2ConnectionState> {
-        self.connections.remove(key).map(|(_, v)| v)
+        self.connections
+            .remove(key)
+            .map(|(_, mutex)| mutex.into_inner().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Check if connection state exists
@@ -84,6 +97,7 @@ impl<K: Hash + Eq + Clone> Default for H2SessionCache<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::parse_frames_stateful;
 
     // Helper to create a minimal SETTINGS frame
     fn create_settings_frame() -> Vec<u8> {
@@ -784,5 +798,477 @@ mod tests {
         }
 
         assert!(cache.contains(&key));
+    }
+
+    // =========================================================================
+    // C2: Buffer growth cap
+    // =========================================================================
+
+    #[test]
+    fn test_buffer_growth_cap_rejects_oversized_feed() {
+        let mut state = H2ConnectionState::with_limits(H2Limits {
+            max_buffer_size: 100,
+            ..H2Limits::default()
+        });
+
+        // Single feed exceeding the limit
+        let chunk = vec![0x00u8; 101];
+        let result = state.feed(&chunk, 1_000_000);
+        assert!(
+            matches!(result, Err(ParseError::Http2BufferTooLarge)),
+            "Feed exceeding buffer cap should return Http2BufferTooLarge, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_buffer_growth_cap_exact_limit_succeeds() {
+        let mut state = H2ConnectionState::with_limits(H2Limits {
+            max_buffer_size: 100,
+            ..H2Limits::default()
+        });
+
+        // Feed exactly 100 bytes — at limit, should succeed
+        let chunk = vec![0x00u8; 100];
+        assert!(
+            state.feed(&chunk, 1_000_000).is_ok(),
+            "Feed at exact limit should succeed"
+        );
+    }
+
+    // =========================================================================
+    // C4: checked_add for frame size calculation
+    // =========================================================================
+
+    #[test]
+    fn test_checked_add_max_24bit_length() {
+        // Frame with max 24-bit length (16,777,215). On 64-bit this fits but
+        // the checked path should still work correctly.
+        let max_length: u32 = 0x00FF_FFFF; // 16,777,215
+        let frame = vec![
+            (max_length >> 16) as u8,
+            (max_length >> 8) as u8,
+            max_length as u8,
+            0x00, // DATA
+            0x00, // flags
+            0x00,
+            0x00,
+            0x00,
+            0x01, // stream 1
+        ];
+        // Only the frame header is present (no payload). The max_frame_size
+        // check fires before the incomplete-frame check.
+
+        let mut state = H2ConnectionState::new();
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+        buffer.extend_from_slice(&create_settings_frame());
+        buffer.extend_from_slice(&frame);
+
+        // parse_frames_stateful should not panic — it should just see an incomplete frame
+        let result = parse_frames_stateful(&buffer, &mut state);
+        // The max_frame_size check will reject this before the incomplete frame check
+        assert!(
+            matches!(result, Err(ParseError::Http2FrameSizeError)),
+            "Max 24-bit length frame should trigger FrameSizeError, got: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // H1: Enforce max_frame_size
+    // =========================================================================
+
+    #[test]
+    fn test_max_frame_size_rejects_oversized_frame() {
+        // Default max_frame_size is 16384. A frame with length 16385 should be rejected.
+        let length: u32 = 16385; // 1 over default
+        let mut frame_header = vec![
+            (length >> 16) as u8,
+            (length >> 8) as u8,
+            length as u8,
+            0x00, // DATA
+            0x01, // END_STREAM
+            0x00,
+            0x00,
+            0x00,
+            0x01, // stream 1
+        ];
+        frame_header.extend(vec![0x41u8; length as usize]);
+
+        let mut state = H2ConnectionState::new();
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+        buffer.extend_from_slice(&create_settings_frame());
+        // First open a stream with HEADERS
+        let hpack = vec![0x82]; // :method: GET
+        buffer.extend(build_test_headers_frame(1, &hpack));
+        buffer.extend(frame_header);
+
+        let result = parse_frames_stateful(&buffer, &mut state);
+        assert!(
+            matches!(result, Err(ParseError::Http2FrameSizeError)),
+            "Frame exceeding default max_frame_size should be rejected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_max_frame_size_respects_settings() {
+        // After SETTINGS sets max_frame_size to 32768, a 20000-byte DATA frame should succeed
+        let mut state = H2ConnectionState::new();
+
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+        // SETTINGS: max_frame_size (0x05) = 32768
+        let settings_payload = [0x00u8, 0x05, 0x00, 0x00, 0x80, 0x00]; // id=5, value=32768
+        let mut settings_frame = vec![
+            0x00, 0x00, 0x06, // length = 6
+            0x04, // type = SETTINGS
+            0x00, // flags
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+        ];
+        settings_frame.extend_from_slice(&settings_payload);
+        buffer.extend(settings_frame);
+
+        // HEADERS with END_HEADERS only (body follows)
+        let hpack = vec![0x82]; // :method: GET
+        let hpack_len = hpack.len();
+        let mut headers = vec![
+            (hpack_len >> 16) as u8,
+            (hpack_len >> 8) as u8,
+            hpack_len as u8,
+            0x01, // HEADERS
+            0x04, // END_HEADERS only
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+        ];
+        headers.extend(&hpack);
+        buffer.extend(headers);
+
+        // DATA frame with 20000 bytes
+        let data_len: u32 = 20000;
+        let mut data_frame = vec![
+            (data_len >> 16) as u8,
+            (data_len >> 8) as u8,
+            data_len as u8,
+            0x00, // DATA
+            0x01, // END_STREAM
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+        ];
+        data_frame.extend(vec![0x41u8; data_len as usize]);
+        buffer.extend(data_frame);
+
+        let result = parse_frames_stateful(&buffer, &mut state);
+        assert!(
+            result.is_ok(),
+            "20000-byte frame should succeed with max_frame_size=32768: {result:?}"
+        );
+
+        let messages = result.unwrap();
+        assert!(messages.contains_key(&1), "Stream 1 should complete");
+        assert_eq!(messages[&1].body.len(), 20000, "Body should be 20000 bytes");
+    }
+
+    // =========================================================================
+    // H4: CONTINUATION ordering validation
+    // =========================================================================
+
+    #[test]
+    fn test_continuation_expected_but_got_data() {
+        // HEADERS without END_HEADERS, then DATA on same stream — should be rejected
+        let mut state = H2ConnectionState::new();
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+        buffer.extend_from_slice(&create_settings_frame());
+
+        // HEADERS without END_HEADERS (flags=0x00)
+        let hpack = vec![0x82]; // :method: GET
+        let mut headers = vec![
+            0x00,
+            0x00,
+            hpack.len() as u8,
+            0x01, // HEADERS
+            0x00, // No flags (no END_HEADERS, no END_STREAM)
+            0x00,
+            0x00,
+            0x00,
+            0x01, // stream 1
+        ];
+        headers.extend(&hpack);
+        buffer.extend(headers);
+
+        // DATA on stream 1 (should expect CONTINUATION instead)
+        let data_frame = vec![
+            0x00, 0x00, 0x05, // length 5
+            0x00, // DATA
+            0x01, // END_STREAM
+            0x00, 0x00, 0x00, 0x01, // stream 1
+            0x68, 0x65, 0x6c, 0x6c, 0x6f, // "hello"
+        ];
+        buffer.extend(data_frame);
+
+        let result = parse_frames_stateful(&buffer, &mut state);
+        assert!(
+            matches!(result, Err(ParseError::Http2ContinuationExpected)),
+            "DATA after HEADERS without END_HEADERS should trigger ContinuationExpected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_continuation_wrong_stream_rejected() {
+        // HEADERS without END_HEADERS on stream 1, then CONTINUATION on stream 3
+        let mut state = H2ConnectionState::new();
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+        buffer.extend_from_slice(&create_settings_frame());
+
+        // HEADERS without END_HEADERS on stream 1
+        let hpack = vec![0x82]; // :method: GET
+        let mut headers = vec![
+            0x00,
+            0x00,
+            hpack.len() as u8,
+            0x01, // HEADERS
+            0x00, // No flags
+            0x00,
+            0x00,
+            0x00,
+            0x01, // stream 1
+        ];
+        headers.extend(&hpack);
+        buffer.extend(headers);
+
+        // CONTINUATION on stream 3 (wrong stream)
+        let cont_payload = vec![0x84]; // :path: /
+        let cont_frame = vec![
+            0x00,
+            0x00,
+            cont_payload.len() as u8,
+            0x09, // CONTINUATION
+            0x04, // END_HEADERS
+            0x00,
+            0x00,
+            0x00,
+            0x03, // stream 3 (wrong!)
+        ];
+        buffer.extend(cont_frame);
+        buffer.extend(cont_payload);
+
+        let result = parse_frames_stateful(&buffer, &mut state);
+        assert!(
+            matches!(result, Err(ParseError::Http2ContinuationExpected)),
+            "CONTINUATION on wrong stream should trigger ContinuationExpected, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_continuation_correct_ordering_succeeds() {
+        // HEADERS without END_HEADERS, then CONTINUATION with END_HEADERS — should succeed
+        let mut state = H2ConnectionState::new();
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+        buffer.extend_from_slice(&create_settings_frame());
+
+        // HEADERS without END_HEADERS
+        let hpack_part1 = vec![0x82]; // :method: GET
+        let mut headers = vec![
+            0x00,
+            0x00,
+            hpack_part1.len() as u8,
+            0x01, // HEADERS
+            0x01, // END_STREAM only (no END_HEADERS)
+            0x00,
+            0x00,
+            0x00,
+            0x01, // stream 1
+        ];
+        headers.extend(&hpack_part1);
+        buffer.extend(headers);
+
+        // CONTINUATION on same stream with END_HEADERS
+        let hpack_part2 = vec![0x84]; // :path: /
+        let mut cont = vec![
+            0x00,
+            0x00,
+            hpack_part2.len() as u8,
+            0x09, // CONTINUATION
+            0x04, // END_HEADERS
+            0x00,
+            0x00,
+            0x00,
+            0x01, // stream 1
+        ];
+        cont.extend(&hpack_part2);
+        buffer.extend(cont);
+
+        let result = parse_frames_stateful(&buffer, &mut state);
+        assert!(
+            result.is_ok(),
+            "Correct CONTINUATION ordering should succeed: {result:?}"
+        );
+
+        let messages = result.unwrap();
+        assert!(
+            messages.contains_key(&1),
+            "Stream 1 should complete with HEADERS + CONTINUATION"
+        );
+    }
+
+    // =========================================================================
+    // H3: SETTINGS payload length validation
+    // =========================================================================
+
+    #[test]
+    fn test_settings_payload_not_multiple_of_6() {
+        // SETTINGS frame with 7-byte payload (not a multiple of 6)
+        let mut state = H2ConnectionState::new();
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+
+        let settings_frame = vec![
+            0x00, 0x00, 0x07, // length = 7
+            0x04, // type = SETTINGS
+            0x00, // flags
+            0x00, 0x00, 0x00, 0x00, // stream_id = 0
+            0x00, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, // 7 bytes (invalid)
+        ];
+        buffer.extend(settings_frame);
+
+        let result = parse_frames_stateful(&buffer, &mut state);
+        assert!(
+            matches!(result, Err(ParseError::Http2SettingsLengthError)),
+            "SETTINGS with 7-byte payload should trigger SettingsLengthError, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_settings_empty_payload_ack_succeeds() {
+        // SETTINGS ACK has empty payload (0 % 6 == 0)
+        let mut state = H2ConnectionState::new();
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+        buffer.extend_from_slice(&create_settings_frame()); // 0-length settings
+
+        let result = parse_frames_stateful(&buffer, &mut state);
+        assert!(
+            result.is_ok(),
+            "SETTINGS ACK (empty payload) should succeed: {result:?}"
+        );
+    }
+
+    // =========================================================================
+    // H5: into_ zero-copy variants
+    // =========================================================================
+
+    #[test]
+    fn test_into_http_request() {
+        let msg = ParsedH2Message {
+            method: Some("GET".to_string()),
+            path: Some("/foo".to_string()),
+            authority: Some("example.com".to_string()),
+            scheme: Some("https".to_string()),
+            status: None,
+            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            stream_id: 1,
+            header_size: 100,
+            body: vec![1, 2, 3],
+            first_frame_timestamp_ns: 1000,
+            end_stream_timestamp_ns: 2000,
+        };
+
+        let req = msg
+            .into_http_request()
+            .expect("should produce an HttpRequest");
+        assert_eq!(req.method, http::Method::GET);
+        assert_eq!(req.uri, "/foo");
+        assert_eq!(req.body, vec![1, 2, 3]);
+        assert_eq!(req.timestamp_ns, 2000);
+    }
+
+    #[test]
+    fn test_into_http_response() {
+        let msg = ParsedH2Message {
+            method: None,
+            path: None,
+            authority: None,
+            scheme: None,
+            status: Some(200),
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            stream_id: 1,
+            header_size: 50,
+            body: vec![4, 5, 6],
+            first_frame_timestamp_ns: 3000,
+            end_stream_timestamp_ns: 4000,
+        };
+
+        let resp = msg
+            .into_http_response()
+            .expect("should produce an HttpResponse");
+        assert_eq!(resp.status, http::StatusCode::OK);
+        assert_eq!(resp.body, vec![4, 5, 6]);
+        assert_eq!(resp.timestamp_ns, 3000);
+    }
+
+    #[test]
+    fn test_into_http_request_returns_none_for_response() {
+        let msg = ParsedH2Message {
+            method: None,
+            path: None,
+            authority: None,
+            scheme: None,
+            status: Some(200),
+            headers: vec![],
+            stream_id: 1,
+            header_size: 10,
+            body: vec![],
+            first_frame_timestamp_ns: 0,
+            end_stream_timestamp_ns: 0,
+        };
+
+        assert!(msg.into_http_request().is_none());
+    }
+
+    // =========================================================================
+    // C1: Per-key Mutex preserves HPACK state across concurrent same-key calls
+    // =========================================================================
+
+    #[test]
+    fn test_per_key_mutex_preserves_hpack_state() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let cache = Arc::new(H2SessionCache::new());
+        let key = "shared".to_string();
+        let num_threads = 4;
+        let barrier = Arc::new(Barrier::new(num_threads));
+
+        // Pre-populate with preface + settings
+        let mut init_buffer = frame::CONNECTION_PREFACE.to_vec();
+        init_buffer.extend_from_slice(&create_settings_frame());
+        let _ = cache.parse(key.clone(), &init_buffer);
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let cache = Arc::clone(&cache);
+                let key = key.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait(); // Force overlapping access
+                    let stream_id = (i * 2 + 1) as u32;
+                    let hpack = vec![0x82]; // :method: GET
+                    let frame = create_headers_frame(stream_id, &hpack);
+                    let result = cache.parse(key, &frame);
+                    assert!(result.is_ok(), "Thread {i} should succeed");
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("Thread should not panic");
+        }
+
+        // HPACK dynamic table should be preserved — parse another request
+        let hpack = vec![0x82];
+        let frame = create_headers_frame(99, &hpack);
+        let result = cache.parse(key.clone(), &frame);
+        assert!(
+            result.is_ok(),
+            "Post-concurrent parse should succeed with intact HPACK state"
+        );
     }
 }

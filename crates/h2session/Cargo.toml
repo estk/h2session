@@ -3,10 +3,14 @@ name = "h2session"
 version.workspace = true
 edition.workspace = true
 
+[features]
+tracing = ["dep:tracing"]
+
 [dependencies]
 loona-hpack.workspace = true
 dashmap.workspace = true
 http.workspace = true
+tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
 h2 = "0.4"

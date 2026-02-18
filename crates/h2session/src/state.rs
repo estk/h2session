@@ -21,6 +21,11 @@ pub struct H2Limits {
     /// Maximum accumulated body size per stream in bytes (default: 10 MiB).
     /// Streams exceeding this limit are dropped to prevent memory exhaustion.
     pub max_body_size: usize,
+    /// Maximum buffer size for incremental parsing in bytes.
+    /// Rejects data that would grow the internal buffer beyond this limit.
+    /// Default: 1 MiB. This bounds per-connection memory while allowing
+    /// normal TCP read sizes and multi-frame chunks to be fed at once.
+    pub max_buffer_size: usize,
 }
 
 impl Default for H2Limits {
@@ -33,6 +38,7 @@ impl Default for H2Limits {
             max_concurrent_streams: 100,
             stream_timeout_ns: 30_000_000_000,
             max_body_size: 10 * 1024 * 1024, // 10 MiB
+            max_buffer_size: 1024 * 1024,    // 1 MiB
         }
     }
 }
@@ -66,6 +72,11 @@ pub struct H2ConnectionState {
 
     /// Internal buffer for incremental parsing
     pub(crate) buffer: Vec<u8>,
+
+    /// Stream ID expecting a CONTINUATION frame, or None if no CONTINUATION is pending.
+    /// When a HEADERS frame arrives without END_HEADERS, this is set to the stream ID.
+    /// Cleared when CONTINUATION with END_HEADERS arrives.
+    pub(crate) expecting_continuation: Option<u32>,
 
     /// Completed messages ready to be popped, stored as (stream_id, message)
     pub(crate) completed: VecDeque<(u32, ParsedH2Message)>,
@@ -145,6 +156,7 @@ impl Default for H2ConnectionState {
             preface_received: false,
             highest_stream_id: 0,
             buffer: Vec::new(),
+            expecting_continuation: None,
             completed: VecDeque::new(),
             current_timestamp_ns: 0,
         }
@@ -168,6 +180,7 @@ impl H2ConnectionState {
             preface_received: false,
             highest_stream_id: 0,
             buffer: Vec::new(),
+            expecting_continuation: None,
             completed: VecDeque::new(),
             current_timestamp_ns: 0,
         }
@@ -182,6 +195,9 @@ impl H2ConnectionState {
     /// Returns Ok(()) if data was processed (even if no messages completed yet).
     /// Returns Err only for fatal parse errors.
     pub fn feed(&mut self, data: &[u8], timestamp_ns: u64) -> Result<(), ParseError> {
+        if self.buffer.len() + data.len() > self.limits.max_buffer_size {
+            return Err(ParseError::Http2BufferTooLarge);
+        }
         self.buffer.extend_from_slice(data);
         self.current_timestamp_ns = timestamp_ns;
         crate::parse::parse_buffer_incremental(self)
@@ -224,8 +240,12 @@ impl H2ConnectionState {
         let max_streams = self.limits.max_concurrent_streams;
 
         // Evict streams that exceeded the timeout
-        self.active_streams.retain(|_, stream| {
-            current_time_ns.saturating_sub(stream.first_frame_timestamp_ns) < timeout
+        self.active_streams.retain(|_id, stream| {
+            let stale = current_time_ns.saturating_sub(stream.first_frame_timestamp_ns) >= timeout;
+            if stale {
+                crate::trace_warn!("evicting stale stream {_id} (timeout)");
+            }
+            !stale
         });
 
         // If still over the limit, evict oldest streams
@@ -236,6 +256,7 @@ impl H2ConnectionState {
                 .min_by_key(|(_, s)| s.first_frame_timestamp_ns)
                 .map(|(&id, _)| id);
             if let Some(id) = oldest_id {
+                crate::trace_warn!("evicting stream {id} (over max_concurrent_streams)");
                 self.active_streams.remove(&id);
             } else {
                 break;
@@ -365,6 +386,36 @@ impl ParsedH2Message {
             timestamp_ns: self.first_frame_timestamp_ns,
         })
     }
+
+    /// Consume this message and convert to an HttpRequest (zero-copy for body).
+    ///
+    /// Returns None if this is not a valid request (missing :method or :path).
+    pub fn into_http_request(self) -> Option<crate::HttpRequest> {
+        let method = self.http_method()?;
+        let uri = self.http_uri()?;
+        let headers = self.http_headers();
+        Some(crate::HttpRequest {
+            method,
+            uri,
+            headers,
+            body: self.body,
+            timestamp_ns: self.end_stream_timestamp_ns,
+        })
+    }
+
+    /// Consume this message and convert to an HttpResponse (zero-copy for body).
+    ///
+    /// Returns None if this is not a valid response (missing :status).
+    pub fn into_http_response(self) -> Option<crate::HttpResponse> {
+        let status = self.http_status()?;
+        let headers = self.http_headers();
+        Some(crate::HttpResponse {
+            status,
+            headers,
+            body: self.body,
+            timestamp_ns: self.first_frame_timestamp_ns,
+        })
+    }
 }
 
 /// Error type for parsing (public API)
@@ -388,6 +439,14 @@ pub enum ParseError {
     Http2StreamNotFound,
     /// Header contains invalid UTF-8 encoding
     Http2InvalidHeaderEncoding,
+    /// Internal buffer would exceed the configured max_buffer_size
+    Http2BufferTooLarge,
+    /// Frame payload length exceeds the negotiated max_frame_size
+    Http2FrameSizeError,
+    /// Expected a CONTINUATION frame but received a different frame type or wrong stream
+    Http2ContinuationExpected,
+    /// SETTINGS frame payload length is not a multiple of 6 bytes
+    Http2SettingsLengthError,
 }
 
 impl std::fmt::Display for ParseError {
@@ -413,6 +472,24 @@ impl std::fmt::Display for ParseError {
             Self::Http2StreamNotFound => write!(f, "HTTP/2 frame references unknown stream"),
             Self::Http2InvalidHeaderEncoding => {
                 write!(f, "HTTP/2 header contains invalid UTF-8 encoding")
+            }
+            Self::Http2BufferTooLarge => {
+                write!(f, "HTTP/2 internal buffer exceeds max_buffer_size")
+            }
+            Self::Http2FrameSizeError => {
+                write!(f, "HTTP/2 frame payload exceeds negotiated max_frame_size")
+            }
+            Self::Http2ContinuationExpected => {
+                write!(
+                    f,
+                    "HTTP/2 expected CONTINUATION frame but received different frame type or stream"
+                )
+            }
+            Self::Http2SettingsLengthError => {
+                write!(
+                    f,
+                    "HTTP/2 SETTINGS frame payload is not a multiple of 6 bytes"
+                )
             }
         }
     }

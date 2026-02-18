@@ -12,7 +12,7 @@ use crate::state::{H2ConnectionState, ParseError, ParsedH2Message, StreamState};
 ///
 /// NOTE: This function re-parses the entire buffer from the beginning each call.
 /// For incremental parsing, use `H2ConnectionState::feed()` instead.
-pub fn parse_frames_stateful(
+pub(crate) fn parse_frames_stateful(
     buffer: &[u8],
     state: &mut H2ConnectionState,
 ) -> Result<HashMap<u32, ParsedH2Message>, ParseError> {
@@ -29,10 +29,27 @@ pub fn parse_frames_stateful(
     // Parse frames
     while pos + FRAME_HEADER_SIZE <= buffer.len() {
         let header = parse_frame_header(&buffer[pos..])?;
-        let frame_total_size = FRAME_HEADER_SIZE + header.length as usize;
+
+        // H1: enforce max_frame_size (before checking completeness — reject
+        // oversized frames as soon as the header is visible)
+        if header.length > state.settings.max_frame_size {
+            return Err(ParseError::Http2FrameSizeError);
+        }
+
+        // C4: checked arithmetic for frame total size
+        let frame_total_size = FRAME_HEADER_SIZE
+            .checked_add(header.length as usize)
+            .ok_or(ParseError::Http2InvalidFrame)?;
 
         if pos + frame_total_size > buffer.len() {
             break; // Incomplete frame
+        }
+
+        // H4: validate CONTINUATION ordering
+        if let Some(expected_stream) = state.expecting_continuation {
+            if header.frame_type != FRAME_TYPE_CONTINUATION || header.stream_id != expected_stream {
+                return Err(ParseError::Http2ContinuationExpected);
+            }
         }
 
         let frame_payload = &buffer[pos + FRAME_HEADER_SIZE..pos + frame_total_size];
@@ -95,10 +112,23 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
             Ok(h) => h,
             Err(_) => break,
         };
-        let frame_total_size = FRAME_HEADER_SIZE + header.length as usize;
+
+        // C4: checked arithmetic for frame total size
+        let frame_total_size = match FRAME_HEADER_SIZE.checked_add(header.length as usize) {
+            Some(s) => s,
+            None => break,
+        };
 
         if pos + frame_total_size > state.buffer.len() {
             break; // Incomplete frame - wait for more data
+        }
+
+        // H4: validate CONTINUATION ordering (non-fatal: skip unexpected frame)
+        if let Some(expected_stream) = state.expecting_continuation {
+            if header.frame_type != FRAME_TYPE_CONTINUATION || header.stream_id != expected_stream {
+                pos += frame_total_size;
+                continue;
+            }
         }
 
         let frame_payload = state.buffer[pos + FRAME_HEADER_SIZE..pos + frame_total_size].to_vec();
@@ -118,13 +148,15 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
 
         let stream_id = header.stream_id;
 
-        if let Err(e) = result {
+        if let Err(ref e) = result {
             // HPACK errors corrupt the decoder's dynamic table — stop parsing
             if matches!(e, ParseError::Http2HpackError(_)) {
-                fatal_error = Some(e);
+                crate::trace_warn!("fatal HPACK error on stream {stream_id}: {e}");
+                fatal_error = Some(result.unwrap_err());
                 break;
             }
             // Other errors (missing stream, padding) are non-fatal: skip frame
+            crate::trace_warn!("non-fatal frame error on stream {stream_id}: {e}");
             continue;
         }
 
@@ -162,6 +194,7 @@ fn handle_headers_frame(
     if !state.active_streams.contains_key(&stream_id)
         && state.active_streams.len() >= state.limits.max_concurrent_streams
     {
+        crate::trace_warn!("max concurrent streams reached, rejecting stream {stream_id}");
         return Err(ParseError::Http2MaxConcurrentStreams);
     }
 
@@ -213,9 +246,11 @@ fn handle_headers_frame(
 
         decode_headers_into_stream(&mut state.decoder, stream, &full_block, &state.limits)?;
         stream.end_headers_seen = true;
+        state.expecting_continuation = None;
     } else {
         // Incomplete header block - wait for CONTINUATION
         stream.continuation_buffer.extend_from_slice(header_block);
+        state.expecting_continuation = Some(stream_id);
     }
 
     // Check END_STREAM flag
@@ -244,6 +279,7 @@ fn handle_continuation_frame(
         let buf = std::mem::take(&mut stream.continuation_buffer);
         decode_headers_into_stream(&mut state.decoder, stream, &buf, &state.limits)?;
         stream.end_headers_seen = true;
+        state.expecting_continuation = None;
     }
 
     Ok(())
@@ -279,6 +315,10 @@ fn handle_data_frame(
             .ok_or(ParseError::Http2StreamNotFound)?;
         if stream.body.len() + data.len() > state.limits.max_body_size {
             // Drop the stream rather than accumulating unbounded data
+            crate::trace_warn!(
+                "body size limit exceeded on stream {}, dropping stream",
+                header.stream_id
+            );
             state.active_streams.remove(&header.stream_id);
             return Ok(());
         }
@@ -304,6 +344,11 @@ fn handle_settings_frame(
     _header: &FrameHeader,
     payload: &[u8],
 ) -> Result<(), ParseError> {
+    // H3: SETTINGS payload must be a multiple of 6 bytes (RFC 7540 §6.5)
+    if payload.len() % 6 != 0 {
+        return Err(ParseError::Http2SettingsLengthError);
+    }
+
     // Settings frame: 6 bytes per setting (2-byte id, 4-byte value)
     let mut pos = 0;
     while pos + 6 <= payload.len() {
@@ -335,6 +380,13 @@ fn handle_settings_frame(
     Ok(())
 }
 
+/// Decode an HPACK header block into the given stream's header state.
+///
+/// The HPACK decoder's dynamic table is mutated during `decode_with_cb`.
+/// If invalid UTF-8 is encountered, the dynamic table has already been
+/// updated with the invalid entry. This is a known limitation of
+/// `loona-hpack`'s callback API. For passive monitoring, this is acceptable
+/// since we prioritize keeping the connection parseable over strict validation.
 fn decode_headers_into_stream(
     decoder: &mut loona_hpack::Decoder<'static>,
     stream: &mut StreamState,
@@ -391,10 +443,14 @@ fn decode_headers_into_stream(
         .map_err(|e| ParseError::Http2HpackError(format!("{e:?}")))?;
 
     if encoding_error {
+        crate::trace_warn!(
+            "HPACK decoded header with invalid UTF-8; dynamic table may contain tainted entry"
+        );
         return Err(ParseError::Http2InvalidHeaderEncoding);
     }
 
     if limit_exceeded {
+        crate::trace_warn!("HPACK header list size/count limit exceeded");
         return Err(ParseError::Http2HeaderListTooLarge);
     }
 

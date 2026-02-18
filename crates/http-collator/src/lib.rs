@@ -39,7 +39,7 @@ pub use h1::{HttpRequest, HttpResponse};
 pub use traits::{DataEvent, Direction};
 
 use connection::Connection as Conn;
-use h2session::{is_http2_preface, looks_like_http2_frame, H2ConnectionState};
+use h2session::{H2ConnectionState, is_http2_preface, looks_like_http2_frame};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
@@ -147,9 +147,30 @@ impl<E: DataEvent> Collator<E> {
             conn.protocol = detect_protocol(buf);
         }
 
+        // Detect protocol change on an established connection (FD reuse).
+        // If the connection has a known protocol but incoming data suggests a
+        // different one, reset the connection and start fresh.
+        if conn.protocol != Protocol::Unknown {
+            let incoming_protocol = detect_protocol(buf);
+            if incoming_protocol != Protocol::Unknown && incoming_protocol != conn.protocol {
+                reset_connection_for_protocol_change(conn, incoming_protocol);
+            }
+        }
+
         // Add chunk to appropriate buffer based on direction
         match direction {
             Direction::Write => {
+                // Track accumulated body size and enforce limit
+                conn.request_body_size += buf.len();
+                if conn.request_body_size > self.config.max_body_size {
+                    reset_connection_body_limit(conn);
+                    return Vec::new();
+                }
+
+                // Append to HTTP/1 growable buffer (avoids O(n²) reconstruction)
+                if conn.protocol == Protocol::Http1 {
+                    conn.h1_request_buffer.extend_from_slice(buf);
+                }
                 conn.request_chunks.push(chunk);
 
                 // Parse incrementally based on protocol
@@ -169,6 +190,17 @@ impl<E: DataEvent> Collator<E> {
                 }
             }
             Direction::Read => {
+                // Track accumulated body size and enforce limit
+                conn.response_body_size += buf.len();
+                if conn.response_body_size > self.config.max_body_size {
+                    reset_connection_body_limit(conn);
+                    return Vec::new();
+                }
+
+                // Append to HTTP/1 growable buffer (avoids O(n²) reconstruction)
+                if conn.protocol == Protocol::Http1 {
+                    conn.h1_response_buffer.extend_from_slice(buf);
+                }
                 conn.response_chunks.push(chunk);
 
                 // Parse incrementally based on protocol
@@ -221,13 +253,25 @@ impl<E: DataEvent> Collator<E> {
         events
     }
 
-    /// Clean up stale connections
-    #[allow(dead_code)]
+    /// Clean up stale connections and evict stale H2 streams.
+    ///
+    /// Callers should invoke this periodically to bound memory usage from
+    /// abandoned connections and incomplete HTTP/2 streams.
     pub fn cleanup(&mut self, current_time_ns: u64) {
         self.connections
             .retain(|_, conn| current_time_ns - conn.last_activity_ns < self.config.timeout_ns);
         self.ssl_connections
             .retain(|_, conn| current_time_ns - conn.last_activity_ns < self.config.timeout_ns);
+
+        // Evict stale H2 streams within surviving connections
+        for conn in self.connections.values_mut() {
+            conn.h2_write_state.evict_stale_streams(current_time_ns);
+            conn.h2_read_state.evict_stale_streams(current_time_ns);
+        }
+        for conn in self.ssl_connections.values_mut() {
+            conn.h2_write_state.evict_stale_streams(current_time_ns);
+            conn.h2_read_state.evict_stale_streams(current_time_ns);
+        }
     }
 
     /// Remove a connection explicitly (e.g., on connection close)
@@ -343,29 +387,87 @@ fn emit_message_events(
 
 /// Reset connection state after emitting an exchange
 fn reset_connection_after_exchange(conn: &mut Conn) {
-    // For HTTP/1: clear everything including parsed messages
-    // For HTTP/2: only the matched pair was removed in build_exchange;
-    //             clear chunks but keep remaining pending messages
-    conn.request_chunks.clear();
-    conn.response_chunks.clear();
-    conn.h2_write_state.clear_buffer();
-    conn.h2_read_state.clear_buffer();
     conn.request_complete = false;
     conn.response_complete = false;
 
     if conn.protocol == Protocol::Http1 {
+        // HTTP/1: clear everything for the next exchange
+        conn.request_chunks.clear();
+        conn.response_chunks.clear();
         conn.h1_request = None;
         conn.h1_response = None;
         conn.h1_request_emitted = false;
         conn.h1_response_emitted = false;
+        conn.h1_request_buffer.clear();
+        conn.h1_response_buffer.clear();
         conn.protocol = Protocol::Unknown;
+    } else if conn.protocol == Protocol::Http2 {
+        // HTTP/2: only clear chunks if no other pending messages remain.
+        // The matched pair was already removed in build_exchange().
+        // Keep h2_*_state HPACK decoder for connection persistence.
+        // h2_emitted_* sets are cleaned up in build_exchange when
+        // the stream_id is removed from pending.
+        if conn.pending_requests.is_empty() && conn.pending_responses.is_empty() {
+            conn.request_chunks.clear();
+            conn.response_chunks.clear();
+            conn.h2_write_state.clear_buffer();
+            conn.h2_read_state.clear_buffer();
+        }
     }
-    // Note: For HTTP/2, don't clear pending_requests/pending_responses
-    //       as they may contain other streams. The matched pair was
-    //       already removed in build_exchange().
-    // Note: Keep h2_*_state HPACK decoder for connection persistence.
-    // Note: h2_emitted_* sets are cleaned up in build_exchange when
-    //       the stream_id is removed from pending.
+
+    // Reset body size tracking for the next exchange
+    conn.request_body_size = 0;
+    conn.response_body_size = 0;
+}
+
+/// Reset connection when accumulated body size exceeds the limit.
+/// Drops all accumulated data and parsed state for this connection.
+fn reset_connection_body_limit(conn: &mut Conn) {
+    conn.request_chunks.clear();
+    conn.response_chunks.clear();
+    conn.h1_request_buffer.clear();
+    conn.h1_response_buffer.clear();
+    conn.h1_request = None;
+    conn.h1_response = None;
+    conn.h1_request_emitted = false;
+    conn.h1_response_emitted = false;
+    conn.h2_write_state = H2ConnectionState::new();
+    conn.h2_read_state = H2ConnectionState::new();
+    conn.pending_requests.clear();
+    conn.pending_responses.clear();
+    conn.h2_emitted_requests.clear();
+    conn.h2_emitted_responses.clear();
+    conn.ready_streams.clear();
+    conn.request_complete = false;
+    conn.response_complete = false;
+    conn.request_body_size = 0;
+    conn.response_body_size = 0;
+    conn.protocol = Protocol::Unknown;
+}
+
+/// Reset connection when the detected protocol changes (FD reuse with
+/// different protocol, e.g., HTTP/2 followed by HTTP/1 on the same fd).
+fn reset_connection_for_protocol_change(conn: &mut Conn, new_protocol: Protocol) {
+    conn.request_chunks.clear();
+    conn.response_chunks.clear();
+    conn.h1_request_buffer.clear();
+    conn.h1_response_buffer.clear();
+    conn.h1_request = None;
+    conn.h1_response = None;
+    conn.h1_request_emitted = false;
+    conn.h1_response_emitted = false;
+    conn.h2_write_state = H2ConnectionState::new();
+    conn.h2_read_state = H2ConnectionState::new();
+    conn.pending_requests.clear();
+    conn.pending_responses.clear();
+    conn.h2_emitted_requests.clear();
+    conn.h2_emitted_responses.clear();
+    conn.ready_streams.clear();
+    conn.request_complete = false;
+    conn.response_complete = false;
+    conn.request_body_size = 0;
+    conn.response_body_size = 0;
+    conn.protocol = new_protocol;
 }
 
 fn detect_protocol(data: &[u8]) -> Protocol {
@@ -424,6 +526,7 @@ fn parse_http2_chunks(conn: &mut Conn, direction: Direction) {
         conn.pending_responses.clear();
         conn.h2_emitted_requests.clear();
         conn.h2_emitted_responses.clear();
+        conn.ready_streams.clear();
     }
 
     let (chunks, h2_state) = match direction {
@@ -440,54 +543,48 @@ fn parse_http2_chunks(conn: &mut Conn, direction: Direction) {
     // Feed to direction-specific h2 parser; errors are non-fatal
     let _ = h2_state.feed(&chunk.data, chunk.timestamp_ns);
 
-    // Pop completed messages and classify by content, not direction
+    // Pop completed messages and classify by content, not direction.
+    // Maintain ready_streams set for O(1) complete-pair lookup.
     while let Some((stream_id, msg)) = h2_state.try_pop() {
         if msg.is_request() {
             conn.pending_requests.insert(stream_id, msg);
+            if conn.pending_responses.contains_key(&stream_id) {
+                conn.ready_streams.insert(stream_id);
+            }
         } else if msg.is_response() {
             conn.pending_responses.insert(stream_id, msg);
+            if conn.pending_requests.contains_key(&stream_id) {
+                conn.ready_streams.insert(stream_id);
+            }
         }
     }
 }
 
-/// Find a stream_id that has both request and response ready
+/// Find a stream_id that has both request and response ready (O(1) via ready_streams set)
 fn find_complete_h2_stream(conn: &Conn) -> Option<u32> {
-    conn.pending_requests
-        .keys()
-        .find(|id| conn.pending_responses.contains_key(id))
-        .copied()
+    conn.ready_streams.iter().next().copied()
 }
 
-/// Try to parse HTTP/1 request from accumulated chunks.
+/// Try to parse HTTP/1 request from accumulated buffer.
 /// If complete, stores the parsed request in conn.h1_request.
 fn try_parse_http1_request_chunks(conn: &mut Conn) {
-    let all_data: Vec<u8> = conn
-        .request_chunks
-        .iter()
-        .flat_map(|c| c.data.clone())
-        .collect();
     let timestamp = conn
         .request_chunks
         .last()
         .map(|c| c.timestamp_ns)
         .unwrap_or(0);
-    conn.h1_request = h1::try_parse_http1_request(&all_data, timestamp);
+    conn.h1_request = h1::try_parse_http1_request(&conn.h1_request_buffer, timestamp);
 }
 
-/// Try to parse HTTP/1 response from accumulated chunks.
+/// Try to parse HTTP/1 response from accumulated buffer.
 /// If complete, stores the parsed response in conn.h1_response.
 fn try_parse_http1_response_chunks(conn: &mut Conn) {
-    let all_data: Vec<u8> = conn
-        .response_chunks
-        .iter()
-        .flat_map(|c| c.data.clone())
-        .collect();
     let timestamp = conn
         .response_chunks
         .first()
         .map(|c| c.timestamp_ns)
         .unwrap_or(0);
-    conn.h1_response = h1::try_parse_http1_response(&all_data, timestamp);
+    conn.h1_response = h1::try_parse_http1_response(&conn.h1_response_buffer, timestamp);
 }
 
 fn is_request_complete(conn: &Conn) -> bool {
@@ -520,9 +617,10 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
             let msg_req = conn.pending_requests.remove(&sid)?;
             let msg_resp = conn.pending_responses.remove(&sid)?;
 
-            // Clean up emission tracking for this stream
+            // Clean up emission and ready tracking for this stream
             conn.h2_emitted_requests.remove(&sid);
             conn.h2_emitted_responses.remove(&sid);
+            conn.ready_streams.remove(&sid);
 
             // For HTTP/2, use per-stream timestamps from the parsed messages
             // Request complete time: when END_STREAM was seen on request
@@ -892,8 +990,7 @@ mod tests {
         headers.extend(&hpack);
         req1.extend(headers);
 
-        let req1_event =
-            make_event(Direction::Read, conn_id, process_id, 80, 1_000_000, &req1);
+        let req1_event = make_event(Direction::Read, conn_id, process_id, 80, 1_000_000, &req1);
         let _ = collator.add_event(&req1_event);
 
         // Response: HEADERS with :status 200 (END_STREAM)
@@ -911,14 +1008,7 @@ mod tests {
         ];
         resp1.extend(&resp_hpack);
 
-        let resp1_event = make_event(
-            Direction::Write,
-            conn_id,
-            process_id,
-            80,
-            2_000_000,
-            &resp1,
-        );
+        let resp1_event = make_event(Direction::Write, conn_id, process_id, 80, 2_000_000, &resp1);
         let events1 = collator.add_event(&resp1_event);
         assert!(
             events1.iter().any(|e| e.is_exchange()),
@@ -933,14 +1023,7 @@ mod tests {
         req2.extend(build_headers_frame(1, &hpack_get_request()));
         req2.extend(build_data_frame(1, &body, true));
 
-        let req2_event = make_event(
-            Direction::Read,
-            conn_id,
-            process_id,
-            80,
-            3_000_000,
-            &req2,
-        );
+        let req2_event = make_event(Direction::Read, conn_id, process_id, 80, 3_000_000, &req2);
         let events2 = collator.add_event(&req2_event);
 
         // Should have emitted a request Message for the second connection
@@ -952,9 +1035,8 @@ mod tests {
             }
             None
         });
-        let request = request_msg.expect(
-            "Second h2 connection on reused fd should parse successfully",
-        );
+        let request =
+            request_msg.expect("Second h2 connection on reused fd should parse successfully");
         match request {
             ParsedHttpMessage::Request(req) => {
                 assert_eq!(
@@ -997,8 +1079,7 @@ mod tests {
         headers.extend(&hpack);
         req1.extend(headers);
 
-        let req1_event =
-            make_event(Direction::Read, conn_id, process_id, 80, 1_000_000, &req1);
+        let req1_event = make_event(Direction::Read, conn_id, process_id, 80, 1_000_000, &req1);
         let _ = collator.add_event(&req1_event);
 
         // Response on Write direction
@@ -1016,14 +1097,7 @@ mod tests {
         ];
         resp1.extend(&resp_hpack);
 
-        let resp1_event = make_event(
-            Direction::Write,
-            conn_id,
-            process_id,
-            80,
-            2_000_000,
-            &resp1,
-        );
+        let resp1_event = make_event(Direction::Write, conn_id, process_id, 80, 2_000_000, &resp1);
         let events1 = collator.add_event(&resp1_event);
         assert!(
             events1.iter().any(|e| e.is_exchange()),
@@ -1040,14 +1114,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x01, // last_stream_id = 1
             0x00, 0x00, 0x00, 0x00, // error_code = NO_ERROR
         ];
-        let goaway_event = make_event(
-            Direction::Read,
-            conn_id,
-            process_id,
-            80,
-            2_500_000,
-            &goaway,
-        );
+        let goaway_event = make_event(Direction::Read, conn_id, process_id, 80, 2_500_000, &goaway);
         let _ = collator.add_event(&goaway_event);
 
         // --- Second exchange: same conn_id (fd reused), large POST body ---
@@ -1132,14 +1199,7 @@ mod tests {
         ];
         resp2.extend(&resp2_hpack);
 
-        let resp2_event = make_event(
-            Direction::Write,
-            conn_id,
-            process_id,
-            80,
-            ts,
-            &resp2,
-        );
+        let resp2_event = make_event(Direction::Write, conn_id, process_id, 80, ts, &resp2);
         let events2 = collator.add_event(&resp2_event);
 
         // Should produce a complete exchange
@@ -1598,6 +1658,221 @@ mod tests {
                 && exchange.latency_ns <= expected_latency + 1_000_000,
             "Expected latency ~50ms, got {} ns",
             exchange.latency_ns
+        );
+    }
+
+    // =========================================================================
+    // CRITICAL-3: cleanup() removes stale connections and evicts stale streams
+    // =========================================================================
+
+    #[test]
+    fn test_cleanup_removes_stale_connections() {
+        let config = CollatorConfig {
+            timeout_ns: 5_000_000_000, // 5 seconds
+            ..CollatorConfig::default()
+        };
+        let mut collator: Collator<TestEvent> = Collator::with_config(config);
+
+        // Add event at t=1s
+        let event = make_event(
+            Direction::Write,
+            1,
+            1234,
+            8080,
+            1_000_000_000,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        );
+        let _ = collator.add_event(&event);
+        assert_eq!(collator.connections.len(), 1);
+
+        // Cleanup at t=3s — connection is only 2s old, should survive
+        collator.cleanup(3_000_000_000);
+        assert_eq!(
+            collator.connections.len(),
+            1,
+            "Connection should survive (2s < 5s timeout)"
+        );
+
+        // Cleanup at t=7s — connection is 6s old, should be removed
+        collator.cleanup(7_000_000_000);
+        assert_eq!(
+            collator.connections.len(),
+            0,
+            "Connection should be removed (6s > 5s timeout)"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_evicts_stale_h2_streams() {
+        let mut collator: Collator<TestEvent> = Collator::new();
+        let conn_id = 42u64;
+
+        // Send H2 preface + settings + HEADERS (no END_STREAM) at t=1s
+        let hpack = hpack_get_request();
+        let mut payload = H2_PREFACE.to_vec();
+        payload.extend(build_settings_frame());
+        // HEADERS with END_HEADERS only (stream stays incomplete)
+        let mut headers = vec![
+            (hpack.len() >> 16) as u8,
+            (hpack.len() >> 8) as u8,
+            hpack.len() as u8,
+            0x01, // HEADERS
+            0x04, // END_HEADERS only
+            0x00,
+            0x00,
+            0x00,
+            0x01, // stream 1
+        ];
+        headers.extend(&hpack);
+        payload.extend(headers);
+
+        let event = make_event(
+            Direction::Write,
+            conn_id,
+            1000,
+            8080,
+            1_000_000_000,
+            &payload,
+        );
+        let _ = collator.add_event(&event);
+
+        // Verify stream is active
+        let conn = collator.connections.get(&conn_id).unwrap();
+        assert_eq!(conn.h2_write_state.active_stream_count(), 1);
+
+        // Cleanup at t=40s (> default 30s stream timeout) with a recent last_activity
+        // First update last_activity so the connection itself survives
+        collator
+            .connections
+            .get_mut(&conn_id)
+            .unwrap()
+            .last_activity_ns = 39_000_000_000;
+        collator.cleanup(40_000_000_000);
+
+        // Connection should survive but stale stream should be evicted
+        assert_eq!(
+            collator.connections.len(),
+            1,
+            "Connection should survive (recent activity)"
+        );
+        let conn = collator.connections.get(&conn_id).unwrap();
+        assert_eq!(
+            conn.h2_write_state.active_stream_count(),
+            0,
+            "Stale H2 stream should be evicted by cleanup"
+        );
+    }
+
+    // =========================================================================
+    // HIGH-4: Body size limit resets connection
+    // =========================================================================
+
+    #[test]
+    fn test_body_size_limit_resets_connection() {
+        let config = CollatorConfig {
+            max_body_size: 100, // Very small limit for testing
+            ..CollatorConfig::default()
+        };
+        let mut collator: Collator<TestEvent> = Collator::with_config(config);
+
+        // Send a request that exceeds the body size limit
+        let large_body = vec![b'X'; 200];
+        let mut payload = b"POST / HTTP/1.1\r\nContent-Length: 200\r\n\r\n".to_vec();
+        payload.extend(&large_body);
+
+        // First chunk: headers + partial body (under limit)
+        let event1 = make_event(Direction::Write, 1, 1234, 8080, 1_000_000, &payload[..80]);
+        let events1 = collator.add_event(&event1);
+        assert!(events1.is_empty());
+
+        // Second chunk: remaining body (exceeds limit)
+        let event2 = make_event(Direction::Write, 1, 1234, 8080, 2_000_000, &payload[80..]);
+        let events2 = collator.add_event(&event2);
+        assert!(
+            events2.is_empty(),
+            "Should not emit after body limit exceeded"
+        );
+
+        // Connection should be reset — protocol should be Unknown again
+        let conn = collator.connections.get(&1).unwrap();
+        assert_eq!(conn.protocol, Protocol::Unknown);
+        assert!(conn.request_chunks.is_empty());
+        assert_eq!(conn.request_body_size, 0);
+    }
+
+    #[test]
+    fn test_body_size_limit_normal_request_works() {
+        let config = CollatorConfig {
+            max_body_size: 1000,
+            ..CollatorConfig::default()
+        };
+        let mut collator: Collator<TestEvent> = Collator::with_config(config);
+
+        // Request well under the limit
+        let event = make_event(
+            Direction::Write,
+            1,
+            1234,
+            8080,
+            1_000_000,
+            b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        );
+        let events = collator.add_event(&event);
+        assert_eq!(events.len(), 1, "Normal request should parse fine");
+        assert!(events[0].is_message());
+    }
+
+    // =========================================================================
+    // MED-3: FD reuse with protocol change (HTTP/2 → HTTP/1)
+    // =========================================================================
+
+    #[test]
+    fn test_fd_reuse_http2_to_http1() {
+        let mut collator: Collator<TestEvent> = Collator::new();
+        let conn_id = 55555u64;
+
+        // First: HTTP/2 exchange
+        let hpack = hpack_get_request();
+        let mut h2_req = H2_PREFACE.to_vec();
+        h2_req.extend(build_settings_frame());
+        let mut headers = vec![
+            (hpack.len() >> 16) as u8,
+            (hpack.len() >> 8) as u8,
+            hpack.len() as u8,
+            0x01,
+            0x05, // END_HEADERS | END_STREAM
+            0x00,
+            0x00,
+            0x00,
+            0x01,
+        ];
+        headers.extend(&hpack);
+        h2_req.extend(headers);
+
+        let h2_event = make_event(Direction::Write, conn_id, 1000, 80, 1_000_000, &h2_req);
+        let _ = collator.add_event(&h2_event);
+
+        // Connection is now HTTP/2
+        assert_eq!(
+            collator.connections.get(&conn_id).unwrap().protocol,
+            Protocol::Http2
+        );
+
+        // Now: HTTP/1 data arrives on the same fd (protocol change)
+        let h1_req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let h1_event = make_event(Direction::Write, conn_id, 1000, 80, 2_000_000, h1_req);
+        let events = collator.add_event(&h1_event);
+
+        // Should have reset to HTTP/1 and parsed the request
+        let conn = collator.connections.get(&conn_id).unwrap();
+        assert_eq!(
+            conn.protocol,
+            Protocol::Http1,
+            "Protocol should switch to HTTP/1"
+        );
+        assert!(
+            events.iter().any(|e| e.is_message()),
+            "HTTP/1 request should be parsed after protocol change"
         );
     }
 }

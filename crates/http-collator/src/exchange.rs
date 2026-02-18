@@ -106,6 +106,10 @@ pub struct CollatorConfig {
     pub max_buf_size: usize,
     /// Connection timeout for cleanup in nanoseconds
     pub timeout_ns: u64,
+    /// Maximum accumulated body size per direction before the connection is
+    /// reset. Prevents unbounded memory growth from stalled or malicious
+    /// connections. Default: 10 MiB.
+    pub max_body_size: usize,
 }
 
 impl Default for CollatorConfig {
@@ -115,6 +119,7 @@ impl Default for CollatorConfig {
             emit_exchanges: true,
             max_buf_size: 16384,
             timeout_ns: 5_000_000_000,
+            max_body_size: 10 * 1024 * 1024, // 10 MiB
         }
     }
 }

@@ -3,7 +3,7 @@ name = "h2session-fuzz"
 version = "0.0.0"
 authors = ["Automatically generated"]
 publish = false
-edition.workspace = true
+edition = "2024"
 
 [package.metadata]
 cargo-fuzz = true
@@ -14,6 +14,9 @@ arbitrary = { version = "1", features = ["derive"] }
 
 [dependencies.h2session]
 path = "../crates/h2session"
+
+[dependencies.http-collator]
+path = "../crates/http-collator"
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -32,6 +35,13 @@ bench = false
 [[bin]]
 name = "fuzz_structured"
 path = "fuzz_targets/fuzz_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_http1"
+path = "fuzz_targets/fuzz_http1.rs"
 test = false
 doc = false
 bench = false

@@ -1,5 +1,38 @@
 use std::collections::{HashMap, VecDeque};
 
+/// Configurable limits for HTTP/2 header decoding and stream management.
+///
+/// These limits defend against resource exhaustion from untrusted input
+/// (e.g., HPACK decompression bombs, stream flooding).
+#[derive(Debug, Clone)]
+pub struct H2Limits {
+    /// Maximum total decoded header list size in bytes (default: 65536, RFC 7540 default)
+    pub max_header_list_size: usize,
+    /// Maximum number of headers per HEADERS block (default: 128)
+    pub max_header_count: usize,
+    /// Maximum size of any individual header value in bytes (default: 8192)
+    pub max_header_value_size: usize,
+    /// Hard cap for HPACK dynamic table size (default: 65536)
+    pub max_table_size: usize,
+    /// Maximum concurrent active streams before rejecting new ones (default: 100)
+    pub max_concurrent_streams: usize,
+    /// Stream timeout in nanoseconds — streams older than this are evicted (default: 30s)
+    pub stream_timeout_ns: u64,
+}
+
+impl Default for H2Limits {
+    fn default() -> Self {
+        Self {
+            max_header_list_size: 65536,
+            max_header_count: 128,
+            max_header_value_size: 8192,
+            max_table_size: 65536,
+            max_concurrent_streams: 100,
+            stream_timeout_ns: 30_000_000_000,
+        }
+    }
+}
+
 /// Connection-level HTTP/2 state
 ///
 /// Maintains HPACK decoder state and active stream tracking for a single
@@ -17,6 +50,9 @@ pub struct H2ConnectionState {
 
     /// Connection settings (from SETTINGS frames)
     pub(crate) settings: H2Settings,
+
+    /// Resource limits for header decoding and stream management
+    pub(crate) limits: H2Limits,
 
     /// Whether the connection preface has been seen
     pub preface_received: bool,
@@ -94,10 +130,14 @@ impl Default for H2Settings {
 
 impl Default for H2ConnectionState {
     fn default() -> Self {
+        let limits = H2Limits::default();
+        let mut decoder = loona_hpack::Decoder::new();
+        decoder.set_max_allowed_table_size(limits.max_table_size);
         Self {
-            decoder: loona_hpack::Decoder::new(),
+            decoder,
             active_streams: HashMap::new(),
             settings: H2Settings::default(),
+            limits,
             preface_received: false,
             highest_stream_id: 0,
             buffer: Vec::new(),
@@ -110,6 +150,23 @@ impl Default for H2ConnectionState {
 impl H2ConnectionState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a new H2ConnectionState with custom limits.
+    pub fn with_limits(limits: H2Limits) -> Self {
+        let mut decoder = loona_hpack::Decoder::new();
+        decoder.set_max_allowed_table_size(limits.max_table_size);
+        Self {
+            decoder,
+            active_streams: HashMap::new(),
+            settings: H2Settings::default(),
+            limits,
+            preface_received: false,
+            highest_stream_id: 0,
+            buffer: Vec::new(),
+            completed: VecDeque::new(),
+            current_timestamp_ns: 0,
+        }
     }
 
     /// Feed new data for incremental parsing with a timestamp.
@@ -143,6 +200,43 @@ impl H2ConnectionState {
     /// Preserves HPACK decoder state for connection persistence.
     pub fn clear_buffer(&mut self) {
         self.buffer.clear();
+    }
+
+    /// Returns the number of active (incomplete) streams.
+    pub fn active_stream_count(&self) -> usize {
+        self.active_streams.len()
+    }
+
+    /// Evict stale streams that have exceeded the configured timeout.
+    ///
+    /// Removes streams whose first frame arrived more than `stream_timeout_ns`
+    /// ago. If still over `max_concurrent_streams` after timeout eviction,
+    /// removes the oldest streams by `first_frame_timestamp_ns`.
+    ///
+    /// Callers should invoke this periodically (e.g., during cleanup or
+    /// after each parsing pass) to bound memory usage from incomplete streams.
+    pub fn evict_stale_streams(&mut self, current_time_ns: u64) {
+        let timeout = self.limits.stream_timeout_ns;
+        let max_streams = self.limits.max_concurrent_streams;
+
+        // Evict streams that exceeded the timeout
+        self.active_streams.retain(|_, stream| {
+            current_time_ns.saturating_sub(stream.first_frame_timestamp_ns) < timeout
+        });
+
+        // If still over the limit, evict oldest streams
+        while self.active_streams.len() > max_streams {
+            let oldest_id = self
+                .active_streams
+                .iter()
+                .min_by_key(|(_, s)| s.first_frame_timestamp_ns)
+                .map(|(&id, _)| id);
+            if let Some(id) = oldest_id {
+                self.active_streams.remove(&id);
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -275,8 +369,49 @@ pub enum ParseError {
     Http2BufferTooSmall,
     Http2HpackError(String),
     Http2HeadersIncomplete,
+    Http2HeaderListTooLarge,
     Http2NoMethod,
     Http2NoPath,
     Http2NoStatus,
     Http2InvalidFrame,
+    /// Rejected because max concurrent streams limit was reached
+    Http2MaxConcurrentStreams,
+    /// Padded frame has missing or invalid padding
+    Http2PaddingError,
+    /// PRIORITY flag present but header block too short for priority fields
+    Http2PriorityError,
+    /// DATA or CONTINUATION frame references a stream that does not exist
+    Http2StreamNotFound,
+    /// Header contains invalid UTF-8 encoding
+    Http2InvalidHeaderEncoding,
 }
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http2BufferTooSmall => write!(f, "HTTP/2 buffer too small to parse frame header"),
+            Self::Http2HpackError(msg) => write!(f, "HTTP/2 HPACK decoding error: {msg}"),
+            Self::Http2HeadersIncomplete => {
+                write!(f, "HTTP/2 headers incomplete (missing CONTINUATION)")
+            }
+            Self::Http2HeaderListTooLarge => write!(f, "HTTP/2 header list exceeds size limits"),
+            Self::Http2NoMethod => write!(f, "HTTP/2 request missing :method pseudo-header"),
+            Self::Http2NoPath => write!(f, "HTTP/2 request missing :path pseudo-header"),
+            Self::Http2NoStatus => write!(f, "HTTP/2 response missing :status pseudo-header"),
+            Self::Http2InvalidFrame => write!(f, "HTTP/2 invalid frame"),
+            Self::Http2MaxConcurrentStreams => {
+                write!(f, "HTTP/2 max concurrent streams limit reached")
+            }
+            Self::Http2PaddingError => write!(f, "HTTP/2 frame has missing or invalid padding"),
+            Self::Http2PriorityError => {
+                write!(f, "HTTP/2 PRIORITY flag present but header block too short")
+            }
+            Self::Http2StreamNotFound => write!(f, "HTTP/2 frame references unknown stream"),
+            Self::Http2InvalidHeaderEncoding => {
+                write!(f, "HTTP/2 header contains invalid UTF-8 encoding")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}

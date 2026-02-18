@@ -372,13 +372,13 @@ fn test_incremental_single_frame_at_a_time() {
 
     match result {
         Ok(messages) => {
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages.get(&1).unwrap().body, b"data");
+            // May have 0 or 1 messages depending on whether state carried over
+            if !messages.is_empty() {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages.get(&1).unwrap().body, b"data");
+            }
         }
-        Err(ParseError::Http2BufferTooSmall) => {
-            // Acceptable - state was persisted, just no complete message yet
-        }
-        Err(e) => panic!("Unexpected error: {:?}", e),
+        Err(e) => panic!("Unexpected error: {e:?}"),
     }
 }
 
@@ -517,7 +517,10 @@ fn test_data_frame_unknown_stream() {
 
     let result = parse_buffer(&buffer);
     // Should error because stream 1 doesn't exist
-    assert!(result.is_err(), "Expected error for unknown stream");
+    assert!(
+        matches!(result, Err(ParseError::Http2StreamNotFound)),
+        "Expected Http2StreamNotFound for unknown stream, got {result:?}"
+    );
 }
 
 #[test]
@@ -541,8 +544,8 @@ fn test_malformed_hpack() {
 fn test_empty_buffer() {
     let result = parse_buffer(&[]);
     assert!(
-        matches!(result, Err(ParseError::Http2BufferTooSmall)),
-        "Expected Http2BufferTooSmall for empty buffer"
+        matches!(result, Ok(ref m) if m.is_empty()),
+        "Expected Ok(empty map) for empty buffer, got {result:?}"
     );
 }
 
@@ -554,8 +557,8 @@ fn test_incomplete_frame() {
 
     let result = parse_buffer(&buffer);
     assert!(
-        matches!(result, Err(ParseError::Http2BufferTooSmall)),
-        "Expected Http2BufferTooSmall for incomplete frame"
+        matches!(result, Ok(ref m) if m.is_empty()),
+        "Expected Ok(empty map) for incomplete frame, got {result:?}"
     );
 }
 

@@ -3,12 +3,19 @@
 //! These traits allow the collator to work with any data source that provides
 //! the necessary information about network traffic direction and payload.
 
-/// Direction of data flow for a network event
+/// Direction of data flow for a network event.
+///
+/// `Read` and `Write` correspond to the socket operation (recv/send) observed
+/// by the tracing layer. Whether Read or Write carries requests vs. responses
+/// depends on the vantage point: on a client, Write = outgoing requests and
+/// Read = incoming responses; on a server the mapping is reversed. The
+/// collator classifies messages by inspecting content (pseudo-headers), not
+/// by assuming a fixed direction-to-role mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
-    /// Response data (inbound from server)
+    /// Data received via a socket read (recv) operation
     Read,
-    /// Request data (outbound to server)
+    /// Data sent via a socket write (send) operation
     Write,
     /// Non-data events (ignored by collator)
     Other,

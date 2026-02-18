@@ -33,6 +33,15 @@ pub struct Connection {
     pub request_complete: bool,
     pub response_complete: bool,
 
+    // HTTP/1 growable buffers — new data is appended as it arrives, avoiding
+    // repeated clone-and-concatenate of all previous chunks.
+    pub(crate) h1_request_buffer: Vec<u8>,
+    pub(crate) h1_response_buffer: Vec<u8>,
+
+    // Accumulated body size per direction for enforcing max_body_size limit
+    pub(crate) request_body_size: usize,
+    pub(crate) response_body_size: usize,
+
     // HTTP/1 parsed messages (when complete)
     pub(crate) h1_request: Option<HttpRequest>,
     pub(crate) h1_response: Option<HttpResponse>,
@@ -53,6 +62,10 @@ pub struct Connection {
     // HTTP/2 emission tracking - which stream_ids have we emitted Message events for?
     pub(crate) h2_emitted_requests: HashSet<u32>,
     pub(crate) h2_emitted_responses: HashSet<u32>,
+
+    // Stream IDs that have both a pending request and pending response,
+    // enabling O(1) lookup for complete exchange pairs.
+    pub(crate) ready_streams: HashSet<u32>,
 }
 
 impl Connection {
@@ -71,6 +84,10 @@ impl Connection {
             last_activity_ns: 0,
             request_complete: false,
             response_complete: false,
+            h1_request_buffer: Vec::new(),
+            h1_response_buffer: Vec::new(),
+            request_body_size: 0,
+            response_body_size: 0,
             h1_request: None,
             h1_response: None,
             h1_request_emitted: false,
@@ -81,6 +98,7 @@ impl Connection {
             pending_responses: HashMap::new(),
             h2_emitted_requests: HashSet::new(),
             h2_emitted_responses: HashSet::new(),
+            ready_streams: HashSet::new(),
         }
     }
 }

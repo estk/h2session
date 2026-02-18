@@ -33,11 +33,11 @@ pub fn try_parse_http1_request(data: &[u8], timestamp_ns: u64) -> Option<HttpReq
         _ => return None, // Headers incomplete
     };
 
-    // Check body completeness using parsed headers
     let body_data = &data[body_offset..];
-    if !is_body_complete(req.headers, body_data, data) {
-        return None;
-    }
+    let body = match determine_body(req.headers, body_data) {
+        BodyResult::Complete(b) => b,
+        BodyResult::Incomplete => return None,
+    };
 
     let method = Method::from_bytes(req.method?.as_bytes()).ok()?;
     let uri: Uri = req.path?.parse().ok()?;
@@ -57,7 +57,7 @@ pub fn try_parse_http1_request(data: &[u8], timestamp_ns: u64) -> Option<HttpReq
         method,
         uri,
         headers: header_map,
-        body: body_data.to_vec(),
+        body,
         timestamp_ns,
     })
 }
@@ -73,11 +73,11 @@ pub fn try_parse_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpRe
         _ => return None, // Headers incomplete
     };
 
-    // Check body completeness using parsed headers
     let body_data = &data[body_offset..];
-    if !is_body_complete(res.headers, body_data, data) {
-        return None;
-    }
+    let body = match determine_body(res.headers, body_data) {
+        BodyResult::Complete(b) => b,
+        BodyResult::Incomplete => return None,
+    };
 
     let status = StatusCode::from_u16(res.code?).ok()?;
 
@@ -95,40 +95,140 @@ pub fn try_parse_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpRe
     Some(HttpResponse {
         status,
         headers: header_map,
-        body: body_data.to_vec(),
+        body,
         timestamp_ns,
     })
 }
 
-/// Check if the body is complete based on parsed headers.
-/// Handles Content-Length, Transfer-Encoding: chunked, and no-body cases.
-fn is_body_complete(headers: &[httparse::Header<'_>], body: &[u8], full_data: &[u8]) -> bool {
+/// Result of body determination for an HTTP/1.x message.
+enum BodyResult {
+    /// Body is complete with the given bytes
+    Complete(Vec<u8>),
+    /// Not enough data yet
+    Incomplete,
+}
+
+/// Determine the body of an HTTP/1.x message based on headers and available data.
+///
+/// - Content-Length: body is exactly `body_data[..content_length]`
+/// - Transfer-Encoding: chunked: walks chunk boundaries to decode body
+/// - Neither: body is empty (no body expected, e.g., GET requests)
+fn determine_body(headers: &[httparse::Header<'_>], body_data: &[u8]) -> BodyResult {
     // Look for Content-Length (case-insensitive via httparse)
     for h in headers.iter() {
         if h.name.eq_ignore_ascii_case("Content-Length") {
-            if let Ok(len_str) = std::str::from_utf8(h.value) {
-                if let Ok(content_length) = len_str.trim().parse::<usize>() {
-                    return body.len() >= content_length;
+            if let Ok(len_str) = std::str::from_utf8(h.value)
+                && let Ok(content_length) = len_str.trim().parse::<usize>()
+            {
+                if body_data.len() >= content_length {
+                    return BodyResult::Complete(body_data[..content_length].to_vec());
                 }
+                return BodyResult::Incomplete;
             }
-            return false; // Invalid Content-Length
+            return BodyResult::Incomplete; // Invalid Content-Length
         }
     }
 
     // Check for Transfer-Encoding: chunked
     for h in headers.iter() {
-        if h.name.eq_ignore_ascii_case("Transfer-Encoding") {
-            if let Ok(value) = std::str::from_utf8(h.value) {
-                if value.to_ascii_lowercase().contains("chunked") {
-                    // Look for final chunk (0\r\n\r\n)
-                    return full_data.windows(5).any(|w| w == b"0\r\n\r\n");
-                }
-            }
+        if h.name.eq_ignore_ascii_case("Transfer-Encoding")
+            && let Ok(value) = std::str::from_utf8(h.value)
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            return decode_chunked_body(body_data);
         }
     }
 
-    // No Content-Length and not chunked - complete after headers (e.g., GET request)
-    true
+    // No Content-Length and not chunked — no body expected
+    BodyResult::Complete(Vec::new())
+}
+
+/// Walk chunk boundaries to decode a chunked transfer-encoded body.
+///
+/// Chunk format: `[hex-size][;ext=val]\r\n[data]\r\n` terminated by `0\r\n\r\n`.
+/// Returns the decoded body or Incomplete if not enough data.
+fn decode_chunked_body(data: &[u8]) -> BodyResult {
+    let mut decoded = Vec::new();
+    let mut pos = 0;
+
+    loop {
+        // Find the end of the chunk-size line
+        let line_end = match find_crlf(data, pos) {
+            Some(idx) => idx,
+            None => return BodyResult::Incomplete,
+        };
+
+        // Parse hex chunk size (ignore chunk extensions after ';')
+        let size_bytes = &data[pos..line_end];
+        let size_part = match size_bytes.iter().position(|&b| b == b';') {
+            Some(semi_pos) => &size_bytes[..semi_pos],
+            None => size_bytes,
+        };
+        let Ok(size_str) = std::str::from_utf8(size_part) else {
+            return BodyResult::Incomplete; // Non-UTF8 chunk size
+        };
+        let Ok(chunk_size) = usize::from_str_radix(size_str.trim(), 16) else {
+            return BodyResult::Incomplete; // Non-hex chunk size
+        };
+
+        // Advance past the chunk-size line (including \r\n)
+        pos = line_end + 2;
+
+        if chunk_size == 0 {
+            // Terminal chunk: expect trailing \r\n (may also have trailers, but
+            // for simplicity we just need \r\n after the 0-size chunk line)
+            if pos + 2 > data.len() {
+                return BodyResult::Incomplete;
+            }
+            // Verify trailing \r\n
+            if data[pos..pos + 2] != *b"\r\n" {
+                // Could be trailers; scan for the final \r\n\r\n
+                match find_crlf_crlf(data, pos) {
+                    Some(_) => return BodyResult::Complete(decoded),
+                    None => return BodyResult::Incomplete,
+                }
+            }
+            return BodyResult::Complete(decoded);
+        }
+
+        // Read chunk data
+        if pos + chunk_size > data.len() {
+            return BodyResult::Incomplete;
+        }
+        decoded.extend_from_slice(&data[pos..pos + chunk_size]);
+        pos += chunk_size;
+
+        // Expect \r\n after chunk data
+        if pos + 2 > data.len() {
+            return BodyResult::Incomplete;
+        }
+        if data[pos..pos + 2] != *b"\r\n" {
+            return BodyResult::Incomplete; // Malformed
+        }
+        pos += 2;
+    }
+}
+
+/// Find the position of `\r\n` starting at `from` in `data`.
+fn find_crlf(data: &[u8], from: usize) -> Option<usize> {
+    if from >= data.len() {
+        return None;
+    }
+    data[from..]
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .map(|p| from + p)
+}
+
+/// Find the position of `\r\n\r\n` starting at `from` in `data`.
+fn find_crlf_crlf(data: &[u8], from: usize) -> Option<usize> {
+    if from >= data.len() {
+        return None;
+    }
+    data[from..]
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|p| from + p)
 }
 
 #[cfg(test)]
@@ -223,6 +323,11 @@ mod tests {
             b"POST /api HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
         let result = try_parse_http1_request(data, 0);
         assert!(result.is_some(), "Should parse complete chunked request");
+        assert_eq!(
+            result.unwrap().body,
+            b"hello",
+            "Chunked body should be decoded"
+        );
     }
 
     #[test]
@@ -339,5 +444,101 @@ mod tests {
 
         assert_eq!(response.status, StatusCode::NOT_FOUND);
         assert!(response.body.is_empty());
+    }
+
+    // =========================================================================
+    // HIGH-3: No-body requests should not include trailing data
+    // =========================================================================
+
+    #[test]
+    fn test_get_request_with_trailing_data_body_empty() {
+        // GET with trailing data after headers — body should be empty
+        let data = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\nEXTRA";
+        let result = try_parse_http1_request(data, 0);
+        assert!(result.is_some());
+        let req = result.unwrap();
+        assert!(
+            req.body.is_empty(),
+            "GET body should be empty, not trailing data"
+        );
+    }
+
+    #[test]
+    fn test_post_content_length_ignores_trailing_data() {
+        // POST with CL=5 but 9 bytes after headers — body should be "hello" only
+        let data = b"POST /api HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloEXTRA";
+        let result = try_parse_http1_request(data, 0);
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap().body,
+            b"hello",
+            "Should truncate to Content-Length"
+        );
+    }
+
+    // =========================================================================
+    // HIGH-2: Proper chunked encoding parsing
+    // =========================================================================
+
+    #[test]
+    fn test_chunked_body_decoded_correctly() {
+        // Standard chunked encoding should decode to "hello"
+        let data =
+            b"POST /api HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let result = try_parse_http1_request(data, 0);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().body, b"hello");
+    }
+
+    #[test]
+    fn test_chunked_false_positive_0_in_content() {
+        // Body data containing "0\r\n\r\n" inside a chunk should not be falsely terminated.
+        // Chunk 1: 12 bytes = "0\r\n\r\nhello\r\n" (contains the pattern inside data)
+        // Chunk 2: 0 (terminal)
+        let data = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nc\r\n0\r\n\r\nhello\r\n\r\n0\r\n\r\n";
+        let result = try_parse_http1_request(data, 0);
+        assert!(
+            result.is_some(),
+            "Should parse chunked body with embedded 0\\r\\n\\r\\n"
+        );
+        assert_eq!(result.unwrap().body, b"0\r\n\r\nhello\r\n");
+    }
+
+    #[test]
+    fn test_chunked_multi_chunk() {
+        // Multiple chunks: "hel" + "lo" = "hello"
+        let data =
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n";
+        let result = try_parse_http1_request(data, 0);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().body, b"hello");
+    }
+
+    #[test]
+    fn test_chunked_with_extensions() {
+        // Chunk size line with extension: "5;ext=val\r\nhello\r\n0\r\n\r\n"
+        let data =
+            b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=val\r\nhello\r\n0\r\n\r\n";
+        let result = try_parse_http1_request(data, 0);
+        assert!(result.is_some(), "Should handle chunk extensions");
+        assert_eq!(result.unwrap().body, b"hello");
+    }
+
+    #[test]
+    fn test_chunked_incomplete_missing_terminator() {
+        // Missing final 0\r\n\r\n
+        let data = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+        assert!(
+            try_parse_http1_request(data, 0).is_none(),
+            "Should be None for incomplete chunked"
+        );
+    }
+
+    #[test]
+    fn test_chunked_response_decoded() {
+        let data = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let result = try_parse_http1_response(data, 0);
+        assert!(result.is_some(), "Should parse complete chunked response");
+        assert_eq!(result.unwrap().body, b"hello");
     }
 }

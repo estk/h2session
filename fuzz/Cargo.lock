@@ -129,6 +129,8 @@ dependencies = [
 name = "http-collator"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "dashmap",
  "h2session",
  "http",
  "httparse",

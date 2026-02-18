@@ -40,7 +40,9 @@ pub use traits::{DataEvent, Direction};
 
 use connection::Connection as Conn;
 use dashmap::DashMap;
-use h2session::{H2ConnectionState, is_http2_preface, looks_like_http2_frame};
+use h2session::{
+    H2ConnectionState, StreamId, TimestampNs, is_http2_preface, looks_like_http2_frame,
+};
 use std::marker::PhantomData;
 
 /// Default maximum buffer size for data events (TLS record size)
@@ -109,7 +111,7 @@ impl<E: DataEvent> Collator<E> {
     pub fn add_event(&self, event: E) -> Vec<CollationEvent> {
         // Extract all scalar metadata before consuming the event
         let direction = event.direction();
-        let timestamp_ns = event.timestamp_ns();
+        let timestamp_ns = TimestampNs(event.timestamp_ns());
         let conn_id = event.connection_id();
         let process_id = event.process_id();
         let remote_port = event.remote_port();
@@ -175,7 +177,7 @@ impl<E: DataEvent> Collator<E> {
         conn: &mut Conn,
         chunk: DataChunk,
         direction: Direction,
-        timestamp_ns: u64,
+        timestamp_ns: TimestampNs,
         remote_port: u16,
         conn_id: u64,
         process_id: u32,
@@ -286,7 +288,7 @@ impl<E: DataEvent> Collator<E> {
     ///
     /// Callers should invoke this periodically to bound memory usage from
     /// abandoned connections and incomplete HTTP/2 streams.
-    pub fn cleanup(&self, current_time_ns: u64) {
+    pub fn cleanup(&self, current_time_ns: TimestampNs) {
         self.connections.retain(|_, conn| {
             current_time_ns.saturating_sub(conn.last_activity_ns) < self.config.timeout_ns
         });
@@ -368,7 +370,7 @@ fn finalize_and_emit(
             .response_chunks
             .first()
             .map(|c| c.timestamp_ns)
-            .unwrap_or(0);
+            .unwrap_or(TimestampNs(0));
         conn.h1_response = h1::try_finalize_http1_response(&conn.h1_response_buffer, timestamp);
         if conn.h1_response.is_some() {
             conn.response_complete = true;
@@ -666,7 +668,7 @@ fn parse_http2_chunks(conn: &mut Conn, direction: Direction) {
 }
 
 /// Find a stream_id that has both request and response ready (O(1) via ready_streams set)
-fn find_complete_h2_stream(conn: &Conn) -> Option<u32> {
+fn find_complete_h2_stream(conn: &Conn) -> Option<StreamId> {
     conn.ready_streams.iter().next().copied()
 }
 
@@ -677,7 +679,7 @@ fn try_parse_http1_request_chunks(conn: &mut Conn) {
         .request_chunks
         .last()
         .map(|c| c.timestamp_ns)
-        .unwrap_or(0);
+        .unwrap_or(TimestampNs(0));
     conn.h1_request = h1::try_parse_http1_request(&conn.h1_request_buffer, timestamp);
 }
 
@@ -688,7 +690,7 @@ fn try_parse_http1_response_chunks(conn: &mut Conn) {
         .response_chunks
         .first()
         .map(|c| c.timestamp_ns)
-        .unwrap_or(0);
+        .unwrap_or(TimestampNs(0));
     conn.h1_response = h1::try_parse_http1_response(&conn.h1_response_buffer, timestamp);
 }
 
@@ -993,7 +995,7 @@ mod tests {
 
         // Check the pending request body
         let conn = collator.connections.get(&conn_id).unwrap();
-        let request = conn.pending_requests.get(&1).unwrap();
+        let request = conn.pending_requests.get(&StreamId(1)).unwrap();
 
         // Body should be "helloworld", NOT "hellohelloworldhelloworldworld" (duplicated)
         assert_eq!(
@@ -1280,10 +1282,10 @@ mod tests {
         {
             let conn = collator.connections.get(&conn_id).unwrap();
             assert!(
-                conn.pending_requests.contains_key(&1),
+                conn.pending_requests.contains_key(&StreamId(1)),
                 "Second exchange request should be in pending_requests"
             );
-            let req = conn.pending_requests.get(&1).unwrap();
+            let req = conn.pending_requests.get(&StreamId(1)).unwrap();
             assert_eq!(
                 req.body.len(),
                 32768,
@@ -1422,19 +1424,19 @@ mod tests {
                 uri: "/".parse().unwrap(),
                 headers: http::HeaderMap::new(),
                 body: vec![],
-                timestamp_ns: 0,
+                timestamp_ns: TimestampNs(0),
             },
             response: HttpResponse {
                 status: http::StatusCode::OK,
                 headers: http::HeaderMap::new(),
                 body: vec![],
-                timestamp_ns: 0,
+                timestamp_ns: TimestampNs(0),
             },
             latency_ns: 1_000_000,
             protocol: Protocol::Http2,
             process_id: 1234,
             remote_port: None, // Port unavailable
-            stream_id: Some(1),
+            stream_id: Some(StreamId(1)),
         };
 
         let display = format!("{exchange}");
@@ -1452,19 +1454,19 @@ mod tests {
                 uri: "/".parse().unwrap(),
                 headers: http::HeaderMap::new(),
                 body: vec![],
-                timestamp_ns: 0,
+                timestamp_ns: TimestampNs(0),
             },
             response: HttpResponse {
                 status: http::StatusCode::OK,
                 headers: http::HeaderMap::new(),
                 body: vec![],
-                timestamp_ns: 0,
+                timestamp_ns: TimestampNs(0),
             },
             latency_ns: 1_000_000,
             protocol: Protocol::Http2,
             process_id: 1234,
             remote_port: Some(8080), // Port available
-            stream_id: Some(1),
+            stream_id: Some(StreamId(1)),
         };
 
         let display = format!("{exchange}");
@@ -1794,7 +1796,7 @@ mod tests {
         assert_eq!(collator.connections.len(), 1);
 
         // Cleanup at t=3s — connection is only 2s old, should survive
-        collator.cleanup(3_000_000_000);
+        collator.cleanup(TimestampNs(3_000_000_000));
         assert_eq!(
             collator.connections.len(),
             1,
@@ -1802,7 +1804,7 @@ mod tests {
         );
 
         // Cleanup at t=7s — connection is 6s old, should be removed
-        collator.cleanup(7_000_000_000);
+        collator.cleanup(TimestampNs(7_000_000_000));
         assert_eq!(
             collator.connections.len(),
             0,
@@ -1856,8 +1858,8 @@ mod tests {
             .connections
             .get_mut(&conn_id)
             .unwrap()
-            .last_activity_ns = 39_000_000_000;
-        collator.cleanup(40_000_000_000);
+            .last_activity_ns = TimestampNs(39_000_000_000);
+        collator.cleanup(TimestampNs(40_000_000_000));
 
         // Connection should survive but stale stream should be evicted
         assert_eq!(
@@ -2000,11 +2002,11 @@ mod tests {
 
         // Manually insert a connection with last_activity in the "future"
         collator.connections.insert(1, Conn::new(1234, 8080));
-        collator.connections.get_mut(&1).unwrap().last_activity_ns = 10_000_000_000;
+        collator.connections.get_mut(&1).unwrap().last_activity_ns = TimestampNs(10_000_000_000);
 
         // Cleanup with a current_time BEFORE the last activity (clock skew).
         // With unsigned subtraction this would panic; saturating_sub prevents it.
-        collator.cleanup(5_000_000_000);
+        collator.cleanup(TimestampNs(5_000_000_000));
 
         // Connection should be retained (saturating_sub returns 0 < timeout)
         assert_eq!(

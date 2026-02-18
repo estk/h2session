@@ -1,5 +1,6 @@
 //! HTTP/1.x parsing utilities
 
+use h2session::TimestampNs;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 
 // Re-export HTTP types from h2session for use across all HTTP versions
@@ -24,7 +25,7 @@ pub fn is_http1_response(data: &[u8]) -> bool {
 
 /// Try to parse an HTTP/1.x request, returning Some only if complete.
 /// This combines header parsing and body completeness checking in one pass.
-pub fn try_parse_http1_request(data: &[u8], timestamp_ns: u64) -> Option<HttpRequest> {
+pub fn try_parse_http1_request(data: &[u8], timestamp_ns: TimestampNs) -> Option<HttpRequest> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
 
@@ -64,7 +65,7 @@ pub fn try_parse_http1_request(data: &[u8], timestamp_ns: u64) -> Option<HttpReq
 
 /// Try to parse an HTTP/1.x response, returning Some only if complete.
 /// This combines header parsing and body completeness checking in one pass.
-pub fn try_parse_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> {
+pub fn try_parse_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Option<HttpResponse> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut res = httparse::Response::new(&mut headers);
 
@@ -105,7 +106,7 @@ pub fn try_parse_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpRe
 /// For responses without explicit framing (no Content-Length or Transfer-Encoding),
 /// RFC 7230 §3.3.3 says the body is everything until the connection closes.
 /// This function parses the headers and takes all remaining data as the body.
-pub fn try_finalize_http1_response(data: &[u8], timestamp_ns: u64) -> Option<HttpResponse> {
+pub fn try_finalize_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Option<HttpResponse> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut res = httparse::Response::new(&mut headers);
 
@@ -321,7 +322,7 @@ mod tests {
         // Headers not complete (no \r\n\r\n)
         let data = b"GET / HTTP/1.1\r\nHost: example.com\r\n";
         assert!(
-            try_parse_http1_request(data, 0).is_none(),
+            try_parse_http1_request(data, TimestampNs(0)).is_none(),
             "Should return None for incomplete headers"
         );
     }
@@ -330,18 +331,18 @@ mod tests {
     fn test_try_parse_request_complete_no_body() {
         // GET request with no body - complete after headers
         let data = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let result = try_parse_http1_request(data, 12345);
+        let result = try_parse_http1_request(data, TimestampNs(12345));
         assert!(result.is_some(), "Should parse complete GET request");
         let req = result.unwrap();
         assert_eq!(req.method, Method::GET);
-        assert_eq!(req.timestamp_ns, 12345);
+        assert_eq!(req.timestamp_ns, TimestampNs(12345));
         assert!(req.body.is_empty());
     }
 
     #[test]
     fn test_try_parse_request_content_length_complete() {
         let data = b"POST /api HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello";
-        let result = try_parse_http1_request(data, 0);
+        let result = try_parse_http1_request(data, TimestampNs(0));
         assert!(result.is_some(), "Should parse complete POST with body");
         let req = result.unwrap();
         assert_eq!(req.method, Method::POST);
@@ -353,7 +354,7 @@ mod tests {
         // Content-Length says 10 but only 5 bytes provided
         let data = b"POST /api HTTP/1.1\r\nContent-Length: 10\r\n\r\nhello";
         assert!(
-            try_parse_http1_request(data, 0).is_none(),
+            try_parse_http1_request(data, TimestampNs(0)).is_none(),
             "Should return None when body is incomplete"
         );
     }
@@ -362,7 +363,7 @@ mod tests {
     fn test_try_parse_request_content_length_case_insensitive() {
         // Mixed case Content-Length header
         let data = b"POST /api HTTP/1.1\r\ncontent-length: 5\r\n\r\nhello";
-        let result = try_parse_http1_request(data, 0);
+        let result = try_parse_http1_request(data, TimestampNs(0));
         assert!(
             result.is_some(),
             "Should handle case-insensitive Content-Length"
@@ -374,7 +375,7 @@ mod tests {
     fn test_try_parse_request_chunked_complete() {
         let data =
             b"POST /api HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let result = try_parse_http1_request(data, 0);
+        let result = try_parse_http1_request(data, TimestampNs(0));
         assert!(result.is_some(), "Should parse complete chunked request");
         assert_eq!(
             result.unwrap().body,
@@ -388,7 +389,7 @@ mod tests {
         // Chunked but missing final 0\r\n\r\n
         let data = b"POST /api HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
         assert!(
-            try_parse_http1_request(data, 0).is_none(),
+            try_parse_http1_request(data, TimestampNs(0)).is_none(),
             "Should return None for incomplete chunked"
         );
     }
@@ -401,7 +402,7 @@ mod tests {
     fn test_try_parse_response_incomplete_headers() {
         let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n";
         assert!(
-            try_parse_http1_response(data, 0).is_none(),
+            try_parse_http1_response(data, TimestampNs(0)).is_none(),
             "Should return None for incomplete response headers"
         );
     }
@@ -409,17 +410,17 @@ mod tests {
     #[test]
     fn test_try_parse_response_complete_no_body() {
         let data = b"HTTP/1.1 204 No Content\r\n\r\n";
-        let result = try_parse_http1_response(data, 67890);
+        let result = try_parse_http1_response(data, TimestampNs(67890));
         assert!(result.is_some(), "Should parse complete 204 response");
         let resp = result.unwrap();
         assert_eq!(resp.status, StatusCode::NO_CONTENT);
-        assert_eq!(resp.timestamp_ns, 67890);
+        assert_eq!(resp.timestamp_ns, TimestampNs(67890));
     }
 
     #[test]
     fn test_try_parse_response_content_length_complete() {
         let data = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\nHello World";
-        let result = try_parse_http1_response(data, 0);
+        let result = try_parse_http1_response(data, TimestampNs(0));
         assert!(result.is_some(), "Should parse complete response with body");
         let resp = result.unwrap();
         assert_eq!(resp.status, StatusCode::OK);
@@ -430,7 +431,7 @@ mod tests {
     fn test_try_parse_response_content_length_incomplete() {
         let data = b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nHello";
         assert!(
-            try_parse_http1_response(data, 0).is_none(),
+            try_parse_http1_response(data, TimestampNs(0)).is_none(),
             "Should return None when response body is incomplete"
         );
     }
@@ -438,7 +439,7 @@ mod tests {
     #[test]
     fn test_try_parse_response_chunked_complete() {
         let data = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let result = try_parse_http1_response(data, 0);
+        let result = try_parse_http1_response(data, TimestampNs(0));
         assert!(result.is_some(), "Should parse complete chunked response");
     }
 
@@ -446,7 +447,7 @@ mod tests {
     fn test_try_parse_response_chunked_incomplete() {
         let data = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
         assert!(
-            try_parse_http1_response(data, 0).is_none(),
+            try_parse_http1_response(data, TimestampNs(0)).is_none(),
             "Should return None for incomplete chunked response"
         );
     }
@@ -458,7 +459,7 @@ mod tests {
     #[test]
     fn test_try_parse_request_with_path_and_headers() {
         let data = b"GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let request = try_parse_http1_request(data, 12345).unwrap();
+        let request = try_parse_http1_request(data, TimestampNs(12345)).unwrap();
 
         assert_eq!(request.method, Method::GET);
         assert_eq!(request.uri.path(), "/path");
@@ -467,14 +468,14 @@ mod tests {
             "example.com"
         );
         assert!(request.body.is_empty());
-        assert_eq!(request.timestamp_ns, 12345);
+        assert_eq!(request.timestamp_ns, TimestampNs(12345));
     }
 
     #[test]
     fn test_try_parse_response_with_content_type() {
         let data =
             b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nHello World";
-        let response = try_parse_http1_response(data, 67890).unwrap();
+        let response = try_parse_http1_response(data, TimestampNs(67890)).unwrap();
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(
@@ -487,7 +488,7 @@ mod tests {
             "text/plain"
         );
         assert_eq!(response.body, b"Hello World");
-        assert_eq!(response.timestamp_ns, 67890);
+        assert_eq!(response.timestamp_ns, TimestampNs(67890));
     }
 
     #[test]
@@ -497,7 +498,7 @@ mod tests {
         // Use close_connection / try_finalize_http1_response to finalize.
         let data = b"HTTP/1.1 404 Not Found\r\n\r\n";
         assert!(
-            try_parse_http1_response(data, 0).is_none(),
+            try_parse_http1_response(data, TimestampNs(0)).is_none(),
             "404 without framing should be incomplete (read-until-close)"
         );
     }
@@ -505,7 +506,7 @@ mod tests {
     #[test]
     fn test_try_parse_response_404_with_content_length() {
         let data = b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
-        let response = try_parse_http1_response(data, 0).unwrap();
+        let response = try_parse_http1_response(data, TimestampNs(0)).unwrap();
         assert_eq!(response.status, StatusCode::NOT_FOUND);
         assert_eq!(response.body, b"Not Found");
     }
@@ -518,7 +519,7 @@ mod tests {
     fn test_get_request_with_trailing_data_body_empty() {
         // GET with trailing data after headers — body should be empty
         let data = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\nEXTRA";
-        let result = try_parse_http1_request(data, 0);
+        let result = try_parse_http1_request(data, TimestampNs(0));
         assert!(result.is_some());
         let req = result.unwrap();
         assert!(
@@ -531,7 +532,7 @@ mod tests {
     fn test_post_content_length_ignores_trailing_data() {
         // POST with CL=5 but 9 bytes after headers — body should be "hello" only
         let data = b"POST /api HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloEXTRA";
-        let result = try_parse_http1_request(data, 0);
+        let result = try_parse_http1_request(data, TimestampNs(0));
         assert!(result.is_some());
         assert_eq!(
             result.unwrap().body,
@@ -549,7 +550,7 @@ mod tests {
         // Standard chunked encoding should decode to "hello"
         let data =
             b"POST /api HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let result = try_parse_http1_request(data, 0);
+        let result = try_parse_http1_request(data, TimestampNs(0));
         assert!(result.is_some());
         assert_eq!(result.unwrap().body, b"hello");
     }
@@ -560,7 +561,7 @@ mod tests {
         // Chunk 1: 12 bytes = "0\r\n\r\nhello\r\n" (contains the pattern inside data)
         // Chunk 2: 0 (terminal)
         let data = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nc\r\n0\r\n\r\nhello\r\n\r\n0\r\n\r\n";
-        let result = try_parse_http1_request(data, 0);
+        let result = try_parse_http1_request(data, TimestampNs(0));
         assert!(
             result.is_some(),
             "Should parse chunked body with embedded 0\\r\\n\\r\\n"
@@ -573,7 +574,7 @@ mod tests {
         // Multiple chunks: "hel" + "lo" = "hello"
         let data =
             b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n";
-        let result = try_parse_http1_request(data, 0);
+        let result = try_parse_http1_request(data, TimestampNs(0));
         assert!(result.is_some());
         assert_eq!(result.unwrap().body, b"hello");
     }
@@ -583,7 +584,7 @@ mod tests {
         // Chunk size line with extension: "5;ext=val\r\nhello\r\n0\r\n\r\n"
         let data =
             b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=val\r\nhello\r\n0\r\n\r\n";
-        let result = try_parse_http1_request(data, 0);
+        let result = try_parse_http1_request(data, TimestampNs(0));
         assert!(result.is_some(), "Should handle chunk extensions");
         assert_eq!(result.unwrap().body, b"hello");
     }
@@ -593,7 +594,7 @@ mod tests {
         // Missing final 0\r\n\r\n
         let data = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
         assert!(
-            try_parse_http1_request(data, 0).is_none(),
+            try_parse_http1_request(data, TimestampNs(0)).is_none(),
             "Should be None for incomplete chunked"
         );
     }
@@ -601,7 +602,7 @@ mod tests {
     #[test]
     fn test_chunked_response_decoded() {
         let data = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let result = try_parse_http1_response(data, 0);
+        let result = try_parse_http1_response(data, TimestampNs(0));
         assert!(result.is_some(), "Should parse complete chunked response");
         assert_eq!(result.unwrap().body, b"hello");
     }
@@ -613,7 +614,7 @@ mod tests {
     #[test]
     fn test_multi_valued_headers_preserved_in_request() {
         let data = b"GET / HTTP/1.1\r\nHost: example.com\r\nCookie: a=1\r\nCookie: b=2\r\n\r\n";
-        let req = try_parse_http1_request(data, 0).unwrap();
+        let req = try_parse_http1_request(data, TimestampNs(0)).unwrap();
         let cookies: Vec<_> = req.headers.get_all("cookie").iter().collect();
         assert_eq!(cookies.len(), 2, "Both Cookie headers should be preserved");
     }
@@ -622,7 +623,7 @@ mod tests {
     fn test_multi_valued_headers_preserved_in_response() {
         let data =
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n";
-        let resp = try_parse_http1_response(data, 0).unwrap();
+        let resp = try_parse_http1_response(data, TimestampNs(0)).unwrap();
         let cookies: Vec<_> = resp.headers.get_all("set-cookie").iter().collect();
         assert_eq!(
             cookies.len(),
@@ -641,7 +642,7 @@ mod tests {
         // until connection close, so try_parse_http1_response should return None.
         let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\npartial body";
         assert!(
-            try_parse_http1_response(data, 0).is_none(),
+            try_parse_http1_response(data, TimestampNs(0)).is_none(),
             "Response without framing should be incomplete"
         );
     }
@@ -651,7 +652,7 @@ mod tests {
         // 204 No Content explicitly has no body per RFC 7230 §3.3.3
         let data = b"HTTP/1.1 204 No Content\r\n\r\n";
         assert!(
-            try_parse_http1_response(data, 0).is_some(),
+            try_parse_http1_response(data, TimestampNs(0)).is_some(),
             "204 should be complete without framing"
         );
     }
@@ -661,7 +662,7 @@ mod tests {
         // 304 Not Modified explicitly has no body per RFC 7230 §3.3.3
         let data = b"HTTP/1.1 304 Not Modified\r\n\r\n";
         assert!(
-            try_parse_http1_response(data, 0).is_some(),
+            try_parse_http1_response(data, TimestampNs(0)).is_some(),
             "304 should be complete without framing"
         );
     }
@@ -669,16 +670,16 @@ mod tests {
     #[test]
     fn test_try_finalize_http1_response_takes_all_remaining_data() {
         let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nfull body here";
-        let resp = try_finalize_http1_response(data, 12345).unwrap();
+        let resp = try_finalize_http1_response(data, TimestampNs(12345)).unwrap();
         assert_eq!(resp.status, StatusCode::OK);
         assert_eq!(resp.body, b"full body here");
-        assert_eq!(resp.timestamp_ns, 12345);
+        assert_eq!(resp.timestamp_ns, TimestampNs(12345));
     }
 
     #[test]
     fn test_try_finalize_http1_response_empty_body() {
         let data = b"HTTP/1.1 200 OK\r\n\r\n";
-        let resp = try_finalize_http1_response(data, 0).unwrap();
+        let resp = try_finalize_http1_response(data, TimestampNs(0)).unwrap();
         assert!(resp.body.is_empty());
     }
 
@@ -686,6 +687,6 @@ mod tests {
     fn test_try_finalize_incomplete_headers_returns_none() {
         // Headers not complete — can't finalize
         let data = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n";
-        assert!(try_finalize_http1_response(data, 0).is_none());
+        assert!(try_finalize_http1_response(data, TimestampNs(0)).is_none());
     }
 }

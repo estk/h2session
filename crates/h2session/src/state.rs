@@ -1,5 +1,55 @@
 use std::collections::{HashMap, VecDeque};
 
+/// Newtype for HTTP/2 stream identifiers (RFC 7540 §5.1.1: 31-bit unsigned integer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StreamId(pub u32);
+
+impl std::fmt::Display for StreamId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl From<u32> for StreamId {
+    fn from(v: u32) -> Self {
+        Self(v)
+    }
+}
+
+impl From<StreamId> for u32 {
+    fn from(v: StreamId) -> Self {
+        v.0
+    }
+}
+
+/// Newtype for nanosecond-precision timestamps (monotonic clock).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TimestampNs(pub u64);
+
+impl TimestampNs {
+    pub fn saturating_sub(self, other: TimestampNs) -> u64 {
+        self.0.saturating_sub(other.0)
+    }
+}
+
+impl std::fmt::Display for TimestampNs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}ns", self.0)
+    }
+}
+
+impl From<u64> for TimestampNs {
+    fn from(v: u64) -> Self {
+        Self(v)
+    }
+}
+
+impl From<TimestampNs> for u64 {
+    fn from(v: TimestampNs) -> Self {
+        v.0
+    }
+}
+
 /// Configurable limits for HTTP/2 header decoding and stream management.
 ///
 /// These limits defend against resource exhaustion from untrusted input
@@ -56,7 +106,7 @@ pub struct H2ConnectionState {
     pub(crate) decoder: loona_hpack::Decoder<'static>,
 
     /// Active streams being tracked
-    pub(crate) active_streams: HashMap<u32, StreamState>,
+    pub(crate) active_streams: HashMap<StreamId, StreamState>,
 
     /// Connection settings (from SETTINGS frames)
     pub(crate) settings: H2Settings,
@@ -68,7 +118,7 @@ pub struct H2ConnectionState {
     pub preface_received: bool,
 
     /// Highest stream ID seen (for protocol validation)
-    pub(crate) highest_stream_id: u32,
+    pub(crate) highest_stream_id: StreamId,
 
     /// Internal buffer for incremental parsing
     pub(crate) buffer: Vec<u8>,
@@ -76,13 +126,30 @@ pub struct H2ConnectionState {
     /// Stream ID expecting a CONTINUATION frame, or None if no CONTINUATION is pending.
     /// When a HEADERS frame arrives without END_HEADERS, this is set to the stream ID.
     /// Cleared when CONTINUATION with END_HEADERS arrives.
-    pub(crate) expecting_continuation: Option<u32>,
+    pub(crate) expecting_continuation: Option<StreamId>,
 
     /// Completed messages ready to be popped, stored as (stream_id, message)
-    pub(crate) completed: VecDeque<(u32, ParsedH2Message)>,
+    pub(crate) completed: VecDeque<(StreamId, ParsedH2Message)>,
 
     /// Current timestamp for frame processing (set by feed())
-    pub(crate) current_timestamp_ns: u64,
+    pub(crate) current_timestamp_ns: TimestampNs,
+}
+
+/// Phase of a stream's lifecycle (RFC 7540 §5.1).
+///
+/// Invariant: transitions only move forward through the variants:
+///   ReceivingHeaders → ReceivingBody → Complete
+///   ReceivingHeaders → Complete  (when END_STREAM arrives with HEADERS)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamPhase {
+    /// HEADERS received but END_HEADERS not yet seen; CONTINUATION pending.
+    /// `end_stream_seen` tracks whether END_STREAM was set on the HEADERS frame
+    /// (the stream will complete once END_HEADERS arrives via CONTINUATION).
+    ReceivingHeaders { end_stream_seen: bool },
+    /// Headers complete (END_HEADERS seen), awaiting body DATA or END_STREAM.
+    ReceivingBody,
+    /// Both END_HEADERS and END_STREAM received; stream is complete.
+    Complete,
 }
 
 /// Per-stream state (internal to crate)
@@ -108,15 +175,14 @@ pub(crate) struct StreamState {
     /// Total size of HEADERS frames
     pub(crate) header_size: usize,
 
-    /// Flags
-    pub(crate) end_stream_seen: bool,
-    pub(crate) end_headers_seen: bool,
+    /// Lifecycle phase of this stream
+    pub(crate) phase: StreamPhase,
 
     /// Timestamp when first frame for this stream was received
-    pub(crate) first_frame_timestamp_ns: u64,
+    pub(crate) first_frame_timestamp_ns: TimestampNs,
 
     /// Timestamp when END_STREAM was received
-    pub(crate) end_stream_timestamp_ns: u64,
+    pub(crate) end_stream_timestamp_ns: TimestampNs,
 }
 
 /// HTTP/2 connection settings (internal to crate)
@@ -154,11 +220,11 @@ impl Default for H2ConnectionState {
             settings: H2Settings::default(),
             limits,
             preface_received: false,
-            highest_stream_id: 0,
+            highest_stream_id: StreamId(0),
             buffer: Vec::new(),
             expecting_continuation: None,
             completed: VecDeque::new(),
-            current_timestamp_ns: 0,
+            current_timestamp_ns: TimestampNs(0),
         }
     }
 }
@@ -178,11 +244,11 @@ impl H2ConnectionState {
             settings: H2Settings::default(),
             limits,
             preface_received: false,
-            highest_stream_id: 0,
+            highest_stream_id: StreamId(0),
             buffer: Vec::new(),
             expecting_continuation: None,
             completed: VecDeque::new(),
-            current_timestamp_ns: 0,
+            current_timestamp_ns: TimestampNs(0),
         }
     }
 
@@ -194,9 +260,9 @@ impl H2ConnectionState {
     ///
     /// Returns Ok(()) if data was processed (even if no messages completed yet).
     /// Returns Err only for fatal parse errors.
-    pub fn feed(&mut self, data: &[u8], timestamp_ns: u64) -> Result<(), ParseError> {
+    pub fn feed(&mut self, data: &[u8], timestamp_ns: TimestampNs) -> Result<(), ParseError> {
         if self.buffer.len() + data.len() > self.limits.max_buffer_size {
-            return Err(ParseError::Http2BufferTooLarge);
+            return Err(ParseError::new(ParseErrorKind::Http2BufferTooLarge));
         }
         self.buffer.extend_from_slice(data);
         self.current_timestamp_ns = timestamp_ns;
@@ -207,7 +273,7 @@ impl H2ConnectionState {
     ///
     /// Returns the stream_id and parsed message for a completed HTTP/2 stream.
     /// Messages are returned in the order they completed.
-    pub fn try_pop(&mut self) -> Option<(u32, ParsedH2Message)> {
+    pub fn try_pop(&mut self) -> Option<(StreamId, ParsedH2Message)> {
         self.completed.pop_front()
     }
 
@@ -233,15 +299,24 @@ impl H2ConnectionState {
     /// ago. If still over `max_concurrent_streams` after timeout eviction,
     /// removes the oldest streams by `first_frame_timestamp_ns`.
     ///
+    /// **Safety invariant**: This only removes *incomplete* streams from
+    /// `active_streams`. Complete streams are removed at parse time (via
+    /// `check_stream_completion`) and moved to the `completed` queue before
+    /// eviction runs. Messages already popped via `try_pop()` are fully owned
+    /// by the caller and are unaffected by eviction.
+    ///
     /// Callers should invoke this periodically (e.g., during cleanup or
     /// after each parsing pass) to bound memory usage from incomplete streams.
-    pub fn evict_stale_streams(&mut self, current_time_ns: u64) {
+    pub fn evict_stale_streams(&mut self, current_time_ns: TimestampNs) {
         let timeout = self.limits.stream_timeout_ns;
         let max_streams = self.limits.max_concurrent_streams;
 
         // Evict streams that exceeded the timeout
         self.active_streams.retain(|_id, stream| {
-            let stale = current_time_ns.saturating_sub(stream.first_frame_timestamp_ns) >= timeout;
+            let stale = current_time_ns
+                .0
+                .saturating_sub(stream.first_frame_timestamp_ns.0)
+                >= timeout;
             if stale {
                 crate::trace_warn!("evicting stale stream {_id} (timeout)");
             }
@@ -266,7 +341,7 @@ impl H2ConnectionState {
 }
 
 impl StreamState {
-    pub(crate) fn new(_stream_id: u32, timestamp_ns: u64) -> Self {
+    pub(crate) fn new(_stream_id: StreamId, timestamp_ns: TimestampNs) -> Self {
         Self {
             headers: Vec::new(),
             method: None,
@@ -277,10 +352,11 @@ impl StreamState {
             body: Vec::new(),
             continuation_buffer: Vec::new(),
             header_size: 0,
-            end_stream_seen: false,
-            end_headers_seen: false,
+            phase: StreamPhase::ReceivingHeaders {
+                end_stream_seen: false,
+            },
             first_frame_timestamp_ns: timestamp_ns,
-            end_stream_timestamp_ns: 0,
+            end_stream_timestamp_ns: TimestampNs(0),
         }
     }
 }
@@ -294,13 +370,13 @@ pub struct ParsedH2Message {
     pub scheme: Option<String>,
     pub status: Option<u16>,
     pub headers: Vec<(String, String)>,
-    pub stream_id: u32,
+    pub stream_id: StreamId,
     pub header_size: usize,
     pub body: Vec<u8>,
     /// Timestamp when first frame for this stream was received
-    pub first_frame_timestamp_ns: u64,
+    pub first_frame_timestamp_ns: TimestampNs,
     /// Timestamp when stream completed (END_STREAM received)
-    pub end_stream_timestamp_ns: u64,
+    pub end_stream_timestamp_ns: TimestampNs,
 }
 
 impl ParsedH2Message {
@@ -418,9 +494,9 @@ impl ParsedH2Message {
     }
 }
 
-/// Error type for parsing (public API)
+/// Classification of parse errors (public API)
 #[derive(Debug, Clone)]
-pub enum ParseError {
+pub enum ParseErrorKind {
     Http2BufferTooSmall,
     Http2HpackError(String),
     Http2HeadersIncomplete,
@@ -449,7 +525,7 @@ pub enum ParseError {
     Http2SettingsLengthError,
 }
 
-impl std::fmt::Display for ParseError {
+impl std::fmt::Display for ParseErrorKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Http2BufferTooSmall => write!(f, "HTTP/2 buffer too small to parse frame header"),
@@ -491,6 +567,39 @@ impl std::fmt::Display for ParseError {
                     "HTTP/2 SETTINGS frame payload is not a multiple of 6 bytes"
                 )
             }
+        }
+    }
+}
+
+/// Parse error with optional stream context (public API)
+#[derive(Debug, Clone)]
+pub struct ParseError {
+    pub kind: ParseErrorKind,
+    pub stream_id: Option<StreamId>,
+}
+
+impl ParseError {
+    pub fn new(kind: ParseErrorKind) -> Self {
+        Self {
+            kind,
+            stream_id: None,
+        }
+    }
+
+    pub fn with_stream(kind: ParseErrorKind, stream_id: StreamId) -> Self {
+        Self {
+            kind,
+            stream_id: Some(stream_id),
+        }
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(sid) = self.stream_id {
+            write!(f, "[stream {sid}] {}", self.kind)
+        } else {
+            write!(f, "{}", self.kind)
         }
     }
 }

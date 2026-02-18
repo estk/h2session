@@ -4,7 +4,7 @@ use bytes::Bytes;
 
 use crate::h1::{HttpRequest, HttpResponse};
 use crate::traits::Direction;
-use h2session::{H2ConnectionState, ParsedH2Message};
+use h2session::{H2ConnectionState, ParsedH2Message, StreamId, TimestampNs};
 use std::collections::{HashMap, HashSet};
 
 /// Protocol detected for a connection
@@ -19,7 +19,7 @@ pub enum Protocol {
 #[derive(Debug, Clone)]
 pub struct DataChunk {
     pub data: Bytes,
-    pub timestamp_ns: u64,
+    pub timestamp_ns: TimestampNs,
     pub direction: Direction,
 }
 
@@ -31,7 +31,7 @@ pub struct Connection {
     pub protocol: Protocol,
     pub request_chunks: Vec<DataChunk>,
     pub response_chunks: Vec<DataChunk>,
-    pub last_activity_ns: u64,
+    pub last_activity_ns: TimestampNs,
     pub request_complete: bool,
     pub response_complete: bool,
 
@@ -58,16 +58,16 @@ pub struct Connection {
     pub(crate) h2_read_state: H2ConnectionState,
 
     // Completed messages from h2session, keyed by stream_id
-    pub(crate) pending_requests: HashMap<u32, ParsedH2Message>,
-    pub(crate) pending_responses: HashMap<u32, ParsedH2Message>,
+    pub(crate) pending_requests: HashMap<StreamId, ParsedH2Message>,
+    pub(crate) pending_responses: HashMap<StreamId, ParsedH2Message>,
 
     // HTTP/2 emission tracking - which stream_ids have we emitted Message events for?
-    pub(crate) h2_emitted_requests: HashSet<u32>,
-    pub(crate) h2_emitted_responses: HashSet<u32>,
+    pub(crate) h2_emitted_requests: HashSet<StreamId>,
+    pub(crate) h2_emitted_responses: HashSet<StreamId>,
 
     // Stream IDs that have both a pending request and pending response,
     // enabling O(1) lookup for complete exchange pairs.
-    pub(crate) ready_streams: HashSet<u32>,
+    pub(crate) ready_streams: HashSet<StreamId>,
 }
 
 impl Connection {
@@ -83,7 +83,7 @@ impl Connection {
             protocol: Protocol::Unknown,
             request_chunks: Vec::new(),
             response_chunks: Vec::new(),
-            last_activity_ns: 0,
+            last_activity_ns: TimestampNs(0),
             request_complete: false,
             response_complete: false,
             h1_request_buffer: Vec::new(),

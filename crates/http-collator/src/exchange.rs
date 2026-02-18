@@ -2,6 +2,7 @@
 
 use crate::connection::Protocol;
 use crate::h1::{HttpRequest, HttpResponse};
+use h2session::{StreamId, TimestampNs};
 
 /// Classification of parsed HTTP message
 #[derive(Debug, Clone)]
@@ -46,9 +47,9 @@ pub struct MessageMetadata {
     /// Process ID for connection tracking
     pub process_id: u32,
     /// Timestamp in nanoseconds
-    pub timestamp_ns: u64,
+    pub timestamp_ns: TimestampNs,
     /// Stream ID for HTTP/2 (None for HTTP/1)
-    pub stream_id: Option<u32>,
+    pub stream_id: Option<StreamId>,
     /// Remote port (None if unavailable)
     pub remote_port: Option<u16>,
     /// Protocol detected for this connection
@@ -155,7 +156,7 @@ pub struct Exchange {
     /// Remote port, None if unavailable (e.g., SSL without socket fd)
     pub remote_port: Option<u16>,
     /// Stream ID for HTTP/2 (None for HTTP/1)
-    pub stream_id: Option<u32>,
+    pub stream_id: Option<StreamId>,
 }
 
 impl std::fmt::Display for Exchange {

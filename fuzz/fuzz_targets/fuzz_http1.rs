@@ -5,15 +5,16 @@
 
 #![no_main]
 
+use h2session::TimestampNs;
 use http_collator::h1;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // Try parsing as request
-    let _ = h1::try_parse_http1_request(data, 0);
+    let _ = h1::try_parse_http1_request(data, TimestampNs(0));
 
     // Try parsing as response
-    let _ = h1::try_parse_http1_response(data, 0);
+    let _ = h1::try_parse_http1_response(data, TimestampNs(0));
 
     // Also test protocol detection helpers
     let _ = h1::is_http1_request(data);
@@ -21,7 +22,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Test incremental: prefix of data
     if data.len() > 10 {
-        let _ = h1::try_parse_http1_request(&data[..data.len() / 2], 0);
-        let _ = h1::try_parse_http1_response(&data[..data.len() / 2], 0);
+        let _ = h1::try_parse_http1_request(&data[..data.len() / 2], TimestampNs(0));
+        let _ = h1::try_parse_http1_response(&data[..data.len() / 2], TimestampNs(0));
     }
 });

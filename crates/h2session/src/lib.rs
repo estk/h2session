@@ -20,7 +20,9 @@ pub(crate) use trace_warn;
 use dashmap::DashMap;
 pub use frame::{CONNECTION_PREFACE, is_http2_preface, looks_like_http2_frame};
 pub use http_types::{HttpRequest, HttpResponse};
-pub use state::{H2ConnectionState, H2Limits, ParseError, ParsedH2Message};
+pub use state::{
+    H2ConnectionState, H2Limits, ParseError, ParseErrorKind, ParsedH2Message, StreamId, TimestampNs,
+};
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Mutex;
@@ -53,7 +55,7 @@ impl<K: Hash + Eq + Clone> H2SessionCache<K> {
         &self,
         key: K,
         buffer: &[u8],
-    ) -> Result<HashMap<u32, ParsedH2Message>, ParseError> {
+    ) -> Result<HashMap<StreamId, ParsedH2Message>, ParseError> {
         // Atomic insert-if-absent
         self.connections
             .entry(key.clone())
@@ -261,7 +263,7 @@ mod tests {
 
         let messages = result.unwrap();
         // Verify messages are keyed by stream_id
-        assert!(messages.contains_key(&1) || messages.contains_key(&3));
+        assert!(messages.contains_key(&StreamId(1)) || messages.contains_key(&StreamId(3)));
 
         // Verify stream_id matches the key
         for (stream_id, msg) in &messages {
@@ -319,7 +321,7 @@ mod tests {
         buffer.extend_from_slice(&create_settings_frame());
         buffer.extend(build_test_headers_frame(1, &hpack));
 
-        let result = state.feed(&buffer, 1_000_000);
+        let result = state.feed(&buffer, TimestampNs(1_000_000));
         // Should be non-fatal (headers rejected but parsing continues)
         assert!(result.is_ok(), "Header limit violation should be non-fatal");
         // Stream should NOT have completed successfully
@@ -341,7 +343,7 @@ mod tests {
         buffer.extend_from_slice(&create_settings_frame());
         buffer.extend(build_test_headers_frame(1, &hpack));
 
-        let result = state.feed(&buffer, 1_000_000);
+        let result = state.feed(&buffer, TimestampNs(1_000_000));
         assert!(result.is_ok());
         let msg = state.try_pop();
         assert!(
@@ -382,7 +384,7 @@ mod tests {
         buffer.extend_from_slice(&create_settings_frame());
         buffer.extend(build_test_headers_frame(1, &hpack));
 
-        let result = state.feed(&buffer, 1_000_000);
+        let result = state.feed(&buffer, TimestampNs(1_000_000));
         assert!(
             result.is_ok(),
             "Header size limit violation should be non-fatal"
@@ -417,7 +419,7 @@ mod tests {
         buffer.extend_from_slice(&create_settings_frame());
         buffer.extend(build_test_headers_frame(1, &hpack));
 
-        let result = state.feed(&buffer, 1_000_000);
+        let result = state.feed(&buffer, TimestampNs(1_000_000));
         assert!(
             result.is_ok(),
             "Header value size violation should be non-fatal"
@@ -451,7 +453,7 @@ mod tests {
         buffer.extend_from_slice(&create_settings_frame());
         buffer.extend(build_test_headers_frame(1, &hpack));
 
-        let result = state.feed(&buffer, 1_000_000);
+        let result = state.feed(&buffer, TimestampNs(1_000_000));
         assert!(
             result.is_ok(),
             "Invalid UTF-8 should be non-fatal via feed()"
@@ -485,7 +487,7 @@ mod tests {
 
         let result = parse_frames_stateful(&buffer, &mut state);
         assert!(
-            matches!(result, Err(ParseError::Http2InvalidHeaderEncoding)),
+            matches!(result, Err(ref e) if matches!(e.kind, ParseErrorKind::Http2InvalidHeaderEncoding)),
             "Should return Http2InvalidHeaderEncoding, got: {result:?}"
         );
     }
@@ -509,7 +511,7 @@ mod tests {
         buffer.extend_from_slice(&create_settings_frame());
         buffer.extend(build_test_headers_frame(1, &hpack));
 
-        let result = state.feed(&buffer, 1_000_000);
+        let result = state.feed(&buffer, TimestampNs(1_000_000));
         assert!(result.is_ok());
         let msg = state.try_pop();
         assert!(
@@ -551,7 +553,7 @@ mod tests {
         hpack.extend_from_slice(b"value");
         buffer.extend(build_test_headers_frame(1, &hpack));
 
-        let result = state.feed(&buffer, 1_000_000);
+        let result = state.feed(&buffer, TimestampNs(1_000_000));
         // With table size 0, the dynamic table should be empty.
         // The decoder should still work — it just won't store the entry.
         assert!(
@@ -591,11 +593,11 @@ mod tests {
         headers.extend(&hpack);
         buffer.extend(headers);
 
-        let _ = state.feed(&buffer, 1_000_000_000);
+        let _ = state.feed(&buffer, TimestampNs(1_000_000_000));
         assert_eq!(state.active_streams.len(), 1, "Stream 1 should be active");
 
         // Feed empty data at t=3s (>1s timeout) to trigger eviction
-        let _ = state.feed(&[], 3_000_000_000);
+        let _ = state.feed(&[], TimestampNs(3_000_000_000));
         assert_eq!(
             state.active_streams.len(),
             0,
@@ -633,7 +635,7 @@ mod tests {
             buffer.extend(headers);
         }
 
-        let _ = state.feed(&buffer, 1_000_000);
+        let _ = state.feed(&buffer, TimestampNs(1_000_000));
         assert_eq!(
             state.active_streams.len(),
             2,
@@ -656,7 +658,7 @@ mod tests {
         headers3.extend(&hpack);
         buffer2.extend(headers3);
 
-        let result = state.feed(&buffer2, 2_000_000);
+        let result = state.feed(&buffer2, TimestampNs(2_000_000));
         assert!(
             result.is_ok(),
             "Exceeding max concurrent streams should be non-fatal"
@@ -813,9 +815,9 @@ mod tests {
 
         // Single feed exceeding the limit
         let chunk = vec![0x00u8; 101];
-        let result = state.feed(&chunk, 1_000_000);
+        let result = state.feed(&chunk, TimestampNs(1_000_000));
         assert!(
-            matches!(result, Err(ParseError::Http2BufferTooLarge)),
+            matches!(result, Err(ref e) if matches!(e.kind, ParseErrorKind::Http2BufferTooLarge)),
             "Feed exceeding buffer cap should return Http2BufferTooLarge, got: {result:?}"
         );
     }
@@ -830,7 +832,7 @@ mod tests {
         // Feed exactly 100 bytes — at limit, should succeed
         let chunk = vec![0x00u8; 100];
         assert!(
-            state.feed(&chunk, 1_000_000).is_ok(),
+            state.feed(&chunk, TimestampNs(1_000_000)).is_ok(),
             "Feed at exact limit should succeed"
         );
     }
@@ -867,7 +869,7 @@ mod tests {
         let result = parse_frames_stateful(&buffer, &mut state);
         // The max_frame_size check will reject this before the incomplete frame check
         assert!(
-            matches!(result, Err(ParseError::Http2FrameSizeError)),
+            matches!(result, Err(ref e) if matches!(e.kind, ParseErrorKind::Http2FrameSizeError)),
             "Max 24-bit length frame should trigger FrameSizeError, got: {result:?}"
         );
     }
@@ -903,7 +905,7 @@ mod tests {
 
         let result = parse_frames_stateful(&buffer, &mut state);
         assert!(
-            matches!(result, Err(ParseError::Http2FrameSizeError)),
+            matches!(result, Err(ref e) if matches!(e.kind, ParseErrorKind::Http2FrameSizeError)),
             "Frame exceeding default max_frame_size should be rejected, got: {result:?}"
         );
     }
@@ -965,8 +967,15 @@ mod tests {
         );
 
         let messages = result.unwrap();
-        assert!(messages.contains_key(&1), "Stream 1 should complete");
-        assert_eq!(messages[&1].body.len(), 20000, "Body should be 20000 bytes");
+        assert!(
+            messages.contains_key(&StreamId(1)),
+            "Stream 1 should complete"
+        );
+        assert_eq!(
+            messages[&StreamId(1)].body.len(),
+            20000,
+            "Body should be 20000 bytes"
+        );
     }
 
     // =========================================================================
@@ -1008,7 +1017,7 @@ mod tests {
 
         let result = parse_frames_stateful(&buffer, &mut state);
         assert!(
-            matches!(result, Err(ParseError::Http2ContinuationExpected)),
+            matches!(result, Err(ref e) if matches!(e.kind, ParseErrorKind::Http2ContinuationExpected)),
             "DATA after HEADERS without END_HEADERS should trigger ContinuationExpected, got: {result:?}"
         );
     }
@@ -1054,7 +1063,7 @@ mod tests {
 
         let result = parse_frames_stateful(&buffer, &mut state);
         assert!(
-            matches!(result, Err(ParseError::Http2ContinuationExpected)),
+            matches!(result, Err(ref e) if matches!(e.kind, ParseErrorKind::Http2ContinuationExpected)),
             "CONTINUATION on wrong stream should trigger ContinuationExpected, got: {result:?}"
         );
     }
@@ -1106,7 +1115,7 @@ mod tests {
 
         let messages = result.unwrap();
         assert!(
-            messages.contains_key(&1),
+            messages.contains_key(&StreamId(1)),
             "Stream 1 should complete with HEADERS + CONTINUATION"
         );
     }
@@ -1132,7 +1141,7 @@ mod tests {
 
         let result = parse_frames_stateful(&buffer, &mut state);
         assert!(
-            matches!(result, Err(ParseError::Http2SettingsLengthError)),
+            matches!(result, Err(ref e) if matches!(e.kind, ParseErrorKind::Http2SettingsLengthError)),
             "SETTINGS with 7-byte payload should trigger SettingsLengthError, got: {result:?}"
         );
     }
@@ -1164,11 +1173,11 @@ mod tests {
             scheme: Some("https".to_string()),
             status: None,
             headers: vec![("content-type".to_string(), "text/plain".to_string())],
-            stream_id: 1,
+            stream_id: StreamId(1),
             header_size: 100,
             body: vec![1, 2, 3],
-            first_frame_timestamp_ns: 1000,
-            end_stream_timestamp_ns: 2000,
+            first_frame_timestamp_ns: TimestampNs(1000),
+            end_stream_timestamp_ns: TimestampNs(2000),
         };
 
         let req = msg
@@ -1177,7 +1186,7 @@ mod tests {
         assert_eq!(req.method, http::Method::GET);
         assert_eq!(req.uri, "/foo");
         assert_eq!(req.body, vec![1, 2, 3]);
-        assert_eq!(req.timestamp_ns, 2000);
+        assert_eq!(req.timestamp_ns, TimestampNs(2000));
     }
 
     #[test]
@@ -1189,11 +1198,11 @@ mod tests {
             scheme: None,
             status: Some(200),
             headers: vec![("content-type".to_string(), "application/json".to_string())],
-            stream_id: 1,
+            stream_id: StreamId(1),
             header_size: 50,
             body: vec![4, 5, 6],
-            first_frame_timestamp_ns: 3000,
-            end_stream_timestamp_ns: 4000,
+            first_frame_timestamp_ns: TimestampNs(3000),
+            end_stream_timestamp_ns: TimestampNs(4000),
         };
 
         let resp = msg
@@ -1201,7 +1210,7 @@ mod tests {
             .expect("should produce an HttpResponse");
         assert_eq!(resp.status, http::StatusCode::OK);
         assert_eq!(resp.body, vec![4, 5, 6]);
-        assert_eq!(resp.timestamp_ns, 3000);
+        assert_eq!(resp.timestamp_ns, TimestampNs(3000));
     }
 
     #[test]
@@ -1213,11 +1222,11 @@ mod tests {
             scheme: None,
             status: Some(200),
             headers: vec![],
-            stream_id: 1,
+            stream_id: StreamId(1),
             header_size: 10,
             body: vec![],
-            first_frame_timestamp_ns: 0,
-            end_stream_timestamp_ns: 0,
+            first_frame_timestamp_ns: TimestampNs(0),
+            end_stream_timestamp_ns: TimestampNs(0),
         };
 
         assert!(msg.into_http_request().is_none());
@@ -1285,7 +1294,7 @@ mod tests {
         // Feed preface + settings
         let mut init = frame::CONNECTION_PREFACE.to_vec();
         init.extend_from_slice(&create_settings_frame());
-        let result = state.feed(&init, 1_000_000);
+        let result = state.feed(&init, TimestampNs(1_000_000));
         assert!(result.is_ok());
 
         // HEADERS without END_HEADERS on stream 1 (expecting CONTINUATION)
@@ -1315,7 +1324,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend(headers);
         buf.extend(data_frame);
-        let result = state.feed(&buf, 2_000_000);
+        let result = state.feed(&buf, TimestampNs(2_000_000));
         assert!(
             result.is_ok(),
             "Broken CONTINUATION should be non-fatal via feed()"
@@ -1328,14 +1337,14 @@ mod tests {
         );
         // Stream 1 (incomplete header block) should be removed
         assert!(
-            !state.active_streams.contains_key(&1),
+            !state.active_streams.contains_key(&StreamId(1)),
             "Incomplete stream 1 should be removed"
         );
 
         // Now send a valid HEADERS frame on stream 5 — connection should NOT be poisoned
         let hpack2 = vec![0x82]; // :method: GET
         let valid_headers = create_headers_frame(5, &hpack2);
-        let result = state.feed(&valid_headers, 3_000_000);
+        let result = state.feed(&valid_headers, TimestampNs(3_000_000));
         assert!(
             result.is_ok(),
             "Valid HEADERS after broken CONTINUATION should succeed: {result:?}"
@@ -1346,7 +1355,7 @@ mod tests {
             "Stream 5 should complete — connection is not poisoned"
         );
         let (stream_id, _) = msg.unwrap();
-        assert_eq!(stream_id, 5);
+        assert_eq!(stream_id, StreamId(5));
     }
 
     // =========================================================================
@@ -1426,5 +1435,70 @@ mod tests {
             state.settings.max_frame_size, 32_768,
             "max_frame_size=32768 should be accepted"
         );
+    }
+
+    // =========================================================================
+    // H6: Eviction safety — completed+popped messages survive eviction
+    // =========================================================================
+
+    #[test]
+    fn test_completed_message_survives_eviction() {
+        let mut state = H2ConnectionState::with_limits(H2Limits {
+            stream_timeout_ns: 1_000_000_000, // 1 second
+            ..H2Limits::default()
+        });
+
+        // Feed preface + settings + complete HEADERS frame at t=1s
+        let hpack = vec![0x82]; // :method: GET
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+        buffer.extend_from_slice(&create_settings_frame());
+        buffer.extend(create_headers_frame(1, &hpack)); // END_STREAM + END_HEADERS
+
+        let _ = state.feed(&buffer, TimestampNs(1_000_000_000));
+
+        // Pop the completed message before eviction
+        let popped = state.try_pop();
+        assert!(popped.is_some(), "Stream 1 should complete and be poppable");
+        let (sid, msg) = popped.unwrap();
+        assert_eq!(sid, StreamId(1));
+        assert_eq!(msg.method.as_deref(), Some("GET"));
+
+        // Trigger eviction at t=3s (well past timeout)
+        state.evict_stale_streams(TimestampNs(3_000_000_000));
+
+        // The popped message is still valid — eviction cannot affect it
+        assert_eq!(sid, StreamId(1));
+        assert_eq!(msg.method.as_deref(), Some("GET"));
+    }
+
+    #[test]
+    fn test_completed_in_queue_not_evicted() {
+        let mut state = H2ConnectionState::with_limits(H2Limits {
+            stream_timeout_ns: 1_000_000_000, // 1 second
+            ..H2Limits::default()
+        });
+
+        // Feed preface + settings + complete HEADERS frame at t=1s
+        let hpack = vec![0x82]; // :method: GET
+        let mut buffer = frame::CONNECTION_PREFACE.to_vec();
+        buffer.extend_from_slice(&create_settings_frame());
+        buffer.extend(create_headers_frame(1, &hpack));
+
+        let _ = state.feed(&buffer, TimestampNs(1_000_000_000));
+
+        // Do NOT pop — the message is in the completed queue
+        assert!(state.has_completed(), "Should have a completed message");
+
+        // Trigger eviction at t=3s
+        state.evict_stale_streams(TimestampNs(3_000_000_000));
+
+        // The completed message should still be in the queue
+        let popped = state.try_pop();
+        assert!(
+            popped.is_some(),
+            "Completed message in queue should survive eviction"
+        );
+        let (sid, _) = popped.unwrap();
+        assert_eq!(sid, StreamId(1));
     }
 }

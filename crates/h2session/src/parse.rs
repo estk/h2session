@@ -1,7 +1,10 @@
 use std::collections::HashMap;
 
 use crate::frame::*;
-use crate::state::{H2ConnectionState, ParseError, ParsedH2Message, StreamState};
+use crate::state::{
+    H2ConnectionState, ParseError, ParseErrorKind, ParsedH2Message, StreamId, StreamPhase,
+    StreamState, TimestampNs,
+};
 
 /// Parse HTTP/2 frames with connection-level state
 ///
@@ -15,7 +18,7 @@ use crate::state::{H2ConnectionState, ParseError, ParsedH2Message, StreamState};
 pub(crate) fn parse_frames_stateful(
     buffer: &[u8],
     state: &mut H2ConnectionState,
-) -> Result<HashMap<u32, ParsedH2Message>, ParseError> {
+) -> Result<HashMap<StreamId, ParsedH2Message>, ParseError> {
     let mut pos = 0;
     let mut completed_messages = HashMap::new();
     let timestamp_ns = state.current_timestamp_ns;
@@ -33,13 +36,13 @@ pub(crate) fn parse_frames_stateful(
         // H1: enforce max_frame_size (before checking completeness — reject
         // oversized frames as soon as the header is visible)
         if header.length > state.settings.max_frame_size {
-            return Err(ParseError::Http2FrameSizeError);
+            return Err(ParseError::new(ParseErrorKind::Http2FrameSizeError));
         }
 
         // C4: checked arithmetic for frame total size
         let frame_total_size = FRAME_HEADER_SIZE
             .checked_add(header.length as usize)
-            .ok_or(ParseError::Http2InvalidFrame)?;
+            .ok_or(ParseError::new(ParseErrorKind::Http2InvalidFrame))?;
 
         if pos + frame_total_size > buffer.len() {
             break; // Incomplete frame
@@ -48,7 +51,7 @@ pub(crate) fn parse_frames_stateful(
         // H4: validate CONTINUATION ordering
         if let Some(expected_stream) = state.expecting_continuation {
             if header.frame_type != FRAME_TYPE_CONTINUATION || header.stream_id != expected_stream {
-                return Err(ParseError::Http2ContinuationExpected);
+                return Err(ParseError::new(ParseErrorKind::Http2ContinuationExpected));
             }
         }
 
@@ -67,15 +70,23 @@ pub(crate) fn parse_frames_stateful(
             FRAME_TYPE_SETTINGS => {
                 handle_settings_frame(state, &header, frame_payload)?;
             }
-            _ => {
-                // Skip other frame types
+            FRAME_TYPE_RST_STREAM => {
+                handle_rst_stream(state, &header, frame_payload);
             }
+            FRAME_TYPE_GOAWAY => {
+                handle_goaway(frame_payload);
+            }
+            FRAME_TYPE_PRIORITY
+            | FRAME_TYPE_PUSH_PROMISE
+            | FRAME_TYPE_PING
+            | FRAME_TYPE_WINDOW_UPDATE => {}
+            _ => {}
         }
 
         pos += frame_total_size;
 
         // Check only the stream that was just modified (stream_id 0 = connection-level)
-        if header.stream_id != 0
+        if header.stream_id != StreamId(0)
             && let Some((id, msg)) = check_stream_completion(state, header.stream_id)
         {
             completed_messages.insert(id, msg);
@@ -147,6 +158,18 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
             }
             FRAME_TYPE_CONTINUATION => handle_continuation_frame(state, &header, &frame_payload),
             FRAME_TYPE_SETTINGS => handle_settings_frame(state, &header, &frame_payload),
+            FRAME_TYPE_RST_STREAM => {
+                handle_rst_stream(state, &header, &frame_payload);
+                Ok(())
+            }
+            FRAME_TYPE_GOAWAY => {
+                handle_goaway(&frame_payload);
+                Ok(())
+            }
+            FRAME_TYPE_PRIORITY
+            | FRAME_TYPE_PUSH_PROMISE
+            | FRAME_TYPE_PING
+            | FRAME_TYPE_WINDOW_UPDATE => Ok(()),
             _ => Ok(()),
         };
 
@@ -157,7 +180,7 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
 
         if let Err(ref e) = result {
             // HPACK errors corrupt the decoder's dynamic table — stop parsing
-            if matches!(e, ParseError::Http2HpackError(_)) {
+            if matches!(e.kind, ParseErrorKind::Http2HpackError(_)) {
                 crate::trace_warn!("fatal HPACK error on stream {stream_id}: {e}");
                 fatal_error = Some(result.unwrap_err());
                 break;
@@ -168,7 +191,7 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
         }
 
         // Check only the stream that was just modified (stream_id 0 = connection-level)
-        if stream_id != 0
+        if stream_id != StreamId(0)
             && let Some(pair) = check_stream_completion(state, stream_id)
         {
             state.completed.push_back(pair);
@@ -193,7 +216,7 @@ fn handle_headers_frame(
     state: &mut H2ConnectionState,
     header: &FrameHeader,
     payload: &[u8],
-    timestamp_ns: u64,
+    timestamp_ns: TimestampNs,
 ) -> Result<(), ParseError> {
     let stream_id = header.stream_id;
 
@@ -202,7 +225,25 @@ fn handle_headers_frame(
         && state.active_streams.len() >= state.limits.max_concurrent_streams
     {
         crate::trace_warn!("max concurrent streams reached, rejecting stream {stream_id}");
-        return Err(ParseError::Http2MaxConcurrentStreams);
+        return Err(ParseError::with_stream(
+            ParseErrorKind::Http2MaxConcurrentStreams,
+            stream_id,
+        ));
+    }
+
+    // H2: Validate stream ID ordering for new streams (RFC 7540 §5.1.1)
+    if !state.active_streams.contains_key(&stream_id) {
+        if stream_id.0 != 0 && stream_id <= state.highest_stream_id {
+            crate::trace_warn!(
+                "stream {stream_id} not greater than highest seen ({}); RFC 7540 §5.1.1 violation",
+                state.highest_stream_id
+            );
+        }
+        if stream_id.0.is_multiple_of(2) && stream_id.0 != 0 {
+            crate::trace_warn!(
+                "even stream ID {stream_id} (server-initiated); unexpected for client traffic"
+            );
+        }
     }
 
     // Create stream if new, recording the timestamp of first frame
@@ -218,21 +259,40 @@ fn handle_headers_frame(
     // Padded frame format: [Pad Length (1 byte)] [Header Block] [Padding]
     let (header_block, _padding_len) = if header.flags & FLAG_PADDED != 0 {
         if payload.is_empty() {
-            return Err(ParseError::Http2PaddingError);
+            return Err(ParseError::with_stream(
+                ParseErrorKind::Http2PaddingError,
+                stream_id,
+            ));
         }
         let pad_len = payload[0] as usize;
         if pad_len >= payload.len() {
-            return Err(ParseError::Http2PaddingError);
+            return Err(ParseError::with_stream(
+                ParseErrorKind::Http2PaddingError,
+                stream_id,
+            ));
         }
         (&payload[1..payload.len() - pad_len], pad_len)
     } else {
         (payload, 0)
     };
 
-    // Handle PRIORITY flag (skip 5 bytes)
+    // Handle PRIORITY flag (skip 5 bytes: 4-byte dependency + 1-byte weight)
     let header_block = if header.flags & FLAG_PRIORITY != 0 {
         if header_block.len() < 5 {
-            return Err(ParseError::Http2PriorityError);
+            return Err(ParseError::with_stream(
+                ParseErrorKind::Http2PriorityError,
+                stream_id,
+            ));
+        }
+        // M2: Check for self-dependency (RFC 7540 §5.3.1)
+        let dependency = u32::from_be_bytes([
+            header_block[0] & 0x7F,
+            header_block[1],
+            header_block[2],
+            header_block[3],
+        ]);
+        if dependency == stream_id.0 {
+            crate::trace_warn!("stream {stream_id} depends on itself (RFC 7540 §5.3.1 violation)");
         }
         &header_block[5..]
     } else {
@@ -241,8 +301,11 @@ fn handle_headers_frame(
 
     stream.header_size += FRAME_HEADER_SIZE + payload.len();
 
+    let has_end_headers = header.flags & FLAG_END_HEADERS != 0;
+    let has_end_stream = header.flags & FLAG_END_STREAM != 0;
+
     // Check END_HEADERS flag
-    if header.flags & FLAG_END_HEADERS != 0 {
+    if has_end_headers {
         // Complete header block - decode now
         let full_block: Vec<u8> = if stream.continuation_buffer.is_empty() {
             header_block.to_vec()
@@ -252,7 +315,6 @@ fn handle_headers_frame(
         };
 
         decode_headers_into_stream(&mut state.decoder, stream, &full_block, &state.limits)?;
-        stream.end_headers_seen = true;
         state.expecting_continuation = None;
     } else {
         // Incomplete header block - wait for CONTINUATION
@@ -260,11 +322,17 @@ fn handle_headers_frame(
         state.expecting_continuation = Some(stream_id);
     }
 
-    // Check END_STREAM flag
-    if header.flags & FLAG_END_STREAM != 0 {
-        stream.end_stream_seen = true;
+    // Update phase based on flags
+    if has_end_stream {
         stream.end_stream_timestamp_ns = timestamp_ns;
     }
+    stream.phase = match (has_end_headers, has_end_stream) {
+        (true, true) => StreamPhase::Complete,
+        (true, false) => StreamPhase::ReceivingBody,
+        (false, es) => StreamPhase::ReceivingHeaders {
+            end_stream_seen: es,
+        },
+    };
 
     Ok(())
 }
@@ -277,7 +345,10 @@ fn handle_continuation_frame(
     let stream = state
         .active_streams
         .get_mut(&header.stream_id)
-        .ok_or(ParseError::Http2HeadersIncomplete)?;
+        .ok_or(ParseError::with_stream(
+            ParseErrorKind::Http2HeadersIncomplete,
+            header.stream_id,
+        ))?;
 
     stream.continuation_buffer.extend_from_slice(payload);
     stream.header_size += FRAME_HEADER_SIZE + payload.len();
@@ -285,8 +356,15 @@ fn handle_continuation_frame(
     if header.flags & FLAG_END_HEADERS != 0 {
         let buf = std::mem::take(&mut stream.continuation_buffer);
         decode_headers_into_stream(&mut state.decoder, stream, &buf, &state.limits)?;
-        stream.end_headers_seen = true;
         state.expecting_continuation = None;
+
+        // Transition based on whether END_STREAM was pending from the HEADERS frame
+        stream.phase = match stream.phase {
+            StreamPhase::ReceivingHeaders {
+                end_stream_seen: true,
+            } => StreamPhase::Complete,
+            _ => StreamPhase::ReceivingBody,
+        };
     }
 
     Ok(())
@@ -296,30 +374,46 @@ fn handle_data_frame(
     state: &mut H2ConnectionState,
     header: &FrameHeader,
     payload: &[u8],
-    timestamp_ns: u64,
+    timestamp_ns: TimestampNs,
 ) -> Result<(), ParseError> {
     // Handle PADDED flag before borrowing the stream
     // Padded frame format: [Pad Length (1 byte)] [Data] [Padding]
     let data = if header.flags & FLAG_PADDED != 0 {
         if payload.is_empty() {
-            return Err(ParseError::Http2PaddingError);
+            return Err(ParseError::with_stream(
+                ParseErrorKind::Http2PaddingError,
+                header.stream_id,
+            ));
         }
         let pad_len = payload[0] as usize;
         // Data length = total - pad_length_byte - padding
         if pad_len >= payload.len() {
-            return Err(ParseError::Http2PaddingError);
+            return Err(ParseError::with_stream(
+                ParseErrorKind::Http2PaddingError,
+                header.stream_id,
+            ));
         }
         &payload[1..payload.len() - pad_len]
     } else {
         payload
     };
 
-    // Check body size limit before borrowing the stream mutably
+    // Check body size limit and M1 (DATA before headers complete) before borrowing the stream mutably
     {
         let stream = state
             .active_streams
             .get(&header.stream_id)
-            .ok_or(ParseError::Http2StreamNotFound)?;
+            .ok_or(ParseError::with_stream(
+                ParseErrorKind::Http2StreamNotFound,
+                header.stream_id,
+            ))?;
+        // M1: DATA before headers are complete (RFC 7540 §8.1)
+        if matches!(stream.phase, StreamPhase::ReceivingHeaders { .. }) {
+            crate::trace_warn!(
+                "DATA on stream {} before headers complete (RFC 7540 §8.1)",
+                header.stream_id
+            );
+        }
         if stream.body.len() + data.len() > state.limits.max_body_size {
             // Drop the stream rather than accumulating unbounded data
             crate::trace_warn!(
@@ -334,13 +428,16 @@ fn handle_data_frame(
     let stream = state
         .active_streams
         .get_mut(&header.stream_id)
-        .ok_or(ParseError::Http2StreamNotFound)?;
+        .ok_or(ParseError::with_stream(
+            ParseErrorKind::Http2StreamNotFound,
+            header.stream_id,
+        ))?;
 
     stream.body.extend_from_slice(data);
 
     if header.flags & FLAG_END_STREAM != 0 {
-        stream.end_stream_seen = true;
         stream.end_stream_timestamp_ns = timestamp_ns;
+        stream.phase = StreamPhase::Complete;
     }
 
     Ok(())
@@ -353,7 +450,7 @@ fn handle_settings_frame(
 ) -> Result<(), ParseError> {
     // H3: SETTINGS payload must be a multiple of 6 bytes (RFC 7540 §6.5)
     if payload.len() % 6 != 0 {
-        return Err(ParseError::Http2SettingsLengthError);
+        return Err(ParseError::new(ParseErrorKind::Http2SettingsLengthError));
     }
 
     // Settings frame: 6 bytes per setting (2-byte id, 4-byte value)
@@ -369,16 +466,17 @@ fn handle_settings_frame(
 
         match setting_id {
             0x01 => {
-                state.settings.header_table_size = value;
-                let capped = (value as usize).min(state.limits.max_table_size);
-                state.decoder.set_max_table_size(capped);
+                // M4: Store the capped value, not the raw peer value
+                let capped = value.min(state.limits.max_table_size as u32);
+                state.settings.header_table_size = capped;
+                state.decoder.set_max_table_size(capped as usize);
             }
             0x02 => state.settings.enable_push = value != 0,
             0x03 => state.settings.max_concurrent_streams = value,
             0x04 => state.settings.initial_window_size = value,
             0x05 => {
                 // RFC 7540 §6.5.2: valid range is [16384, 16777215]
-                if (16_384..=16_777_215).contains(&value) {
+                if (16_384..=MAX_FRAME_PAYLOAD_LENGTH).contains(&value) {
                     state.settings.max_frame_size = value;
                 }
                 // Ignore out-of-range values (passive monitor shouldn't disconnect)
@@ -391,6 +489,37 @@ fn handle_settings_frame(
     }
 
     Ok(())
+}
+
+/// Handle RST_STREAM: remove the stream from active tracking (L1).
+fn handle_rst_stream(state: &mut H2ConnectionState, header: &FrameHeader, payload: &[u8]) {
+    if payload.len() < 4 {
+        crate::trace_warn!(
+            "RST_STREAM on stream {} with short payload ({} bytes)",
+            header.stream_id,
+            payload.len()
+        );
+        return;
+    }
+    let _error_code = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    crate::trace_warn!(
+        "RST_STREAM on stream {} error_code={_error_code}",
+        header.stream_id
+    );
+    state.active_streams.remove(&header.stream_id);
+}
+
+/// Handle GOAWAY: log the last stream ID and error code (L2).
+/// Does not interrupt parsing — the passive monitor continues observing.
+fn handle_goaway(payload: &[u8]) {
+    if payload.len() < 8 {
+        crate::trace_warn!("GOAWAY with short payload ({} bytes)", payload.len());
+        return;
+    }
+    let _last_stream_id =
+        u32::from_be_bytes([payload[0] & 0x7F, payload[1], payload[2], payload[3]]);
+    let _error_code = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    crate::trace_warn!("GOAWAY: last_stream_id={_last_stream_id}, error_code={_error_code}");
 }
 
 /// Decode an HPACK header block into the given stream's header state.
@@ -453,25 +582,25 @@ fn decode_headers_into_stream(
                 _ => stream.headers.push((name_str, value_str)),
             }
         })
-        .map_err(|e| ParseError::Http2HpackError(format!("{e:?}")))?;
+        .map_err(|e| ParseError::new(ParseErrorKind::Http2HpackError(format!("{e:?}"))))?;
 
     if encoding_error {
         crate::trace_warn!(
             "HPACK decoded header with invalid UTF-8; dynamic table may contain tainted entry"
         );
-        return Err(ParseError::Http2InvalidHeaderEncoding);
+        return Err(ParseError::new(ParseErrorKind::Http2InvalidHeaderEncoding));
     }
 
     if limit_exceeded {
         crate::trace_warn!("HPACK header list size/count limit exceeded");
-        return Err(ParseError::Http2HeaderListTooLarge);
+        return Err(ParseError::new(ParseErrorKind::Http2HeaderListTooLarge));
     }
 
     Ok(())
 }
 
 /// Build a `ParsedH2Message` by taking ownership of a completed stream's data.
-fn build_parsed_message_owned(stream_id: u32, stream: StreamState) -> ParsedH2Message {
+fn build_parsed_message_owned(stream_id: StreamId, stream: StreamState) -> ParsedH2Message {
     ParsedH2Message {
         method: stream.method,
         path: stream.path,
@@ -491,10 +620,10 @@ fn build_parsed_message_owned(stream_id: u32, stream: StreamState) -> ParsedH2Me
 /// Only checks the single stream that was just modified, avoiding a full scan.
 fn check_stream_completion(
     state: &mut H2ConnectionState,
-    stream_id: u32,
-) -> Option<(u32, ParsedH2Message)> {
+    stream_id: StreamId,
+) -> Option<(StreamId, ParsedH2Message)> {
     let stream = state.active_streams.get(&stream_id)?;
-    if stream.end_headers_seen && stream.end_stream_seen {
+    if stream.phase == StreamPhase::Complete {
         let stream = state.active_streams.remove(&stream_id)?;
         Some((stream_id, build_parsed_message_owned(stream_id, stream)))
     } else {

@@ -49,10 +49,10 @@ pub(crate) fn parse_frames_stateful(
         }
 
         // H4: validate CONTINUATION ordering
-        if let Some(expected_stream) = state.expecting_continuation {
-            if header.frame_type != FRAME_TYPE_CONTINUATION || header.stream_id != expected_stream {
-                return Err(ParseError::new(ParseErrorKind::Http2ContinuationExpected));
-            }
+        if let Some(expected_stream) = state.expecting_continuation
+            && (header.frame_type != FRAME_TYPE_CONTINUATION || header.stream_id != expected_stream)
+        {
+            return Err(ParseError::new(ParseErrorKind::Http2ContinuationExpected));
         }
 
         let frame_payload = &buffer[pos + FRAME_HEADER_SIZE..pos + frame_total_size];
@@ -135,18 +135,18 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
         }
 
         // H4: validate CONTINUATION ordering (non-fatal: skip unexpected frame)
-        if let Some(expected_stream) = state.expecting_continuation {
-            if header.frame_type != FRAME_TYPE_CONTINUATION || header.stream_id != expected_stream {
-                crate::trace_warn!(
-                    "expected CONTINUATION for stream {expected_stream}, got frame type {} on stream {}; \
+        if let Some(expected_stream) = state.expecting_continuation
+            && (header.frame_type != FRAME_TYPE_CONTINUATION || header.stream_id != expected_stream)
+        {
+            crate::trace_warn!(
+                "expected CONTINUATION for stream {expected_stream}, got frame type {} on stream {}; \
                      abandoning incomplete header block",
-                    header.frame_type,
-                    header.stream_id
-                );
-                state.expecting_continuation = None;
-                state.active_streams.remove(&expected_stream);
-                // Fall through to process this frame normally
-            }
+                header.frame_type,
+                header.stream_id
+            );
+            state.expecting_continuation = None;
+            state.active_streams.remove(&expected_stream);
+            // Fall through to process this frame normally
         }
 
         let frame_payload = state.buffer[pos + FRAME_HEADER_SIZE..pos + frame_total_size].to_vec();
@@ -449,7 +449,7 @@ fn handle_settings_frame(
     payload: &[u8],
 ) -> Result<(), ParseError> {
     // H3: SETTINGS payload must be a multiple of 6 bytes (RFC 7540 §6.5)
-    if payload.len() % 6 != 0 {
+    if !payload.len().is_multiple_of(6) {
         return Err(ParseError::new(ParseErrorKind::Http2SettingsLengthError));
     }
 

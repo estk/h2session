@@ -413,10 +413,10 @@ impl ParsedH2Message {
         let mut header_map = http::HeaderMap::new();
 
         // Convert :authority to Host header
-        if let Some(authority) = &self.authority {
-            if let Ok(v) = http::HeaderValue::from_str(authority) {
-                header_map.insert(http::header::HOST, v);
-            }
+        if let Some(authority) = &self.authority
+            && let Ok(v) = http::HeaderValue::from_str(authority)
+        {
+            header_map.insert(http::header::HOST, v);
         }
 
         // Convert regular headers (skip pseudo-headers)

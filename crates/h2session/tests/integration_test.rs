@@ -6,11 +6,11 @@
 mod fixtures;
 
 use fixtures::*;
-use h2session::{H2SessionCache, ParseError, ParsedH2Message};
+use h2session::{H2SessionCache, ParseError, ParseErrorKind, ParsedH2Message, StreamId};
 use std::collections::HashMap;
 
 /// Helper to parse a buffer and return messages or error
-fn parse_buffer(buffer: &[u8]) -> Result<HashMap<u32, ParsedH2Message>, ParseError> {
+fn parse_buffer(buffer: &[u8]) -> Result<HashMap<StreamId, ParsedH2Message>, ParseError> {
     let cache: H2SessionCache<&str> = H2SessionCache::new();
     cache.parse("test", buffer)
 }
@@ -78,17 +78,17 @@ fn test_interleaved_data_body_integrity() {
 
     // Verify each stream's body is correct (messages already keyed by stream_id)
     assert_eq!(
-        messages.get(&1).unwrap().body,
+        messages.get(&StreamId(1)).unwrap().body,
         expected_body_1,
         "Stream 1 body integrity"
     );
     assert_eq!(
-        messages.get(&3).unwrap().body,
+        messages.get(&StreamId(3)).unwrap().body,
         expected_body_3,
         "Stream 3 body integrity"
     );
     assert_eq!(
-        messages.get(&5).unwrap().body,
+        messages.get(&StreamId(5)).unwrap().body,
         expected_body_5,
         "Stream 5 body integrity"
     );
@@ -116,8 +116,8 @@ fn test_interleaved_data_single_byte_chunks() {
     let messages = parse_buffer(&buffer).expect("should parse successfully");
     assert_eq!(messages.len(), 2);
 
-    assert_eq!(messages.get(&1).unwrap().body, b"ABCD");
-    assert_eq!(messages.get(&3).unwrap().body, b"1234");
+    assert_eq!(messages.get(&StreamId(1)).unwrap().body, b"ABCD");
+    assert_eq!(messages.get(&StreamId(3)).unwrap().body, b"1234");
 }
 
 // =============================================================================
@@ -149,8 +149,8 @@ fn test_hpack_dynamic_table_cross_stream() {
     assert_eq!(messages.len(), 2);
 
     // Both streams should have the x-custom header
-    let stream_1_headers = &messages.get(&1).unwrap().headers;
-    let stream_3_headers = &messages.get(&3).unwrap().headers;
+    let stream_1_headers = &messages.get(&StreamId(1)).unwrap().headers;
+    let stream_3_headers = &messages.get(&StreamId(3)).unwrap().headers;
 
     assert!(
         stream_1_headers
@@ -192,15 +192,17 @@ fn test_hpack_dynamic_table_multiple_entries() {
     let messages = parse_buffer(&buffer).expect("should parse successfully");
     assert_eq!(messages.len(), 3);
 
-    let s5 = messages.get(&5).unwrap();
-    assert!(s5
-        .headers
-        .iter()
-        .any(|(k, v)| k == "header-a" && v == "value-a"));
-    assert!(s5
-        .headers
-        .iter()
-        .any(|(k, v)| k == "header-b" && v == "value-b"));
+    let s5 = messages.get(&StreamId(5)).unwrap();
+    assert!(
+        s5.headers
+            .iter()
+            .any(|(k, v)| k == "header-a" && v == "value-a")
+    );
+    assert!(
+        s5.headers
+            .iter()
+            .any(|(k, v)| k == "header-b" && v == "value-b")
+    );
 }
 
 // =============================================================================
@@ -246,7 +248,7 @@ fn test_window_update_frame_parsing() {
 
     let messages = parse_buffer(&buffer).expect("should parse successfully");
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages.get(&1).unwrap().body, b"body");
+    assert_eq!(messages.get(&StreamId(1)).unwrap().body, b"body");
 }
 
 // =============================================================================
@@ -375,7 +377,7 @@ fn test_incremental_single_frame_at_a_time() {
             // May have 0 or 1 messages depending on whether state carried over
             if !messages.is_empty() {
                 assert_eq!(messages.len(), 1);
-                assert_eq!(messages.get(&1).unwrap().body, b"data");
+                assert_eq!(messages.get(&StreamId(1)).unwrap().body, b"data");
             }
         }
         Err(e) => panic!("Unexpected error: {e:?}"),
@@ -405,7 +407,7 @@ fn test_large_body_many_chunks() {
 
     let messages = parse_buffer(&buffer).expect("should parse successfully");
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages.get(&1).unwrap().body, expected_body);
+    assert_eq!(messages.get(&StreamId(1)).unwrap().body, expected_body);
 }
 
 #[test]
@@ -428,9 +430,9 @@ fn test_large_body_interleaved_with_other_streams() {
     let messages = parse_buffer(&buffer).expect("should parse successfully");
     assert_eq!(messages.len(), 3);
 
-    assert_eq!(messages.get(&1).unwrap().body, b"part1part2part3");
-    assert!(messages.get(&3).unwrap().body.is_empty());
-    assert_eq!(messages.get(&5).unwrap().body, b"five");
+    assert_eq!(messages.get(&StreamId(1)).unwrap().body, b"part1part2part3");
+    assert!(messages.get(&StreamId(3)).unwrap().body.is_empty());
+    assert_eq!(messages.get(&StreamId(5)).unwrap().body, b"five");
 }
 
 // =============================================================================
@@ -454,7 +456,7 @@ fn test_continuation_single() {
     let messages = parse_buffer(&buffer).expect("should parse successfully");
     assert_eq!(messages.len(), 1);
     assert_eq!(
-        messages.get(&1).unwrap().path,
+        messages.get(&StreamId(1)).unwrap().path,
         Some("/continuation".to_string())
     );
 }
@@ -482,7 +484,7 @@ fn test_continuation_multiple() {
     let messages = parse_buffer(&buffer).expect("should parse successfully");
     assert_eq!(messages.len(), 1);
     assert_eq!(
-        messages.get(&1).unwrap().path,
+        messages.get(&StreamId(1)).unwrap().path,
         Some("/multi-cont".to_string())
     );
 }
@@ -501,7 +503,13 @@ fn test_continuation_without_headers() {
 
     let result = parse_buffer(&buffer);
     assert!(
-        matches!(result, Err(ParseError::Http2HeadersIncomplete)),
+        matches!(
+            result,
+            Err(ParseError {
+                kind: ParseErrorKind::Http2HeadersIncomplete,
+                ..
+            })
+        ),
         "Expected Http2HeadersIncomplete, got {:?}",
         result
     );
@@ -518,7 +526,13 @@ fn test_data_frame_unknown_stream() {
     let result = parse_buffer(&buffer);
     // Should error because stream 1 doesn't exist
     assert!(
-        matches!(result, Err(ParseError::Http2StreamNotFound)),
+        matches!(
+            result,
+            Err(ParseError {
+                kind: ParseErrorKind::Http2StreamNotFound,
+                ..
+            })
+        ),
         "Expected Http2StreamNotFound for unknown stream, got {result:?}"
     );
 }
@@ -534,7 +548,13 @@ fn test_malformed_hpack() {
 
     let result = parse_buffer(&buffer);
     assert!(
-        matches!(result, Err(ParseError::Http2HpackError(_))),
+        matches!(
+            result,
+            Err(ParseError {
+                kind: ParseErrorKind::Http2HpackError(_),
+                ..
+            })
+        ),
         "Expected Http2HpackError, got {:?}",
         result
     );
@@ -578,7 +598,7 @@ fn test_data_frame_with_padding() {
 
     let messages = parse_buffer(&buffer).expect("should parse successfully");
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages.get(&1).unwrap().body, b"actual-data");
+    assert_eq!(messages.get(&StreamId(1)).unwrap().body, b"actual-data");
 }
 
 // =============================================================================
@@ -597,8 +617,8 @@ fn test_response_parsing() {
 
     let messages = parse_buffer(&buffer).expect("should parse successfully");
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages.get(&1).unwrap().status, Some(200));
-    assert_eq!(messages.get(&1).unwrap().body, b"OK");
+    assert_eq!(messages.get(&StreamId(1)).unwrap().status, Some(200));
+    assert_eq!(messages.get(&StreamId(1)).unwrap().body, b"OK");
 }
 
 // =============================================================================
@@ -658,14 +678,20 @@ fn test_multiple_connections_isolated() {
     assert_eq!(msgs2.len(), 1);
 
     // Verify they're different (both use stream 1)
-    assert_eq!(msgs1.get(&1).unwrap().path, Some("/conn1".to_string()));
-    assert_eq!(msgs2.get(&1).unwrap().path, Some("/conn2".to_string()));
     assert_eq!(
-        msgs1.get(&1).unwrap().authority,
+        msgs1.get(&StreamId(1)).unwrap().path,
+        Some("/conn1".to_string())
+    );
+    assert_eq!(
+        msgs2.get(&StreamId(1)).unwrap().path,
+        Some("/conn2".to_string())
+    );
+    assert_eq!(
+        msgs1.get(&StreamId(1)).unwrap().authority,
         Some("example.com".to_string())
     );
     assert_eq!(
-        msgs2.get(&1).unwrap().authority,
+        msgs2.get(&StreamId(1)).unwrap().authority,
         Some("other.com".to_string())
     );
 }
@@ -739,7 +765,9 @@ fn test_real_traffic_parsing() {
         }
     } else {
         // Skip test if fixture doesn't exist
-        eprintln!("Skipping real traffic test - fixture not found. Run generate_real_traffic to create it.");
+        eprintln!(
+            "Skipping real traffic test - fixture not found. Run generate_real_traffic to create it."
+        );
     }
 }
 
@@ -775,10 +803,13 @@ fn test_headers_padded_and_priority_flags() {
     let messages = parse_buffer(&buffer).expect("should parse HEADERS with PADDED+PRIORITY");
     assert_eq!(messages.len(), 1);
     assert_eq!(
-        messages.get(&1).unwrap().path,
+        messages.get(&StreamId(1)).unwrap().path,
         Some("/padded-priority".to_string())
     );
-    assert_eq!(messages.get(&1).unwrap().method, Some("GET".to_string()));
+    assert_eq!(
+        messages.get(&StreamId(1)).unwrap().method,
+        Some("GET".to_string())
+    );
 }
 
 #[test]
@@ -801,7 +832,7 @@ fn test_headers_priority_only() {
     let messages = parse_buffer(&buffer).expect("should parse HEADERS with PRIORITY");
     assert_eq!(messages.len(), 1);
     assert_eq!(
-        messages.get(&1).unwrap().path,
+        messages.get(&StreamId(1)).unwrap().path,
         Some("/priority-only".to_string())
     );
 }
@@ -824,7 +855,7 @@ fn test_headers_padded_only() {
     let messages = parse_buffer(&buffer).expect("should parse HEADERS with PADDED");
     assert_eq!(messages.len(), 1);
     assert_eq!(
-        messages.get(&1).unwrap().path,
+        messages.get(&StreamId(1)).unwrap().path,
         Some("/padded-only".to_string())
     );
 }
@@ -903,7 +934,7 @@ fn test_max_frame_size_boundary() {
 
     let messages = parse_buffer(&buffer).expect("should parse max size frame");
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages.get(&1).unwrap().body.len(), 16384);
+    assert_eq!(messages.get(&StreamId(1)).unwrap().body.len(), 16384);
 }
 
 #[test]
@@ -918,7 +949,7 @@ fn test_frame_size_just_under_max() {
     buffer.extend(build_data_frame(1, &data, true));
 
     let messages = parse_buffer(&buffer).expect("should parse frame just under max");
-    assert_eq!(messages.get(&1).unwrap().body.len(), 16383);
+    assert_eq!(messages.get(&StreamId(1)).unwrap().body.len(), 16383);
 }
 
 #[test]
@@ -937,7 +968,7 @@ fn test_many_small_frames() {
 
     let messages = parse_buffer(&buffer).expect("should parse many small frames");
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages.get(&1).unwrap().body.len(), 1000);
+    assert_eq!(messages.get(&StreamId(1)).unwrap().body.len(), 1000);
 }
 
 // =============================================================================
@@ -956,8 +987,8 @@ fn test_stream_id_max_client() {
     let messages = parse_buffer(&buffer).expect("should parse max stream ID");
     assert_eq!(messages.len(), 1);
     assert_eq!(
-        messages.get(&max_stream_id).unwrap().stream_id,
-        max_stream_id
+        messages.get(&StreamId(max_stream_id)).unwrap().stream_id,
+        StreamId(max_stream_id)
     );
 }
 
@@ -972,8 +1003,8 @@ fn test_stream_id_large_odd() {
 
     let messages = parse_buffer(&buffer).expect("should parse large stream ID");
     assert_eq!(
-        messages.get(&large_stream_id).unwrap().stream_id,
-        large_stream_id
+        messages.get(&StreamId(large_stream_id)).unwrap().stream_id,
+        StreamId(large_stream_id)
     );
 }
 
@@ -989,8 +1020,8 @@ fn test_stream_id_server_initiated() {
 
     let messages = parse_buffer(&buffer).expect("should parse server-initiated stream");
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages.get(&2).unwrap().stream_id, 2);
-    assert_eq!(messages.get(&2).unwrap().status, Some(200));
+    assert_eq!(messages.get(&StreamId(2)).unwrap().stream_id, StreamId(2));
+    assert_eq!(messages.get(&StreamId(2)).unwrap().status, Some(200));
 }
 
 #[test]
@@ -1008,10 +1039,10 @@ fn test_multiple_high_stream_ids() {
     let messages = parse_buffer(&buffer).expect("should parse multiple high stream IDs");
     assert_eq!(messages.len(), 5);
 
-    let parsed_ids: Vec<u32> = messages.keys().copied().collect();
+    let parsed_ids: Vec<StreamId> = messages.keys().copied().collect();
     for &expected_id in &ids {
         assert!(
-            parsed_ids.contains(&expected_id),
+            parsed_ids.contains(&StreamId(expected_id)),
             "Should contain stream {}",
             expected_id
         );
@@ -1043,7 +1074,7 @@ fn test_huffman_encoded_header_value() {
     let messages = parse_buffer(&buffer).expect("should parse Huffman-encoded headers");
     assert_eq!(messages.len(), 1);
     assert_eq!(
-        messages.get(&1).unwrap().authority,
+        messages.get(&StreamId(1)).unwrap().authority,
         Some("www.example.com".to_string())
     );
 }
@@ -1067,7 +1098,7 @@ fn test_huffman_encoded_custom_header() {
     assert_eq!(messages.len(), 1);
 
     let has_custom = messages
-        .get(&1)
+        .get(&StreamId(1))
         .unwrap()
         .headers
         .iter()
@@ -1097,7 +1128,7 @@ fn test_mixed_huffman_and_literal() {
 
     let messages = parse_buffer(&buffer).expect("should parse mixed encoding");
     assert_eq!(messages.len(), 1);
-    let msg = messages.get(&1).unwrap();
+    let msg = messages.get(&StreamId(1)).unwrap();
     assert_eq!(msg.authority, Some("example.com".to_string()));
 
     let has_custom = msg
@@ -1126,7 +1157,7 @@ fn test_zero_length_body() {
 
     let messages = parse_buffer(&buffer).expect("should parse zero-length body");
     assert_eq!(messages.len(), 1);
-    assert!(messages.get(&1).unwrap().body.is_empty());
+    assert!(messages.get(&StreamId(1)).unwrap().body.is_empty());
 }
 
 #[test]
@@ -1142,7 +1173,7 @@ fn test_zero_length_data_frame() {
 
     let messages = parse_buffer(&buffer).expect("should parse zero-length DATA");
     assert_eq!(messages.len(), 1);
-    assert!(messages.get(&1).unwrap().body.is_empty());
+    assert!(messages.get(&StreamId(1)).unwrap().body.is_empty());
 }
 
 #[test]
@@ -1158,7 +1189,7 @@ fn test_max_padding() {
 
     let messages = parse_buffer(&buffer).expect("should parse max padding");
     assert_eq!(messages.len(), 1);
-    assert_eq!(messages.get(&1).unwrap().body, b"tiny");
+    assert_eq!(messages.get(&StreamId(1)).unwrap().body, b"tiny");
 }
 
 #[test]

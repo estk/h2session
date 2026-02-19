@@ -97,6 +97,7 @@ impl<K: Hash + Eq + Clone> Default for H2SessionCache<K> {
 }
 
 #[cfg(test)]
+#[allow(clippy::vec_init_then_push)]
 mod tests {
     use super::*;
     use crate::parse::parse_frames_stateful;

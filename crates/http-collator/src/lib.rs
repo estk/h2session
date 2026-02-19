@@ -404,61 +404,61 @@ fn emit_message_events(
     match conn.protocol {
         Protocol::Http1 => {
             // Emit request if parsed and not yet emitted
-            if let Some(ref req) = conn.h1_request {
-                if !conn.h1_request_emitted {
-                    let metadata = MessageMetadata {
-                        connection_id: conn_id,
-                        process_id,
-                        timestamp_ns: req.timestamp_ns,
-                        stream_id: None,
-                        remote_port: conn.remote_port,
-                        protocol: conn.protocol,
-                    };
-                    events.push(CollationEvent::Message {
-                        message: ParsedHttpMessage::Request(req.clone()),
-                        metadata,
-                    });
-                    conn.h1_request_emitted = true;
-                }
+            if let Some(ref req) = conn.h1_request
+                && !conn.h1_request_emitted
+            {
+                let metadata = MessageMetadata {
+                    connection_id: conn_id,
+                    process_id,
+                    timestamp_ns: req.timestamp_ns,
+                    stream_id: None,
+                    remote_port: conn.remote_port,
+                    protocol: conn.protocol,
+                };
+                events.push(CollationEvent::Message {
+                    message: ParsedHttpMessage::Request(req.clone()),
+                    metadata,
+                });
+                conn.h1_request_emitted = true;
             }
 
             // Emit response if parsed and not yet emitted
-            if let Some(ref resp) = conn.h1_response {
-                if !conn.h1_response_emitted {
-                    let metadata = MessageMetadata {
-                        connection_id: conn_id,
-                        process_id,
-                        timestamp_ns: resp.timestamp_ns,
-                        stream_id: None,
-                        remote_port: conn.remote_port,
-                        protocol: conn.protocol,
-                    };
-                    events.push(CollationEvent::Message {
-                        message: ParsedHttpMessage::Response(resp.clone()),
-                        metadata,
-                    });
-                    conn.h1_response_emitted = true;
-                }
+            if let Some(ref resp) = conn.h1_response
+                && !conn.h1_response_emitted
+            {
+                let metadata = MessageMetadata {
+                    connection_id: conn_id,
+                    process_id,
+                    timestamp_ns: resp.timestamp_ns,
+                    stream_id: None,
+                    remote_port: conn.remote_port,
+                    protocol: conn.protocol,
+                };
+                events.push(CollationEvent::Message {
+                    message: ParsedHttpMessage::Response(resp.clone()),
+                    metadata,
+                });
+                conn.h1_response_emitted = true;
             }
         }
         Protocol::Http2 => {
             // Emit newly parsed HTTP/2 requests
             for (&stream_id, msg) in &conn.pending_requests {
-                if !conn.h2_emitted_requests.contains(&stream_id) {
-                    if let Some(req) = msg.to_http_request() {
-                        let metadata = MessageMetadata {
-                            connection_id: conn_id,
-                            process_id,
-                            timestamp_ns: msg.end_stream_timestamp_ns,
-                            stream_id: Some(stream_id),
-                            remote_port: conn.remote_port,
-                            protocol: conn.protocol,
-                        };
-                        events.push(CollationEvent::Message {
-                            message: ParsedHttpMessage::Request(req),
-                            metadata,
-                        });
-                    }
+                if !conn.h2_emitted_requests.contains(&stream_id)
+                    && let Some(req) = msg.to_http_request()
+                {
+                    let metadata = MessageMetadata {
+                        connection_id: conn_id,
+                        process_id,
+                        timestamp_ns: msg.end_stream_timestamp_ns,
+                        stream_id: Some(stream_id),
+                        remote_port: conn.remote_port,
+                        protocol: conn.protocol,
+                    };
+                    events.push(CollationEvent::Message {
+                        message: ParsedHttpMessage::Request(req),
+                        metadata,
+                    });
                 }
             }
             // Mark all current pending requests as emitted
@@ -467,21 +467,21 @@ fn emit_message_events(
 
             // Emit newly parsed HTTP/2 responses
             for (&stream_id, msg) in &conn.pending_responses {
-                if !conn.h2_emitted_responses.contains(&stream_id) {
-                    if let Some(resp) = msg.to_http_response() {
-                        let metadata = MessageMetadata {
-                            connection_id: conn_id,
-                            process_id,
-                            timestamp_ns: msg.first_frame_timestamp_ns,
-                            stream_id: Some(stream_id),
-                            remote_port: conn.remote_port,
-                            protocol: conn.protocol,
-                        };
-                        events.push(CollationEvent::Message {
-                            message: ParsedHttpMessage::Response(resp),
-                            metadata,
-                        });
-                    }
+                if !conn.h2_emitted_responses.contains(&stream_id)
+                    && let Some(resp) = msg.to_http_response()
+                {
+                    let metadata = MessageMetadata {
+                        connection_id: conn_id,
+                        process_id,
+                        timestamp_ns: msg.first_frame_timestamp_ns,
+                        stream_id: Some(stream_id),
+                        remote_port: conn.remote_port,
+                        protocol: conn.protocol,
+                    };
+                    events.push(CollationEvent::Message {
+                        message: ParsedHttpMessage::Response(resp),
+                        metadata,
+                    });
                 }
             }
             // Mark all current pending responses as emitted
@@ -613,11 +613,11 @@ fn parse_http2_chunks(conn: &mut Conn, direction: Direction) {
         Direction::Write => conn
             .request_chunks
             .last()
-            .map_or(false, |c| is_http2_preface(&c.data)),
+            .is_some_and(|c| is_http2_preface(&c.data)),
         Direction::Read => conn
             .response_chunks
             .last()
-            .map_or(false, |c| is_http2_preface(&c.data)),
+            .is_some_and(|c| is_http2_preface(&c.data)),
         Direction::Other => false,
     };
     let current_state_has_preface = match direction {

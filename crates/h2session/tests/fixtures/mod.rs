@@ -1,3 +1,4 @@
+#![allow(clippy::vec_init_then_push, clippy::too_many_arguments)]
 //! HTTP/2 frame building helpers for tests
 //!
 //! These functions construct raw HTTP/2 frames for precise testing of

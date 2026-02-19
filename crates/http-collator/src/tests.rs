@@ -1,6 +1,7 @@
 #![allow(unused_mut)]
 
 use super::*;
+use rstest::rstest;
 
 /// Test implementation of DataEvent
 struct TestEvent {
@@ -657,9 +658,10 @@ fn test_h2_per_stream_latency() {
     );
 }
 
-#[test]
-fn test_exchange_display_port_unavailable() {
-    // Create an exchange with None port
+#[rstest]
+#[case::port_unavailable(None, "Port: unavailable")]
+#[case::port_available(Some(8080), "Port: 8080")]
+fn test_exchange_display_port(#[case] remote_port: Option<u16>, #[case] expected_text: &str) {
     let exchange = Exchange {
         request: HttpRequest {
             method: http::Method::GET,
@@ -677,44 +679,14 @@ fn test_exchange_display_port_unavailable() {
         latency_ns: 1_000_000,
         protocol: Protocol::Http2,
         process_id: 1234,
-        remote_port: None, // Port unavailable
+        remote_port,
         stream_id: Some(StreamId(1)),
     };
 
     let display = format!("{exchange}");
     assert!(
-        display.contains("Port: unavailable"),
-        "Should display 'unavailable' for None port"
-    );
-}
-
-#[test]
-fn test_exchange_display_port_available() {
-    let exchange = Exchange {
-        request: HttpRequest {
-            method: http::Method::GET,
-            uri: "/".parse().unwrap(),
-            headers: http::HeaderMap::new(),
-            body: vec![],
-            timestamp_ns: TimestampNs(0),
-        },
-        response: HttpResponse {
-            status: http::StatusCode::OK,
-            headers: http::HeaderMap::new(),
-            body: vec![],
-            timestamp_ns: TimestampNs(0),
-        },
-        latency_ns: 1_000_000,
-        protocol: Protocol::Http2,
-        process_id: 1234,
-        remote_port: Some(8080), // Port available
-        stream_id: Some(StreamId(1)),
-    };
-
-    let display = format!("{exchange}");
-    assert!(
-        display.contains("Port: 8080"),
-        "Should display actual port number"
+        display.contains(expected_text),
+        "Display should contain '{expected_text}'"
     );
 }
 
@@ -722,25 +694,17 @@ fn test_exchange_display_port_available() {
 // CollatorConfig tests
 // =========================================================================
 
-#[test]
-fn test_messages_only_config() {
-    let config = CollatorConfig::messages_only();
-    assert!(config.emit_messages);
-    assert!(!config.emit_exchanges);
-}
-
-#[test]
-fn test_exchanges_only_config() {
-    let config = CollatorConfig::exchanges_only();
-    assert!(!config.emit_messages);
-    assert!(config.emit_exchanges);
-}
-
-#[test]
-fn test_default_config_emits_both() {
-    let config = CollatorConfig::default();
-    assert!(config.emit_messages);
-    assert!(config.emit_exchanges);
+#[rstest]
+#[case::messages_only(CollatorConfig::messages_only(), true, false)]
+#[case::exchanges_only(CollatorConfig::exchanges_only(), false, true)]
+#[case::default_emits_both(CollatorConfig::default(), true, true)]
+fn test_collator_config(
+    #[case] config: CollatorConfig,
+    #[case] expect_messages: bool,
+    #[case] expect_exchanges: bool,
+) {
+    assert_eq!(config.emit_messages, expect_messages);
+    assert_eq!(config.emit_exchanges, expect_exchanges);
 }
 
 // =========================================================================

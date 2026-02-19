@@ -1,4 +1,5 @@
 use super::*;
+use rstest::rstest;
 
 #[test]
 fn test_is_http1_request() {
@@ -356,23 +357,15 @@ fn test_response_without_framing_is_incomplete() {
     );
 }
 
-#[test]
-fn test_204_response_without_framing_is_complete() {
-    // 204 No Content explicitly has no body per RFC 7230 §3.3.3
-    let data = b"HTTP/1.1 204 No Content\r\n\r\n";
+#[rstest]
+#[case::status_204(204, "No Content")]
+#[case::status_304(304, "Not Modified")]
+fn test_no_body_status_without_framing_is_complete(#[case] status_code: u16, #[case] reason: &str) {
+    // These statuses explicitly have no body per RFC 7230 §3.3.3
+    let data = format!("HTTP/1.1 {status_code} {reason}\r\n\r\n");
     assert!(
-        try_parse_http1_response(data, TimestampNs(0)).is_some(),
-        "204 should be complete without framing"
-    );
-}
-
-#[test]
-fn test_304_response_without_framing_is_complete() {
-    // 304 Not Modified explicitly has no body per RFC 7230 §3.3.3
-    let data = b"HTTP/1.1 304 Not Modified\r\n\r\n";
-    assert!(
-        try_parse_http1_response(data, TimestampNs(0)).is_some(),
-        "304 should be complete without framing"
+        try_parse_http1_response(data.as_bytes(), TimestampNs(0)).is_some(),
+        "{status_code} should be complete without framing"
     );
 }
 

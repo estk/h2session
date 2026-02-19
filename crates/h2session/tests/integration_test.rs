@@ -7,6 +7,7 @@ mod fixtures;
 
 use fixtures::*;
 use h2session::{H2SessionCache, ParseError, ParseErrorKind, ParsedH2Message, StreamId};
+use rstest::rstest;
 use std::collections::HashMap;
 
 /// Helper to parse a buffer and return messages or error
@@ -920,36 +921,21 @@ fn test_dynamic_table_size_zero() {
 // Edge Case 3: Max frame size boundary conditions
 // =============================================================================
 
-#[test]
-fn test_max_frame_size_boundary() {
-    // Default MAX_FRAME_SIZE is 16384 (2^14)
+#[rstest]
+#[case::at_max(16384)]
+#[case::just_under_max(16383)]
+fn test_frame_size_boundary(#[case] body_size: usize) {
     let mut buffer = connection_start();
 
     let hpack_block = hpack_get_request("/", "example.com");
     buffer.extend(build_headers_frame(1, &hpack_block, FLAG_END_HEADERS));
 
-    // Create a DATA frame exactly at max frame size
-    let max_data = vec![b'X'; 16384];
-    buffer.extend(build_data_frame(1, &max_data, true));
-
-    let messages = parse_buffer(&buffer).expect("should parse max size frame");
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages.get(&StreamId(1)).unwrap().body.len(), 16384);
-}
-
-#[test]
-fn test_frame_size_just_under_max() {
-    let mut buffer = connection_start();
-
-    let hpack_block = hpack_get_request("/", "example.com");
-    buffer.extend(build_headers_frame(1, &hpack_block, FLAG_END_HEADERS));
-
-    // Create a DATA frame just under max (16383 bytes)
-    let data = vec![b'Y'; 16383];
+    let data = vec![b'X'; body_size];
     buffer.extend(build_data_frame(1, &data, true));
 
-    let messages = parse_buffer(&buffer).expect("should parse frame just under max");
-    assert_eq!(messages.get(&StreamId(1)).unwrap().body.len(), 16383);
+    let messages = parse_buffer(&buffer).expect("should parse frame at boundary");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages.get(&StreamId(1)).unwrap().body.len(), body_size);
 }
 
 #[test]

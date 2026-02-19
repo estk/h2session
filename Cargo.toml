@@ -13,5 +13,6 @@ httparse = "1"
 loona-hpack = "0.4"
 dashmap = "6.1.0"
 tracing = "0.1"
+rstest = "0.26"
 h2session = { path = "crates/h2session" }
 http-collator = { path = "crates/http-collator" }

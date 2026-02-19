@@ -1,4 +1,4 @@
-#![allow(clippy::vec_init_then_push, clippy::too_many_arguments)]
+#![allow(clippy::vec_init_then_push, clippy::too_many_arguments, dead_code)]
 //! HTTP/2 frame building helpers for tests
 //!
 //! These functions construct raw HTTP/2 frames for precise testing of
@@ -73,7 +73,7 @@ pub fn build_data_frame_padded(
     let mut frame = build_frame_header(total_len as u32, FRAME_TYPE_DATA, flags, stream_id);
     frame.push(padding_len);
     frame.extend_from_slice(data);
-    frame.extend(std::iter::repeat(0u8).take(padding_len as usize));
+    frame.extend(std::iter::repeat_n(0u8, padding_len as usize));
     frame
 }
 
@@ -125,7 +125,7 @@ pub fn build_headers_frame_padded(
     let mut frame = build_frame_header(total_len as u32, FRAME_TYPE_HEADERS, flags, stream_id);
     frame.push(padding_len);
     frame.extend_from_slice(hpack_block);
-    frame.extend(std::iter::repeat(0u8).take(padding_len as usize));
+    frame.extend(std::iter::repeat_n(0u8, padding_len as usize));
     frame
 }
 
@@ -191,7 +191,7 @@ pub fn build_headers_frame_padded_priority(
     frame.extend_from_slice(&dep.to_be_bytes());
     frame.push(weight);
     frame.extend_from_slice(hpack_block);
-    frame.extend(std::iter::repeat(0u8).take(padding_len as usize));
+    frame.extend(std::iter::repeat_n(0u8, padding_len as usize));
     frame
 }
 
@@ -487,7 +487,7 @@ pub mod hpack_huffman {
     pub fn literal_indexed_name_huffman_value(name_index: u8, value_huffman: &[u8]) -> Vec<u8> {
         let mut encoded = Vec::new();
         // Literal without indexing, indexed name (4-bit prefix)
-        encoded.push(0x00 | (name_index & 0x0F));
+        encoded.push(name_index & 0x0F);
         // Value length with Huffman flag
         encoded.extend(huffman_length(value_huffman.len()));
         encoded.extend_from_slice(value_huffman);

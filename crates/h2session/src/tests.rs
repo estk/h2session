@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::parse::parse_frames_stateful;
+use rstest::rstest;
 
 // Helper to create a minimal SETTINGS frame
 fn create_settings_frame() -> Vec<u8> {
@@ -708,35 +709,28 @@ fn test_h2session_cache_concurrent_same_connection() {
 // C2: Buffer growth cap
 // =========================================================================
 
-#[test]
-fn test_buffer_growth_cap_rejects_oversized_feed() {
+#[rstest]
+#[case::oversized_rejected(101, true)]
+#[case::exact_limit_succeeds(100, false)]
+fn test_buffer_growth_cap(#[case] chunk_size: usize, #[case] expect_error: bool) {
     let mut state = H2ConnectionState::with_limits(H2Limits {
         max_buffer_size: 100,
         ..H2Limits::default()
     });
 
-    // Single feed exceeding the limit
-    let chunk = vec![0x00u8; 101];
+    let chunk = vec![0x00u8; chunk_size];
     let result = state.feed(&chunk, TimestampNs(1_000_000));
-    assert!(
-        matches!(result, Err(ref e) if matches!(e.kind, ParseErrorKind::Http2BufferTooLarge)),
-        "Feed exceeding buffer cap should return Http2BufferTooLarge, got: {result:?}"
-    );
-}
-
-#[test]
-fn test_buffer_growth_cap_exact_limit_succeeds() {
-    let mut state = H2ConnectionState::with_limits(H2Limits {
-        max_buffer_size: 100,
-        ..H2Limits::default()
-    });
-
-    // Feed exactly 100 bytes — at limit, should succeed
-    let chunk = vec![0x00u8; 100];
-    assert!(
-        state.feed(&chunk, TimestampNs(1_000_000)).is_ok(),
-        "Feed at exact limit should succeed"
-    );
+    if expect_error {
+        assert!(
+            matches!(result, Err(ref e) if matches!(e.kind, ParseErrorKind::Http2BufferTooLarge)),
+            "Feed of {chunk_size} bytes should return Http2BufferTooLarge, got: {result:?}"
+        );
+    } else {
+        assert!(
+            result.is_ok(),
+            "Feed of {chunk_size} bytes should succeed, got: {result:?}"
+        );
+    }
 }
 
 // =========================================================================
@@ -1264,78 +1258,41 @@ fn test_broken_continuation_does_not_poison_connection() {
 // FIX-3: max_frame_size SETTINGS range validation
 // =========================================================================
 
-#[test]
-fn test_settings_max_frame_size_zero_ignored() {
-    // SETTINGS with max_frame_size = 0 should be ignored (default 16384 retained)
+#[rstest]
+#[case::zero_ignored(0x00000000_u32, 16_384)]
+#[case::u32_max_ignored(0xFFFFFFFF_u32, 16_384)]
+#[case::valid_32768_accepted(0x00008000_u32, 32_768)]
+fn test_settings_max_frame_size_validation(
+    #[case] settings_value: u32,
+    #[case] expected_max_frame_size: u32,
+) {
     let mut state = H2ConnectionState::new();
     let mut buffer = frame::CONNECTION_PREFACE.to_vec();
 
-    // SETTINGS: max_frame_size (0x05) = 0
     let settings_frame = vec![
-        0x00, 0x00, 0x06, // length = 6
+        0x00,
+        0x00,
+        0x06, // length = 6
         0x04, // type = SETTINGS
         0x00, // flags
-        0x00, 0x00, 0x00, 0x00, // stream_id = 0
-        0x00, 0x05, // id = SETTINGS_MAX_FRAME_SIZE
-        0x00, 0x00, 0x00, 0x00, // value = 0
+        0x00,
+        0x00,
+        0x00,
+        0x00, // stream_id = 0
+        0x00,
+        0x05, // id = SETTINGS_MAX_FRAME_SIZE
+        (settings_value >> 24) as u8,
+        (settings_value >> 16) as u8,
+        (settings_value >> 8) as u8,
+        settings_value as u8,
     ];
     buffer.extend(settings_frame);
 
     let result = parse_frames_stateful(&buffer, &mut state);
     assert!(result.is_ok());
     assert_eq!(
-        state.settings.max_frame_size, 16_384,
-        "max_frame_size=0 should be ignored, default 16384 retained"
-    );
-}
-
-#[test]
-fn test_settings_max_frame_size_u32_max_ignored() {
-    // SETTINGS with max_frame_size = u32::MAX should be ignored
-    let mut state = H2ConnectionState::new();
-    let mut buffer = frame::CONNECTION_PREFACE.to_vec();
-
-    // SETTINGS: max_frame_size (0x05) = 0xFFFFFFFF
-    let settings_frame = vec![
-        0x00, 0x00, 0x06, // length = 6
-        0x04, // type = SETTINGS
-        0x00, // flags
-        0x00, 0x00, 0x00, 0x00, // stream_id = 0
-        0x00, 0x05, // id = SETTINGS_MAX_FRAME_SIZE
-        0xFF, 0xFF, 0xFF, 0xFF, // value = u32::MAX
-    ];
-    buffer.extend(settings_frame);
-
-    let result = parse_frames_stateful(&buffer, &mut state);
-    assert!(result.is_ok());
-    assert_eq!(
-        state.settings.max_frame_size, 16_384,
-        "max_frame_size=u32::MAX should be ignored, default 16384 retained"
-    );
-}
-
-#[test]
-fn test_settings_max_frame_size_valid_accepted() {
-    // SETTINGS with max_frame_size = 32768 (valid, within RFC range) should be accepted
-    let mut state = H2ConnectionState::new();
-    let mut buffer = frame::CONNECTION_PREFACE.to_vec();
-
-    // SETTINGS: max_frame_size (0x05) = 32768 (0x00008000)
-    let settings_frame = vec![
-        0x00, 0x00, 0x06, // length = 6
-        0x04, // type = SETTINGS
-        0x00, // flags
-        0x00, 0x00, 0x00, 0x00, // stream_id = 0
-        0x00, 0x05, // id = SETTINGS_MAX_FRAME_SIZE
-        0x00, 0x00, 0x80, 0x00, // value = 32768
-    ];
-    buffer.extend(settings_frame);
-
-    let result = parse_frames_stateful(&buffer, &mut state);
-    assert!(result.is_ok());
-    assert_eq!(
-        state.settings.max_frame_size, 32_768,
-        "max_frame_size=32768 should be accepted"
+        state.settings.max_frame_size, expected_max_frame_size,
+        "max_frame_size={settings_value:#010X} should yield {expected_max_frame_size}"
     );
 }
 

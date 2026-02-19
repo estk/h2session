@@ -9,3 +9,6 @@ dashmap.workspace = true
 h2session.workspace = true
 http.workspace = true
 httparse.workspace = true
+
+[dev-dependencies]
+rstest.workspace = true

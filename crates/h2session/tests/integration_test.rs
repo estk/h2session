@@ -5,10 +5,11 @@
 
 mod fixtures;
 
+use std::collections::HashMap;
+
 use fixtures::*;
 use h2session::{H2SessionCache, ParseError, ParseErrorKind, ParsedH2Message, StreamId};
 use rstest::rstest;
-use std::collections::HashMap;
 
 /// Helper to parse a buffer and return messages or error
 fn parse_buffer(buffer: &[u8]) -> Result<HashMap<StreamId, ParsedH2Message>, ParseError> {
@@ -43,7 +44,8 @@ fn test_interleaved_data_body_integrity() {
     buffer.extend(build_headers_frame(5, &hpack_block, FLAG_END_HEADERS));
 
     // Interleave DATA frames in complex pattern:
-    // S1-D1, S3-D1, S1-D2, S5-D1, S3-D2, S1-D3 (END), S5-D2, S3-D3 (END), S5-D3 (END)
+    // S1-D1, S3-D1, S1-D2, S5-D1, S3-D2, S1-D3 (END), S5-D2, S3-D3 (END), S5-D3
+    // (END)
     buffer.extend(build_data_frame(1, &unique_body_pattern(1, 1), false));
     buffer.extend(build_data_frame(3, &unique_body_pattern(3, 1), false));
     buffer.extend(build_data_frame(1, &unique_body_pattern(1, 2), false));
@@ -127,15 +129,16 @@ fn test_interleaved_data_single_byte_chunks() {
 
 #[test]
 fn test_hpack_dynamic_table_cross_stream() {
-    // Stream 1: HEADERS with literal header "x-custom: value1" (adds to dynamic table)
-    // Stream 3: HEADERS referencing that header by dynamic index
+    // Stream 1: HEADERS with literal header "x-custom: value1" (adds to dynamic
+    // table) Stream 3: HEADERS referencing that header by dynamic index
     // Verify both streams have correct headers
 
     let mut buffer = connection_start();
 
     // Stream 1: Add custom header with incremental indexing
     let mut hpack_block_1 = hpack_get_request("/", "example.com");
-    // Add x-custom: value1 with indexing (will be added to dynamic table at index 62)
+    // Add x-custom: value1 with indexing (will be added to dynamic table at index
+    // 62)
     hpack_block_1.extend(hpack_literal_with_indexing("x-custom", "value1"));
     buffer.extend(build_complete_headers_frame(1, &hpack_block_1));
 
@@ -380,7 +383,7 @@ fn test_incremental_single_frame_at_a_time() {
                 assert_eq!(messages.len(), 1);
                 assert_eq!(messages.get(&StreamId(1)).unwrap().body, b"data");
             }
-        }
+        },
         Err(e) => panic!("Unexpected error: {e:?}"),
     }
 }
@@ -767,7 +770,8 @@ fn test_real_traffic_parsing() {
     } else {
         // Skip test if fixture doesn't exist
         eprintln!(
-            "Skipping real traffic test - fixture not found. Run generate_real_traffic to create it."
+            "Skipping real traffic test - fixture not found. Run generate_real_traffic to create \
+             it."
         );
     }
 }

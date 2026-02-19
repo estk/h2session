@@ -33,17 +33,21 @@ mod exchange;
 pub mod h1;
 mod traits;
 
-pub use connection::{Connection, DataChunk, Protocol};
-pub use exchange::{CollationEvent, CollatorConfig, Exchange, MessageMetadata, ParsedHttpMessage};
-pub use h1::{HttpRequest, HttpResponse};
-pub use traits::{DataEvent, Direction};
+use std::marker::PhantomData;
 
 use connection::Connection as Conn;
+pub use connection::{Connection, DataChunk, Protocol};
 use dashmap::DashMap;
+pub use exchange::{CollationEvent, CollatorConfig, Exchange, MessageMetadata, ParsedHttpMessage};
+pub use h1::{HttpRequest, HttpResponse};
 use h2session::{
-    H2ConnectionState, StreamId, TimestampNs, is_http2_preface, looks_like_http2_frame,
+    H2ConnectionState,
+    StreamId,
+    TimestampNs,
+    is_http2_preface,
+    looks_like_http2_frame,
 };
-use std::marker::PhantomData;
+pub use traits::{DataEvent, Direction};
 
 /// Default maximum buffer size for data events (TLS record size)
 pub const MAX_BUF_SIZE: usize = 16384;
@@ -55,13 +59,13 @@ pub const MAX_BUF_SIZE: usize = 16384;
 /// do not serialize through a single mutex.
 pub struct Collator<E: DataEvent> {
     /// Connections tracked by conn_id (for socket events)
-    connections: DashMap<u64, Conn>,
+    connections:     DashMap<u64, Conn>,
     /// SSL connections tracked by process_id (no conn_id available)
     ssl_connections: DashMap<u32, Conn>,
     /// Configuration for what events to emit
-    config: CollatorConfig,
+    config:          CollatorConfig,
     /// Phantom data for the event type
-    _phantom: PhantomData<E>,
+    _phantom:        PhantomData<E>,
 }
 
 impl<E: DataEvent> Default for Collator<E> {
@@ -71,7 +75,8 @@ impl<E: DataEvent> Default for Collator<E> {
 }
 
 impl<E: DataEvent> Collator<E> {
-    /// Create a new collator with default settings (emits both messages and exchanges)
+    /// Create a new collator with default settings (emits both messages and
+    /// exchanges)
     pub fn new() -> Self {
         Self::with_config(CollatorConfig::default())
     }
@@ -221,17 +226,17 @@ impl<E: DataEvent> Collator<E> {
                 match conn.protocol {
                     Protocol::Http1 if conn.h1_request.is_none() => {
                         try_parse_http1_request_chunks(conn);
-                    }
+                    },
                     Protocol::Http2 => {
                         parse_http2_chunks(conn, direction);
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
 
                 if is_request_complete(conn) {
                     conn.request_complete = true;
                 }
-            }
+            },
             Direction::Read => {
                 conn.response_body_size += buf.len();
                 if conn.response_body_size > config.max_body_size {
@@ -247,20 +252,20 @@ impl<E: DataEvent> Collator<E> {
                 match conn.protocol {
                     Protocol::Http1 if conn.h1_response.is_none() => {
                         try_parse_http1_response_chunks(conn);
-                    }
+                    },
                     Protocol::Http2 => {
                         parse_http2_chunks(conn, direction);
-                    }
-                    _ => {}
+                    },
+                    _ => {},
                 }
 
                 if is_response_complete(conn) {
                     conn.response_complete = true;
                 }
-            }
+            },
             Direction::Other => {
                 return Vec::new();
-            }
+            },
         }
 
         // For HTTP/2, a complete stream pair can be detected on either event.
@@ -332,14 +337,14 @@ impl<E: DataEvent> Collator<E> {
             match self.connections.get_mut(&connection_id) {
                 Some(mut guard) => {
                     finalize_and_emit(&mut guard, connection_id, process_id, &self.config)
-                }
+                },
                 None => Vec::new(),
             }
         } else {
             match self.ssl_connections.get_mut(&process_id) {
                 Some(mut guard) => {
                     finalize_and_emit(&mut guard, connection_id, process_id, &self.config)
-                }
+                },
                 None => Vec::new(),
             }
         };
@@ -395,7 +400,8 @@ fn finalize_and_emit(
     events
 }
 
-/// Emit Message events for any newly parsed messages that haven't been emitted yet
+/// Emit Message events for any newly parsed messages that haven't been emitted
+/// yet
 fn emit_message_events(
     conn: &mut Conn,
     conn_id: u64,
@@ -441,7 +447,7 @@ fn emit_message_events(
                 });
                 conn.h1_response_emitted = true;
             }
-        }
+        },
         Protocol::Http2 => {
             // Emit newly parsed HTTP/2 requests
             for (&stream_id, msg) in &conn.pending_requests {
@@ -488,8 +494,8 @@ fn emit_message_events(
             // Mark all current pending responses as emitted
             conn.h2_emitted_responses
                 .extend(conn.pending_responses.keys().copied());
-        }
-        Protocol::Unknown => {}
+        },
+        Protocol::Unknown => {},
     }
 }
 
@@ -668,7 +674,8 @@ fn parse_http2_chunks(conn: &mut Conn, direction: Direction) {
     }
 }
 
-/// Find a stream_id that has both request and response ready (O(1) via ready_streams set)
+/// Find a stream_id that has both request and response ready (O(1) via
+/// ready_streams set)
 fn find_complete_h2_stream(conn: &Conn) -> Option<StreamId> {
     conn.ready_streams.iter().next().copied()
 }
@@ -719,7 +726,7 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
             let resp = conn.h1_response.take()?;
             let latency = resp.timestamp_ns.saturating_sub(req.timestamp_ns);
             (req, resp, None, latency)
-        }
+        },
         Protocol::Http2 => {
             let sid = find_complete_h2_stream(conn)?;
             let msg_req = conn.pending_requests.remove(&sid)?;
@@ -741,7 +748,7 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
 
             let latency = response_start_time.saturating_sub(request_complete_time);
             (req, resp, Some(sid), latency)
-        }
+        },
         Protocol::Unknown => return None,
     };
 

@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
-/// Newtype for HTTP/2 stream identifiers (RFC 7540 §5.1.1: 31-bit unsigned integer).
+/// Newtype for HTTP/2 stream identifiers (RFC 7540 §5.1.1: 31-bit unsigned
+/// integer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StreamId(pub u32);
 
@@ -56,39 +57,42 @@ impl From<TimestampNs> for u64 {
 /// (e.g., HPACK decompression bombs, stream flooding).
 #[derive(Debug, Clone)]
 pub struct H2Limits {
-    /// Maximum total decoded header list size in bytes (default: 65536, RFC 7540 default)
-    pub max_header_list_size: usize,
+    /// Maximum total decoded header list size in bytes (default: 65536, RFC
+    /// 7540 default)
+    pub max_header_list_size:   usize,
     /// Maximum number of headers per HEADERS block (default: 128)
-    pub max_header_count: usize,
+    pub max_header_count:       usize,
     /// Maximum size of any individual header value in bytes (default: 8192)
-    pub max_header_value_size: usize,
+    pub max_header_value_size:  usize,
     /// Hard cap for HPACK dynamic table size (default: 65536)
-    pub max_table_size: usize,
-    /// Maximum concurrent active streams before rejecting new ones (default: 100)
+    pub max_table_size:         usize,
+    /// Maximum concurrent active streams before rejecting new ones (default:
+    /// 100)
     pub max_concurrent_streams: usize,
-    /// Stream timeout in nanoseconds — streams older than this are evicted (default: 30s)
-    pub stream_timeout_ns: u64,
+    /// Stream timeout in nanoseconds — streams older than this are evicted
+    /// (default: 30s)
+    pub stream_timeout_ns:      u64,
     /// Maximum accumulated body size per stream in bytes (default: 10 MiB).
     /// Streams exceeding this limit are dropped to prevent memory exhaustion.
-    pub max_body_size: usize,
+    pub max_body_size:          usize,
     /// Maximum buffer size for incremental parsing in bytes.
     /// Rejects data that would grow the internal buffer beyond this limit.
     /// Default: 1 MiB. This bounds per-connection memory while allowing
     /// normal TCP read sizes and multi-frame chunks to be fed at once.
-    pub max_buffer_size: usize,
+    pub max_buffer_size:        usize,
 }
 
 impl Default for H2Limits {
     fn default() -> Self {
         Self {
-            max_header_list_size: 65536,
-            max_header_count: 128,
-            max_header_value_size: 8192,
-            max_table_size: 65536,
+            max_header_list_size:   65536,
+            max_header_count:       128,
+            max_header_value_size:  8192,
+            max_table_size:         65536,
             max_concurrent_streams: 100,
-            stream_timeout_ns: 30_000_000_000,
-            max_body_size: 10 * 1024 * 1024, // 10 MiB
-            max_buffer_size: 1024 * 1024,    // 1 MiB
+            stream_timeout_ns:      30_000_000_000,
+            max_body_size:          10 * 1024 * 1024, // 10 MiB
+            max_buffer_size:        1024 * 1024,      // 1 MiB
         }
     }
 }
@@ -123,9 +127,10 @@ pub struct H2ConnectionState {
     /// Internal buffer for incremental parsing
     pub(crate) buffer: Vec<u8>,
 
-    /// Stream ID expecting a CONTINUATION frame, or None if no CONTINUATION is pending.
-    /// When a HEADERS frame arrives without END_HEADERS, this is set to the stream ID.
-    /// Cleared when CONTINUATION with END_HEADERS arrives.
+    /// Stream ID expecting a CONTINUATION frame, or None if no CONTINUATION is
+    /// pending. When a HEADERS frame arrives without END_HEADERS, this is
+    /// set to the stream ID. Cleared when CONTINUATION with END_HEADERS
+    /// arrives.
     pub(crate) expecting_continuation: Option<StreamId>,
 
     /// Completed messages ready to be popped, stored as (stream_id, message)
@@ -158,10 +163,10 @@ pub(crate) struct StreamState {
     pub(crate) headers: Vec<(String, String)>,
 
     /// Request pseudo-headers
-    pub(crate) method: Option<String>,
-    pub(crate) path: Option<String>,
+    pub(crate) method:    Option<String>,
+    pub(crate) path:      Option<String>,
     pub(crate) authority: Option<String>,
-    pub(crate) scheme: Option<String>,
+    pub(crate) scheme:    Option<String>,
 
     /// Response pseudo-header
     pub(crate) status: Option<u16>,
@@ -254,12 +259,12 @@ impl H2ConnectionState {
 
     /// Feed new data for incremental parsing with a timestamp.
     ///
-    /// The timestamp is used to track when frames arrive for latency measurement.
-    /// Call this method as data arrives, then use `try_pop()` to retrieve
-    /// completed messages.
+    /// The timestamp is used to track when frames arrive for latency
+    /// measurement. Call this method as data arrives, then use `try_pop()`
+    /// to retrieve completed messages.
     ///
-    /// Returns Ok(()) if data was processed (even if no messages completed yet).
-    /// Returns Err only for fatal parse errors.
+    /// Returns Ok(()) if data was processed (even if no messages completed
+    /// yet). Returns Err only for fatal parse errors.
     pub fn feed(&mut self, data: &[u8], timestamp_ns: TimestampNs) -> Result<(), ParseError> {
         if self.buffer.len() + data.len() > self.limits.max_buffer_size {
             return Err(ParseError::new(ParseErrorKind::Http2BufferTooLarge));
@@ -439,13 +444,14 @@ impl ParsedH2Message {
     /// Convert this HTTP/2 message to an HttpRequest
     ///
     /// Returns None if this is not a valid request (missing :method or :path).
-    /// Uses end_stream_timestamp_ns as the request timestamp (when request was fully sent).
+    /// Uses end_stream_timestamp_ns as the request timestamp (when request was
+    /// fully sent).
     pub fn to_http_request(&self) -> Option<crate::HttpRequest> {
         Some(crate::HttpRequest {
-            method: self.http_method()?,
-            uri: self.http_uri()?,
-            headers: self.http_headers(),
-            body: self.body.clone(),
+            method:       self.http_method()?,
+            uri:          self.http_uri()?,
+            headers:      self.http_headers(),
+            body:         self.body.clone(),
             timestamp_ns: self.end_stream_timestamp_ns,
         })
     }
@@ -453,12 +459,13 @@ impl ParsedH2Message {
     /// Convert this HTTP/2 message to an HttpResponse
     ///
     /// Returns None if this is not a valid response (missing :status).
-    /// Uses first_frame_timestamp_ns as the response timestamp (when response started arriving).
+    /// Uses first_frame_timestamp_ns as the response timestamp (when response
+    /// started arriving).
     pub fn to_http_response(&self) -> Option<crate::HttpResponse> {
         Some(crate::HttpResponse {
-            status: self.http_status()?,
-            headers: self.http_headers(),
-            body: self.body.clone(),
+            status:       self.http_status()?,
+            headers:      self.http_headers(),
+            body:         self.body.clone(),
             timestamp_ns: self.first_frame_timestamp_ns,
         })
     }
@@ -479,7 +486,8 @@ impl ParsedH2Message {
         })
     }
 
-    /// Consume this message and convert to an HttpResponse (zero-copy for body).
+    /// Consume this message and convert to an HttpResponse (zero-copy for
+    /// body).
     ///
     /// Returns None if this is not a valid response (missing :status).
     pub fn into_http_response(self) -> Option<crate::HttpResponse> {
@@ -519,7 +527,8 @@ pub enum ParseErrorKind {
     Http2BufferTooLarge,
     /// Frame payload length exceeds the negotiated max_frame_size
     Http2FrameSizeError,
-    /// Expected a CONTINUATION frame but received a different frame type or wrong stream
+    /// Expected a CONTINUATION frame but received a different frame type or
+    /// wrong stream
     Http2ContinuationExpected,
     /// SETTINGS frame payload length is not a multiple of 6 bytes
     Http2SettingsLengthError,
@@ -532,7 +541,7 @@ impl std::fmt::Display for ParseErrorKind {
             Self::Http2HpackError(msg) => write!(f, "HTTP/2 HPACK decoding error: {msg}"),
             Self::Http2HeadersIncomplete => {
                 write!(f, "HTTP/2 headers incomplete (missing CONTINUATION)")
-            }
+            },
             Self::Http2HeaderListTooLarge => write!(f, "HTTP/2 header list exceeds size limits"),
             Self::Http2NoMethod => write!(f, "HTTP/2 request missing :method pseudo-header"),
             Self::Http2NoPath => write!(f, "HTTP/2 request missing :path pseudo-header"),
@@ -540,33 +549,34 @@ impl std::fmt::Display for ParseErrorKind {
             Self::Http2InvalidFrame => write!(f, "HTTP/2 invalid frame"),
             Self::Http2MaxConcurrentStreams => {
                 write!(f, "HTTP/2 max concurrent streams limit reached")
-            }
+            },
             Self::Http2PaddingError => write!(f, "HTTP/2 frame has missing or invalid padding"),
             Self::Http2PriorityError => {
                 write!(f, "HTTP/2 PRIORITY flag present but header block too short")
-            }
+            },
             Self::Http2StreamNotFound => write!(f, "HTTP/2 frame references unknown stream"),
             Self::Http2InvalidHeaderEncoding => {
                 write!(f, "HTTP/2 header contains invalid UTF-8 encoding")
-            }
+            },
             Self::Http2BufferTooLarge => {
                 write!(f, "HTTP/2 internal buffer exceeds max_buffer_size")
-            }
+            },
             Self::Http2FrameSizeError => {
                 write!(f, "HTTP/2 frame payload exceeds negotiated max_frame_size")
-            }
+            },
             Self::Http2ContinuationExpected => {
                 write!(
                     f,
-                    "HTTP/2 expected CONTINUATION frame but received different frame type or stream"
+                    "HTTP/2 expected CONTINUATION frame but received different frame type or \
+                     stream"
                 )
-            }
+            },
             Self::Http2SettingsLengthError => {
                 write!(
                     f,
                     "HTTP/2 SETTINGS frame payload is not a multiple of 6 bytes"
                 )
-            }
+            },
         }
     }
 }
@@ -574,7 +584,7 @@ impl std::fmt::Display for ParseErrorKind {
 /// Parse error with optional stream context (public API)
 #[derive(Debug, Clone)]
 pub struct ParseError {
-    pub kind: ParseErrorKind,
+    pub kind:      ParseErrorKind,
     pub stream_id: Option<StreamId>,
 }
 

@@ -1,10 +1,9 @@
 //! HTTP/1.x parsing utilities
 
 use h2session::TimestampNs;
-use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
-
 // Re-export HTTP types from h2session for use across all HTTP versions
 pub use h2session::{HttpRequest, HttpResponse};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 
 /// Check if data starts with an HTTP/1.x request
 pub fn is_http1_request(data: &[u8]) -> bool {
@@ -103,9 +102,10 @@ pub fn try_parse_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Optio
 
 /// Finalize an HTTP/1.x response when the connection closes.
 ///
-/// For responses without explicit framing (no Content-Length or Transfer-Encoding),
-/// RFC 7230 §3.3.3 says the body is everything until the connection closes.
-/// This function parses the headers and takes all remaining data as the body.
+/// For responses without explicit framing (no Content-Length or
+/// Transfer-Encoding), RFC 7230 §3.3.3 says the body is everything until the
+/// connection closes. This function parses the headers and takes all remaining
+/// data as the body.
 pub fn try_finalize_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Option<HttpResponse> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut res = httparse::Response::new(&mut headers);
@@ -145,7 +145,8 @@ enum BodyResult {
     Incomplete,
 }
 
-/// Determine the body of an HTTP/1.x message based on headers and available data.
+/// Determine the body of an HTTP/1.x message based on headers and available
+/// data.
 ///
 /// - Content-Length: body is exactly `body_data[..content_length]`
 /// - Transfer-Encoding: chunked: walks chunk boundaries to decode body
@@ -191,7 +192,7 @@ fn determine_body(
         // 1xx, 204, and 304 responses explicitly have no body (RFC 7230 §3.3.3)
         Some(code) if (100..200).contains(&code) || code == 204 || code == 304 => {
             BodyResult::Complete(Vec::new())
-        }
+        },
         // Other responses: body is read until connection close
         Some(_) => BodyResult::Incomplete,
     }
@@ -199,8 +200,8 @@ fn determine_body(
 
 /// Walk chunk boundaries to decode a chunked transfer-encoded body.
 ///
-/// Chunk format: `[hex-size][;ext=val]\r\n[data]\r\n` terminated by `0\r\n\r\n`.
-/// Returns the decoded body or Incomplete if not enough data.
+/// Chunk format: `[hex-size][;ext=val]\r\n[data]\r\n` terminated by
+/// `0\r\n\r\n`. Returns the decoded body or Incomplete if not enough data.
 fn decode_chunked_body(data: &[u8]) -> BodyResult {
     let mut decoded = Vec::new();
     let mut pos = 0;

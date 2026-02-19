@@ -1,7 +1,7 @@
 //! Fuzz target: Structured frame generation
 //!
-//! This fuzz target generates semi-valid HTTP/2 frames using the Arbitrary trait.
-//! This is more effective at finding bugs in frame handling logic since
+//! This fuzz target generates semi-valid HTTP/2 frames using the Arbitrary
+//! trait. This is more effective at finding bugs in frame handling logic since
 //! the inputs are structurally valid but have random field values.
 
 #![no_main]
@@ -25,14 +25,14 @@ const FLAG_PRIORITY: u8 = 0x20;
 /// A structured HTTP/2 frame for fuzzing
 #[derive(Debug, Arbitrary)]
 struct FuzzFrame {
-    frame_type: u8,
-    flags: u8,
-    stream_id: u32,
-    payload: Vec<u8>,
+    frame_type:   u8,
+    flags:        u8,
+    stream_id:    u32,
+    payload:      Vec<u8>,
     /// Extra flags to control frame generation
-    add_padding: bool,
+    add_padding:  bool,
     add_priority: bool,
-    padding_len: u8,
+    padding_len:  u8,
 }
 
 impl FuzzFrame {
@@ -104,9 +104,9 @@ impl FuzzFrame {
 /// A sequence of frames for fuzzing
 #[derive(Debug, Arbitrary)]
 struct FuzzConnection {
-    include_preface: bool,
+    include_preface:  bool,
     include_settings: bool,
-    frames: Vec<FuzzFrame>,
+    frames:           Vec<FuzzFrame>,
 }
 
 impl FuzzConnection {
@@ -140,7 +140,8 @@ fuzz_target!(|conn: FuzzConnection| {
     // Test incremental parsing with same structured input
     if data.len() > 20 {
         let cache2: H2SessionCache<u32> = H2SessionCache::new();
-        for chunk in data.chunks(33) { // Odd chunk size to hit boundaries
+        for chunk in data.chunks(33) {
+            // Odd chunk size to hit boundaries
             let _ = cache2.parse(2, chunk);
         }
     }

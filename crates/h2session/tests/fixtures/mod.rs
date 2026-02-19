@@ -130,7 +130,8 @@ pub fn build_headers_frame_padded(
 }
 
 /// Build a HEADERS frame with PRIORITY flag
-/// Priority: 5 bytes = [E (1 bit) + Stream Dependency (31 bits)] + [Weight (8 bits)]
+/// Priority: 5 bytes = [E (1 bit) + Stream Dependency (31 bits)] + [Weight (8
+/// bits)]
 pub fn build_headers_frame_priority(
     stream_id: u32,
     hpack_block: &[u8],
@@ -179,7 +180,8 @@ pub fn build_headers_frame_padded_priority(
     if end_headers {
         flags |= FLAG_END_HEADERS;
     }
-    // Layout: [Pad Length (1)] [E + Stream Dep (4)] [Weight (1)] [Header Block] [Padding]
+    // Layout: [Pad Length (1)] [E + Stream Dep (4)] [Weight (1)] [Header Block]
+    // [Padding]
     let total_len = 1 + 5 + hpack_block.len() + padding_len as usize;
     let mut frame = build_frame_header(total_len as u32, FRAME_TYPE_HEADERS, flags, stream_id);
     frame.push(padding_len);
@@ -280,8 +282,8 @@ pub fn build_rst_stream_frame(stream_id: u32, error_code: u32) -> Vec<u8> {
 
 /// HPACK helper: Encode a literal header with incremental indexing
 ///
-/// This adds the header to the dynamic table so it can be referenced by later frames.
-/// Format: 0b01xxxxxx (index 0 for new name)
+/// This adds the header to the dynamic table so it can be referenced by later
+/// frames. Format: 0b01xxxxxx (index 0 for new name)
 pub fn hpack_literal_with_indexing(name: &str, value: &str) -> Vec<u8> {
     let mut encoded = Vec::new();
     // Literal with incremental indexing, new name (index 0)
@@ -468,7 +470,8 @@ pub mod hpack_huffman {
         vec![0x25, 0xa8, 0x49, 0xe9, 0x5b, 0xb8, 0xe8, 0xb4, 0xbf]
     }
 
-    /// Build literal header with Huffman-encoded name and value (without indexing)
+    /// Build literal header with Huffman-encoded name and value (without
+    /// indexing)
     pub fn literal_huffman(name_huffman: &[u8], value_huffman: &[u8]) -> Vec<u8> {
         let mut encoded = Vec::new();
         // Literal without indexing, new name

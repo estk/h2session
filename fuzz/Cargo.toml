@@ -3,27 +3,16 @@ name = "h2session-fuzz"
 version = "0.0.0"
 authors = ["Automatically generated"]
 publish = false
-edition = "2024"
+edition.workspace = true
 
 [package.metadata]
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4"
-arbitrary = { version = "1", features = ["derive"] }
-
-[dependencies.h2session]
-path = "../crates/h2session"
-
-[dependencies.http-collator]
-path = "../crates/http-collator"
-
-# Prevent this from interfering with workspaces
-[workspace]
-members = ["."]
-
-[profile.release]
-debug = 1
+libfuzzer-sys.workspace = true
+arbitrary = { workspace = true, features = ["derive"] }
+h2session.workspace = true
+http-collator.workspace = true
 
 [[bin]]
 name = "fuzz_parse"

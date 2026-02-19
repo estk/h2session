@@ -5,8 +5,8 @@
 
 #![no_main]
 
-use libfuzzer_sys::fuzz_target;
 use h2session::H2SessionCache;
+use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // Create a fresh cache for each input

@@ -1,8 +1,11 @@
 //! HTTP exchange (request/response pair) and collation events
 
-use crate::connection::Protocol;
-use crate::h1::{HttpRequest, HttpResponse};
 use h2session::{StreamId, TimestampNs};
+
+use crate::{
+    connection::Protocol,
+    h1::{HttpRequest, HttpResponse},
+};
 
 /// Classification of parsed HTTP message
 #[derive(Debug, Clone)]
@@ -45,15 +48,15 @@ pub struct MessageMetadata {
     /// Connection identifier (0 if unavailable, falls back to process_id)
     pub connection_id: u64,
     /// Process ID for connection tracking
-    pub process_id: u32,
+    pub process_id:    u32,
     /// Timestamp in nanoseconds
-    pub timestamp_ns: TimestampNs,
+    pub timestamp_ns:  TimestampNs,
     /// Stream ID for HTTP/2 (None for HTTP/1)
-    pub stream_id: Option<StreamId>,
+    pub stream_id:     Option<StreamId>,
     /// Remote port (None if unavailable)
-    pub remote_port: Option<u16>,
+    pub remote_port:   Option<u16>,
     /// Protocol detected for this connection
-    pub protocol: Protocol,
+    pub protocol:      Protocol,
 }
 
 /// Events emitted by the collator
@@ -61,7 +64,7 @@ pub struct MessageMetadata {
 pub enum CollationEvent {
     /// Individual message parsed and ready for processing
     Message {
-        message: ParsedHttpMessage,
+        message:  ParsedHttpMessage,
         metadata: MessageMetadata,
     },
     /// Complete exchange with latency (request + response matched)
@@ -100,27 +103,27 @@ impl CollationEvent {
 #[derive(Debug, Clone)]
 pub struct CollatorConfig {
     /// Emit Message events when individual requests/responses are parsed
-    pub emit_messages: bool,
+    pub emit_messages:  bool,
     /// Emit Exchange events when request/response pairs complete
     pub emit_exchanges: bool,
     /// Maximum buffer size per chunk
-    pub max_buf_size: usize,
+    pub max_buf_size:   usize,
     /// Connection timeout for cleanup in nanoseconds
-    pub timeout_ns: u64,
+    pub timeout_ns:     u64,
     /// Maximum accumulated body size per direction before the connection is
     /// reset. Prevents unbounded memory growth from stalled or malicious
     /// connections. Default: 10 MiB.
-    pub max_body_size: usize,
+    pub max_body_size:  usize,
 }
 
 impl Default for CollatorConfig {
     fn default() -> Self {
         Self {
-            emit_messages: true,
+            emit_messages:  true,
             emit_exchanges: true,
-            max_buf_size: 16384,
-            timeout_ns: 5_000_000_000,
-            max_body_size: 10 * 1024 * 1024, // 10 MiB
+            max_buf_size:   16384,
+            timeout_ns:     5_000_000_000,
+            max_body_size:  10 * 1024 * 1024, // 10 MiB
         }
     }
 }
@@ -148,15 +151,15 @@ impl CollatorConfig {
 /// A complete request/response exchange
 #[derive(Debug)]
 pub struct Exchange {
-    pub request: HttpRequest,
-    pub response: HttpResponse,
-    pub latency_ns: u64,
-    pub protocol: Protocol,
-    pub process_id: u32,
+    pub request:     HttpRequest,
+    pub response:    HttpResponse,
+    pub latency_ns:  u64,
+    pub protocol:    Protocol,
+    pub process_id:  u32,
     /// Remote port, None if unavailable (e.g., SSL without socket fd)
     pub remote_port: Option<u16>,
     /// Stream ID for HTTP/2 (None for HTTP/1)
-    pub stream_id: Option<StreamId>,
+    pub stream_id:   Option<StreamId>,
 }
 
 impl std::fmt::Display for Exchange {

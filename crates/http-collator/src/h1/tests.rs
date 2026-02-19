@@ -1,5 +1,6 @@
-use super::*;
 use rstest::rstest;
+
+use super::*;
 
 #[test]
 fn test_is_http1_request() {
@@ -267,9 +268,9 @@ fn test_chunked_body_decoded_correctly() {
 
 #[test]
 fn test_chunked_false_positive_0_in_content() {
-    // Body data containing "0\r\n\r\n" inside a chunk should not be falsely terminated.
-    // Chunk 1: 12 bytes = "0\r\n\r\nhello\r\n" (contains the pattern inside data)
-    // Chunk 2: 0 (terminal)
+    // Body data containing "0\r\n\r\n" inside a chunk should not be falsely
+    // terminated. Chunk 1: 12 bytes = "0\r\n\r\nhello\r\n" (contains the
+    // pattern inside data) Chunk 2: 0 (terminal)
     let data = b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nc\r\n0\r\n\r\nhello\r\n\r\n0\r\n\r\n";
     let result = try_parse_http1_request(data, TimestampNs(0));
     assert!(

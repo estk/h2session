@@ -17,26 +17,31 @@ macro_rules! trace_warn {
 macro_rules! trace_warn {
     ($($arg:tt)*) => {};
 }
-pub(crate) use trace_warn;
+use std::{collections::HashMap, hash::Hash, sync::Mutex};
 
 // Public re-exports for direct state management
 use dashmap::DashMap;
 pub use frame::{CONNECTION_PREFACE, is_http2_preface, looks_like_http2_frame};
 pub use http_types::{HttpRequest, HttpResponse};
 pub use state::{
-    H2ConnectionState, H2Limits, ParseError, ParseErrorKind, ParsedH2Message, StreamId, TimestampNs,
+    H2ConnectionState,
+    H2Limits,
+    ParseError,
+    ParseErrorKind,
+    ParsedH2Message,
+    StreamId,
+    TimestampNs,
 };
-use std::collections::HashMap;
-use std::hash::Hash;
-use std::sync::Mutex;
+pub(crate) use trace_warn;
 
 /// HTTP/2 session cache with generic connection keys.
 ///
-/// Uses `DashMap<K, Mutex<H2ConnectionState>>` to provide per-key serialization.
-/// The DashMap shard lock is held only briefly (to look up or insert the entry),
-/// while the per-key Mutex serializes concurrent same-key calls to `parse()`.
-/// This prevents the remove-and-reinsert race where two threads would both
-/// create default state for the same key, losing one thread's HPACK table.
+/// Uses `DashMap<K, Mutex<H2ConnectionState>>` to provide per-key
+/// serialization. The DashMap shard lock is held only briefly (to look up or
+/// insert the entry), while the per-key Mutex serializes concurrent same-key
+/// calls to `parse()`. This prevents the remove-and-reinsert race where two
+/// threads would both create default state for the same key, losing one
+/// thread's HPACK table.
 pub struct H2SessionCache<K> {
     connections: DashMap<K, Mutex<H2ConnectionState>>,
 }

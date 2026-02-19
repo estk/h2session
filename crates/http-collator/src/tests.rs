@@ -1,16 +1,17 @@
 #![allow(unused_mut)]
 
-use super::*;
 use rstest::rstest;
+
+use super::*;
 
 /// Test implementation of DataEvent
 struct TestEvent {
-    payload: Vec<u8>,
+    payload:      Vec<u8>,
     timestamp_ns: u64,
-    direction: Direction,
-    conn_id: u64,
-    process_id: u32,
-    remote_port: u16,
+    direction:    Direction,
+    conn_id:      u64,
+    process_id:   u32,
+    remote_port:  u16,
 }
 
 impl DataEvent for TestEvent {
@@ -240,7 +241,8 @@ fn test_h2_incremental_parsing_no_body_duplication() {
     let conn = collator.connections.get(&conn_id).unwrap();
     let request = conn.pending_requests.get(&StreamId(1)).unwrap();
 
-    // Body should be "helloworld", NOT "hellohelloworldhelloworldworld" (duplicated)
+    // Body should be "helloworld", NOT "hellohelloworldhelloworldworld"
+    // (duplicated)
     assert_eq!(
         request.body, b"helloworld",
         "Body should not be duplicated when parsing incrementally"
@@ -306,7 +308,7 @@ fn test_h2_large_payload_exceeding_max_buf_size() {
                 req.body.iter().all(|&b| b == 0x41),
                 "Body content should be all 'A' bytes"
             );
-        }
+        },
         _ => panic!("Expected a request message"),
     }
 }
@@ -394,7 +396,7 @@ fn test_h2_fd_reuse_resets_parser_on_new_preface() {
                 "Body should be 32KB, got {} bytes",
                 req.body.len()
             );
-        }
+        },
         _ => panic!("Expected a request message"),
     }
 }
@@ -454,7 +456,8 @@ fn test_h2_fd_reuse_split_chunks_with_response() {
     );
 
     // --- GOAWAY on Read direction (server sends to client) ---
-    // GOAWAY: type=0x07, flags=0, stream_id=0, payload: last_stream_id(4) + error_code(4)
+    // GOAWAY: type=0x07, flags=0, stream_id=0, payload: last_stream_id(4) +
+    // error_code(4)
     let goaway = vec![
         0x00, 0x00, 0x08, // length = 8
         0x07, // type = GOAWAY
@@ -664,16 +667,16 @@ fn test_h2_per_stream_latency() {
 fn test_exchange_display_port(#[case] remote_port: Option<u16>, #[case] expected_text: &str) {
     let exchange = Exchange {
         request: HttpRequest {
-            method: http::Method::GET,
-            uri: "/".parse().unwrap(),
-            headers: http::HeaderMap::new(),
-            body: vec![],
+            method:       http::Method::GET,
+            uri:          "/".parse().unwrap(),
+            headers:      http::HeaderMap::new(),
+            body:         vec![],
             timestamp_ns: TimestampNs(0),
         },
         response: HttpResponse {
-            status: http::StatusCode::OK,
-            headers: http::HeaderMap::new(),
-            body: vec![],
+            status:       http::StatusCode::OK,
+            headers:      http::HeaderMap::new(),
+            body:         vec![],
             timestamp_ns: TimestampNs(0),
         },
         latency_ns: 1_000_000,
@@ -863,8 +866,9 @@ fn test_message_not_emitted_twice() {
 
 #[test]
 fn test_h2_server_side_monitoring() {
-    // Server-side monitoring: Read = request (from client), Write = response (to client)
-    // This is inverted from client-side monitoring where Write = request, Read = response
+    // Server-side monitoring: Read = request (from client), Write = response (to
+    // client) This is inverted from client-side monitoring where Write =
+    // request, Read = response
     let mut collator: Collator<TestEvent> = Collator::new();
     let conn_id = 77777u64;
     let process_id = 3000u32;

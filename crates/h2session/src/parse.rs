@@ -1,9 +1,17 @@
 use std::collections::HashMap;
 
-use crate::frame::*;
-use crate::state::{
-    H2ConnectionState, ParseError, ParseErrorKind, ParsedH2Message, StreamId, StreamPhase,
-    StreamState, TimestampNs,
+use crate::{
+    frame::*,
+    state::{
+        H2ConnectionState,
+        ParseError,
+        ParseErrorKind,
+        ParsedH2Message,
+        StreamId,
+        StreamPhase,
+        StreamState,
+        TimestampNs,
+    },
 };
 
 /// Parse HTTP/2 frames with connection-level state
@@ -13,8 +21,8 @@ use crate::state::{
 /// and stream tracking.
 /// Returns `Ok(HashMap)` which may be empty if no streams completed yet.
 ///
-/// NOTE: This function re-parses the entire buffer from the beginning each call.
-/// For incremental parsing, use `H2ConnectionState::feed()` instead.
+/// NOTE: This function re-parses the entire buffer from the beginning each
+/// call. For incremental parsing, use `H2ConnectionState::feed()` instead.
 pub(crate) fn parse_frames_stateful(
     buffer: &[u8],
     state: &mut H2ConnectionState,
@@ -60,27 +68,27 @@ pub(crate) fn parse_frames_stateful(
         match header.frame_type {
             FRAME_TYPE_DATA => {
                 handle_data_frame(state, &header, frame_payload, timestamp_ns)?;
-            }
+            },
             FRAME_TYPE_HEADERS => {
                 handle_headers_frame(state, &header, frame_payload, timestamp_ns)?;
-            }
+            },
             FRAME_TYPE_CONTINUATION => {
                 handle_continuation_frame(state, &header, frame_payload)?;
-            }
+            },
             FRAME_TYPE_SETTINGS => {
                 handle_settings_frame(state, &header, frame_payload)?;
-            }
+            },
             FRAME_TYPE_RST_STREAM => {
                 handle_rst_stream(state, &header, frame_payload);
-            }
+            },
             FRAME_TYPE_GOAWAY => {
                 handle_goaway(frame_payload);
-            }
+            },
             FRAME_TYPE_PRIORITY
             | FRAME_TYPE_PUSH_PROMISE
             | FRAME_TYPE_PING
-            | FRAME_TYPE_WINDOW_UPDATE => {}
-            _ => {}
+            | FRAME_TYPE_WINDOW_UPDATE => {},
+            _ => {},
         }
 
         pos += frame_total_size;
@@ -139,8 +147,8 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
             && (header.frame_type != FRAME_TYPE_CONTINUATION || header.stream_id != expected_stream)
         {
             crate::trace_warn!(
-                "expected CONTINUATION for stream {expected_stream}, got frame type {} on stream {}; \
-                     abandoning incomplete header block",
+                "expected CONTINUATION for stream {expected_stream}, got frame type {} on stream \
+                 {}; abandoning incomplete header block",
                 header.frame_type,
                 header.stream_id
             );
@@ -155,17 +163,17 @@ pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<
             FRAME_TYPE_DATA => handle_data_frame(state, &header, &frame_payload, timestamp_ns),
             FRAME_TYPE_HEADERS => {
                 handle_headers_frame(state, &header, &frame_payload, timestamp_ns)
-            }
+            },
             FRAME_TYPE_CONTINUATION => handle_continuation_frame(state, &header, &frame_payload),
             FRAME_TYPE_SETTINGS => handle_settings_frame(state, &header, &frame_payload),
             FRAME_TYPE_RST_STREAM => {
                 handle_rst_stream(state, &header, &frame_payload);
                 Ok(())
-            }
+            },
             FRAME_TYPE_GOAWAY => {
                 handle_goaway(&frame_payload);
                 Ok(())
-            }
+            },
             FRAME_TYPE_PRIORITY
             | FRAME_TYPE_PUSH_PROMISE
             | FRAME_TYPE_PING
@@ -398,7 +406,8 @@ fn handle_data_frame(
         payload
     };
 
-    // Check body size limit and M1 (DATA before headers complete) before borrowing the stream mutably
+    // Check body size limit and M1 (DATA before headers complete) before borrowing
+    // the stream mutably
     {
         let stream = state
             .active_streams
@@ -470,7 +479,7 @@ fn handle_settings_frame(
                 let capped = value.min(state.limits.max_table_size as u32);
                 state.settings.header_table_size = capped;
                 state.decoder.set_max_table_size(capped as usize);
-            }
+            },
             0x02 => state.settings.enable_push = value != 0,
             0x03 => state.settings.max_concurrent_streams = value,
             0x04 => state.settings.initial_window_size = value,
@@ -479,10 +488,11 @@ fn handle_settings_frame(
                 if (16_384..=MAX_FRAME_PAYLOAD_LENGTH).contains(&value) {
                     state.settings.max_frame_size = value;
                 }
-                // Ignore out-of-range values (passive monitor shouldn't disconnect)
-            }
+                // Ignore out-of-range values (passive monitor shouldn't
+                // disconnect)
+            },
             0x06 => state.settings.max_header_list_size = value,
-            _ => {} // Unknown setting
+            _ => {}, // Unknown setting
         }
 
         pos += 6;
@@ -557,7 +567,8 @@ fn decode_headers_into_stream(
                 return;
             }
 
-            // RFC 7540 §6.5.2: header list size = sum of (name.len + value.len + 32) per entry
+            // RFC 7540 §6.5.2: header list size = sum of (name.len + value.len + 32) per
+            // entry
             total_size += name.len() + value.len() + 32;
             if total_size > limits.max_header_list_size {
                 limit_exceeded = true;

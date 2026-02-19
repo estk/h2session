@@ -1,11 +1,14 @@
 //! Connection state tracking for HTTP collation
 
-use bytes::Bytes;
-
-use crate::h1::{HttpRequest, HttpResponse};
-use crate::traits::Direction;
-use h2session::{H2ConnectionState, ParsedH2Message, StreamId, TimestampNs};
 use std::collections::{HashMap, HashSet};
+
+use bytes::Bytes;
+use h2session::{H2ConnectionState, ParsedH2Message, StreamId, TimestampNs};
+
+use crate::{
+    h1::{HttpRequest, HttpResponse},
+    traits::Direction,
+};
 
 /// Protocol detected for a connection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,51 +21,51 @@ pub enum Protocol {
 /// A chunk of data received from a data source
 #[derive(Debug, Clone)]
 pub struct DataChunk {
-    pub data: Bytes,
+    pub data:         Bytes,
     pub timestamp_ns: TimestampNs,
-    pub direction: Direction,
+    pub direction:    Direction,
 }
 
 /// Tracks state for a single connection
 pub struct Connection {
-    pub process_id: u32,
+    pub process_id:        u32,
     /// Remote port, None if unavailable (e.g., SSL without socket fd)
-    pub remote_port: Option<u16>,
-    pub protocol: Protocol,
-    pub request_chunks: Vec<DataChunk>,
-    pub response_chunks: Vec<DataChunk>,
-    pub last_activity_ns: TimestampNs,
-    pub request_complete: bool,
+    pub remote_port:       Option<u16>,
+    pub protocol:          Protocol,
+    pub request_chunks:    Vec<DataChunk>,
+    pub response_chunks:   Vec<DataChunk>,
+    pub last_activity_ns:  TimestampNs,
+    pub request_complete:  bool,
     pub response_complete: bool,
 
     // HTTP/1 growable buffers — new data is appended as it arrives, avoiding
     // repeated clone-and-concatenate of all previous chunks.
-    pub(crate) h1_request_buffer: Vec<u8>,
+    pub(crate) h1_request_buffer:  Vec<u8>,
     pub(crate) h1_response_buffer: Vec<u8>,
 
     // Accumulated body size per direction for enforcing max_body_size limit
-    pub(crate) request_body_size: usize,
+    pub(crate) request_body_size:  usize,
     pub(crate) response_body_size: usize,
 
     // HTTP/1 parsed messages (when complete)
-    pub(crate) h1_request: Option<HttpRequest>,
+    pub(crate) h1_request:  Option<HttpRequest>,
     pub(crate) h1_response: Option<HttpResponse>,
 
     // HTTP/1 emission tracking - have we already emitted Message events for these?
-    pub(crate) h1_request_emitted: bool,
+    pub(crate) h1_request_emitted:  bool,
     pub(crate) h1_response_emitted: bool,
 
     // HTTP/2 state: separate parsers per direction to avoid corrupting
     // frame boundaries when Read and Write events interleave.
     pub(crate) h2_write_state: H2ConnectionState,
-    pub(crate) h2_read_state: H2ConnectionState,
+    pub(crate) h2_read_state:  H2ConnectionState,
 
     // Completed messages from h2session, keyed by stream_id
-    pub(crate) pending_requests: HashMap<StreamId, ParsedH2Message>,
+    pub(crate) pending_requests:  HashMap<StreamId, ParsedH2Message>,
     pub(crate) pending_responses: HashMap<StreamId, ParsedH2Message>,
 
     // HTTP/2 emission tracking - which stream_ids have we emitted Message events for?
-    pub(crate) h2_emitted_requests: HashSet<StreamId>,
+    pub(crate) h2_emitted_requests:  HashSet<StreamId>,
     pub(crate) h2_emitted_responses: HashSet<StreamId>,
 
     // Stream IDs that have both a pending request and pending response,

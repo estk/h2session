@@ -33,10 +33,10 @@ pub(crate) const MAX_FRAME_PAYLOAD_LENGTH: u32 = (1 << 24) - 1;
 /// Parsed HTTP/2 frame header
 #[derive(Debug, Clone)]
 pub(crate) struct FrameHeader {
-    pub(crate) length: u32,
+    pub(crate) length:     u32,
     pub(crate) frame_type: u8,
-    pub(crate) flags: u8,
-    pub(crate) stream_id: StreamId,
+    pub(crate) flags:      u8,
+    pub(crate) stream_id:  StreamId,
 }
 
 /// Check if buffer starts with HTTP/2 connection preface

@@ -1,8 +1,9 @@
 #![allow(clippy::vec_init_then_push)]
 
+use rstest::rstest;
+
 use super::*;
 use crate::parse::parse_frames_stateful;
-use rstest::rstest;
 
 // Helper to create a minimal SETTINGS frame
 fn create_settings_frame() -> Vec<u8> {
@@ -14,7 +15,8 @@ fn create_settings_frame() -> Vec<u8> {
     ]
 }
 
-// Helper to create a minimal HEADERS frame with END_HEADERS and END_STREAM flags
+// Helper to create a minimal HEADERS frame with END_HEADERS and END_STREAM
+// flags
 fn create_headers_frame(stream_id: u32, header_block: &[u8]) -> Vec<u8> {
     let mut frame = vec![
         0x00,
@@ -112,7 +114,8 @@ fn test_multi_stream_tracking() {
     let result = cache.parse(key.clone(), &buffer);
     assert!(result.is_ok());
 
-    // Should return multiple messages (one per completed stream), keyed by stream_id
+    // Should return multiple messages (one per completed stream), keyed by
+    // stream_id
     let messages = result.unwrap();
     assert!(!messages.is_empty()); // At least one message completed
 }
@@ -178,7 +181,8 @@ fn test_parse_returns_hashmap_keyed_by_stream_id() {
 // CRITICAL-1: HPACK decompression bomb protection
 // =========================================================================
 
-/// Build an HPACK block with many literal headers (no indexing) to exceed limits
+/// Build an HPACK block with many literal headers (no indexing) to exceed
+/// limits
 fn build_many_headers_hpack(count: usize) -> Vec<u8> {
     let mut block = Vec::new();
     for i in 0..count {
@@ -448,7 +452,8 @@ fn test_settings_header_table_size_applied() {
     // Add a header with indexing (tries to add to dynamic table)
     let mut hpack = Vec::new();
     hpack.push(0x82); // :method: GET (static, fine)
-    // Literal with incremental indexing: tries to add "x-test: value" to dynamic table
+    // Literal with incremental indexing: tries to add "x-test: value" to dynamic
+    // table
     hpack.push(0x40); // Literal with indexing, new name
     hpack.push(0x06); // name length
     hpack.extend_from_slice(b"x-test");
@@ -636,8 +641,7 @@ fn test_body_size_limit_drops_stream() {
 
 #[test]
 fn test_h2session_cache_concurrent_different_connections() {
-    use std::sync::Arc;
-    use std::thread;
+    use std::{sync::Arc, thread};
 
     let cache = Arc::new(H2SessionCache::new());
     let num_threads = 8;
@@ -671,8 +675,7 @@ fn test_h2session_cache_concurrent_different_connections() {
 
 #[test]
 fn test_h2session_cache_concurrent_same_connection() {
-    use std::sync::Arc;
-    use std::thread;
+    use std::{sync::Arc, thread};
 
     let cache = Arc::new(H2SessionCache::new());
     let key = "shared_conn".to_string();
@@ -761,7 +764,8 @@ fn test_checked_add_max_24bit_length() {
     buffer.extend_from_slice(&create_settings_frame());
     buffer.extend_from_slice(&frame);
 
-    // parse_frames_stateful should not panic — it should just see an incomplete frame
+    // parse_frames_stateful should not panic — it should just see an incomplete
+    // frame
     let result = parse_frames_stateful(&buffer, &mut state);
     // The max_frame_size check will reject this before the incomplete frame check
     assert!(
@@ -776,7 +780,8 @@ fn test_checked_add_max_24bit_length() {
 
 #[test]
 fn test_max_frame_size_rejects_oversized_frame() {
-    // Default max_frame_size is 16384. A frame with length 16385 should be rejected.
+    // Default max_frame_size is 16384. A frame with length 16385 should be
+    // rejected.
     let length: u32 = 16385; // 1 over default
     let mut frame_header = vec![
         (length >> 16) as u8,
@@ -808,7 +813,8 @@ fn test_max_frame_size_rejects_oversized_frame() {
 
 #[test]
 fn test_max_frame_size_respects_settings() {
-    // After SETTINGS sets max_frame_size to 32768, a 20000-byte DATA frame should succeed
+    // After SETTINGS sets max_frame_size to 32768, a 20000-byte DATA frame should
+    // succeed
     let mut state = H2ConnectionState::new();
 
     let mut buffer = frame::CONNECTION_PREFACE.to_vec();
@@ -914,7 +920,8 @@ fn test_continuation_expected_but_got_data() {
     let result = parse_frames_stateful(&buffer, &mut state);
     assert!(
         matches!(result, Err(ref e) if matches!(e.kind, ParseErrorKind::Http2ContinuationExpected)),
-        "DATA after HEADERS without END_HEADERS should trigger ContinuationExpected, got: {result:?}"
+        "DATA after HEADERS without END_HEADERS should trigger ContinuationExpected, got: \
+         {result:?}"
     );
 }
 
@@ -966,7 +973,8 @@ fn test_continuation_wrong_stream_rejected() {
 
 #[test]
 fn test_continuation_correct_ordering_succeeds() {
-    // HEADERS without END_HEADERS, then CONTINUATION with END_HEADERS — should succeed
+    // HEADERS without END_HEADERS, then CONTINUATION with END_HEADERS — should
+    // succeed
     let mut state = H2ConnectionState::new();
     let mut buffer = frame::CONNECTION_PREFACE.to_vec();
     buffer.extend_from_slice(&create_settings_frame());
@@ -1134,8 +1142,10 @@ fn test_into_http_request_returns_none_for_response() {
 
 #[test]
 fn test_per_key_mutex_preserves_hpack_state() {
-    use std::sync::{Arc, Barrier};
-    use std::thread;
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     let cache = Arc::new(H2SessionCache::new());
     let key = "shared".to_string();
@@ -1237,7 +1247,8 @@ fn test_broken_continuation_does_not_poison_connection() {
         "Incomplete stream 1 should be removed"
     );
 
-    // Now send a valid HEADERS frame on stream 5 — connection should NOT be poisoned
+    // Now send a valid HEADERS frame on stream 5 — connection should NOT be
+    // poisoned
     let hpack2 = vec![0x82]; // :method: GET
     let valid_headers = create_headers_frame(5, &hpack2);
     let result = state.feed(&valid_headers, TimestampNs(3_000_000));

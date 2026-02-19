@@ -1,5 +1,64 @@
-// HTTP/2 session management crate
-// Provides connection-level state tracking for HTTP/2 parsing
+#![warn(missing_docs)]
+//! Stateful HTTP/2 frame parser with HPACK support for passive traffic
+//! monitoring.
+//!
+//! This crate decodes HTTP/2 frames and HPACK-compressed headers from raw
+//! byte streams, maintaining per-connection decoder state so that dynamic
+//! table entries are preserved across successive `feed()` calls.
+//!
+//! # Key types
+//!
+//! - [`H2SessionCache`] — thread-safe cache of many connections keyed by an
+//!   arbitrary `K`. Best when you have many connections and want automatic
+//!   state management.
+//! - [`H2ConnectionState`] — state for a single HTTP/2 connection. Use
+//!   [`feed()`](H2ConnectionState::feed) to push data incrementally and
+//!   [`try_pop()`](H2ConnectionState::try_pop) to retrieve completed messages.
+//!
+//! # Examples
+//!
+//! ## Multi-connection cache
+//!
+//! ```no_run
+//! use h2session::{H2SessionCache, ParsedH2Message};
+//!
+//! let cache = H2SessionCache::<u64>::new();
+//!
+//! // Parse a buffer for connection 42
+//! let completed = cache.parse(42, &raw_bytes).unwrap();
+//! for (stream_id, msg) in &completed {
+//!     if msg.is_request() {
+//!         println!(
+//!             "{} {}",
+//!             msg.method.as_deref().unwrap_or("?"),
+//!             msg.path.as_deref().unwrap_or("/")
+//!         );
+//!     }
+//! }
+//! # let raw_bytes: Vec<u8> = vec![];
+//! ```
+//!
+//! ## Single-connection incremental parsing
+//!
+//! ```no_run
+//! use h2session::{H2ConnectionState, TimestampNs};
+//!
+//! let mut state = H2ConnectionState::new();
+//!
+//! // Feed data as it arrives
+//! state.feed(&chunk, TimestampNs(0)).unwrap();
+//!
+//! // Pop completed messages
+//! while let Some((stream_id, msg)) = state.try_pop() {
+//!     println!("stream {stream_id}: request={}", msg.is_request());
+//! }
+//! # let chunk: Vec<u8> = vec![];
+//! ```
+//!
+//! # Feature flags
+//!
+//! - **`tracing`** — emit `tracing::warn!` events for non-fatal parse issues
+//!   (stale stream eviction, etc.)
 
 mod frame;
 mod http_types;

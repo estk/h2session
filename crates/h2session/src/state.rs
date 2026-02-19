@@ -28,6 +28,7 @@ impl From<StreamId> for u32 {
 pub struct TimestampNs(pub u64);
 
 impl TimestampNs {
+    /// Returns `self - other`, clamped to zero on underflow.
     pub fn saturating_sub(self, other: TimestampNs) -> u64 {
         self.0.saturating_sub(other.0)
     }
@@ -118,7 +119,8 @@ pub struct H2ConnectionState {
     /// Resource limits for header decoding and stream management
     pub(crate) limits: H2Limits,
 
-    /// Whether the connection preface has been seen
+    /// Whether the HTTP/2 connection preface (`PRI *
+    /// HTTP/2.0\r\n\r\nSM\r\n\r\n`) has been received on this connection.
     pub preface_received: bool,
 
     /// Highest stream ID seen (for protocol validation)
@@ -235,6 +237,7 @@ impl Default for H2ConnectionState {
 }
 
 impl H2ConnectionState {
+    /// Create a connection state with default limits.
     pub fn new() -> Self {
         Self::default()
     }
@@ -366,17 +369,32 @@ impl StreamState {
     }
 }
 
-/// Parsed HTTP/2 message (public API)
+/// A fully parsed HTTP/2 message extracted from a completed stream.
+///
+/// Contains pseudo-headers (`:method`, `:path`, `:status`, etc.), regular
+/// headers, accumulated body data, and timing information. Use
+/// [`is_request()`](Self::is_request) / [`is_response()`](Self::is_response)
+/// to classify, or the `to_http_*` / `into_http_*` helpers to convert into
+/// [`HttpRequest`](crate::HttpRequest) / [`HttpResponse`](crate::HttpResponse).
 #[derive(Debug, Clone)]
 pub struct ParsedH2Message {
+    /// `:method` pseudo-header (present for requests)
     pub method: Option<String>,
+    /// `:path` pseudo-header (present for requests)
     pub path: Option<String>,
+    /// `:authority` pseudo-header (present for requests, mapped to `Host`)
     pub authority: Option<String>,
+    /// `:scheme` pseudo-header (present for requests)
     pub scheme: Option<String>,
+    /// `:status` pseudo-header (present for responses)
     pub status: Option<u16>,
+    /// Decoded headers (both pseudo and regular, in wire order)
     pub headers: Vec<(String, String)>,
+    /// HTTP/2 stream identifier
     pub stream_id: StreamId,
+    /// Total decoded header size in bytes
     pub header_size: usize,
+    /// Accumulated body from DATA frames
     pub body: Vec<u8>,
     /// Timestamp when first frame for this stream was received
     pub first_frame_timestamp_ns: TimestampNs,
@@ -505,13 +523,22 @@ impl ParsedH2Message {
 /// Classification of parse errors (public API)
 #[derive(Debug, Clone)]
 pub enum ParseErrorKind {
+    /// Frame header requires 9 bytes but the buffer is shorter
     Http2BufferTooSmall,
+    /// HPACK decompression failed (detail in the `String`)
     Http2HpackError(String),
+    /// HEADERS block is split across CONTINUATION frames that have not all
+    /// arrived yet
     Http2HeadersIncomplete,
+    /// Decoded header list exceeds the configured size limit
     Http2HeaderListTooLarge,
+    /// Request stream completed without a `:method` pseudo-header
     Http2NoMethod,
+    /// Request stream completed without a `:path` pseudo-header
     Http2NoPath,
+    /// Response stream completed without a `:status` pseudo-header
     Http2NoStatus,
+    /// Frame could not be classified or has an invalid structure
     Http2InvalidFrame,
     /// Rejected because max concurrent streams limit was reached
     Http2MaxConcurrentStreams,
@@ -584,11 +611,14 @@ impl std::fmt::Display for ParseErrorKind {
 /// Parse error with optional stream context (public API)
 #[derive(Debug, Clone)]
 pub struct ParseError {
+    /// What went wrong
     pub kind:      ParseErrorKind,
+    /// The stream that caused the error, if applicable
     pub stream_id: Option<StreamId>,
 }
 
 impl ParseError {
+    /// Create a connection-level parse error (no specific stream).
     pub fn new(kind: ParseErrorKind) -> Self {
         Self {
             kind,
@@ -596,6 +626,7 @@ impl ParseError {
         }
     }
 
+    /// Create a stream-level parse error with the offending stream ID.
     pub fn with_stream(kind: ParseErrorKind, stream_id: StreamId) -> Self {
         Self {
             kind,

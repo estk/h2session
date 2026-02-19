@@ -2,6 +2,10 @@
 name = "h2session"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Stateful HTTP/2 frame parser with HPACK support for passive traffic monitoring"
+keywords = ["http2", "hpack", "parser", "network", "monitoring"]
+categories = ["network-programming", "parser-implementations"]
 
 [features]
 tracing = ["dep:tracing"]

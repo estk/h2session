@@ -13,30 +13,34 @@ use crate::{
 /// Protocol detected for a connection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
+    /// Protocol has not been identified yet
     Unknown,
+    /// HTTP/1.x (HTTP/1.0 or HTTP/1.1)
     Http1,
+    /// HTTP/2
     Http2,
 }
 
 /// A chunk of data received from a data source
 #[derive(Debug, Clone)]
-pub struct DataChunk {
-    pub data:         Bytes,
-    pub timestamp_ns: TimestampNs,
-    pub direction:    Direction,
+pub(crate) struct DataChunk {
+    pub(crate) data:         Bytes,
+    pub(crate) timestamp_ns: TimestampNs,
+    #[allow(dead_code)]
+    pub(crate) direction:    Direction,
 }
 
 /// Tracks state for a single connection
-pub struct Connection {
-    pub process_id:        u32,
+pub(crate) struct Connection {
+    pub(crate) process_id:        u32,
     /// Remote port, None if unavailable (e.g., SSL without socket fd)
-    pub remote_port:       Option<u16>,
-    pub protocol:          Protocol,
-    pub request_chunks:    Vec<DataChunk>,
-    pub response_chunks:   Vec<DataChunk>,
-    pub last_activity_ns:  TimestampNs,
-    pub request_complete:  bool,
-    pub response_complete: bool,
+    pub(crate) remote_port:       Option<u16>,
+    pub(crate) protocol:          Protocol,
+    pub(crate) request_chunks:    Vec<DataChunk>,
+    pub(crate) response_chunks:   Vec<DataChunk>,
+    pub(crate) last_activity_ns:  TimestampNs,
+    pub(crate) request_complete:  bool,
+    pub(crate) response_complete: bool,
 
     // HTTP/1 growable buffers — new data is appended as it arrives, avoiding
     // repeated clone-and-concatenate of all previous chunks.
@@ -74,7 +78,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub fn new(process_id: u32, remote_port: u16) -> Self {
+    pub(crate) fn new(process_id: u32, remote_port: u16) -> Self {
         Self {
             process_id,
             // Store None for port 0 (unavailable from SSL)

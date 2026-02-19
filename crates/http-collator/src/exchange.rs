@@ -10,7 +10,9 @@ use crate::{
 /// Classification of parsed HTTP message
 #[derive(Debug, Clone)]
 pub enum ParsedHttpMessage {
+    /// A parsed HTTP request
     Request(HttpRequest),
+    /// A parsed HTTP response
     Response(HttpResponse),
 }
 
@@ -64,7 +66,9 @@ pub struct MessageMetadata {
 pub enum CollationEvent {
     /// Individual message parsed and ready for processing
     Message {
+        /// The parsed HTTP message (request or response)
         message:  ParsedHttpMessage,
+        /// Connection and timing metadata for this message
         metadata: MessageMetadata,
     },
     /// Complete exchange with latency (request + response matched)
@@ -151,10 +155,15 @@ impl CollatorConfig {
 /// A complete request/response exchange
 #[derive(Debug)]
 pub struct Exchange {
+    /// The HTTP request
     pub request:     HttpRequest,
+    /// The matched HTTP response
     pub response:    HttpResponse,
+    /// Time between request completion and response start, in nanoseconds
     pub latency_ns:  u64,
+    /// Protocol used for this exchange
     pub protocol:    Protocol,
+    /// OS process ID that handled this connection
     pub process_id:  u32,
     /// Remote port, None if unavailable (e.g., SSL without socket fd)
     pub remote_port: Option<u16>,

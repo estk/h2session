@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! HTTP collation library
 //!
 //! Collates individual data events (from eBPF, pcap, etc.) into complete
@@ -8,35 +9,54 @@
 //! Implement the [`DataEvent`] trait for your data source, then feed events
 //! to the [`Collator`]:
 //!
-//! ```ignore
-//! use http_collator::{Collator, DataEvent, Direction};
+//! ```no_run
+//! use http_collator::{Collator, CollationEvent, DataEvent, Direction};
+//! use bytes::Bytes;
 //!
-//! struct MyEvent { /* ... */ }
-//!
-//! impl DataEvent for MyEvent {
-//!     fn payload(&self) -> &[u8] { /* ... */ }
-//!     fn timestamp_ns(&self) -> u64 { /* ... */ }
-//!     fn direction(&self) -> Direction { /* ... */ }
-//!     fn connection_id(&self) -> u64 { /* ... */ }
-//!     fn process_id(&self) -> u32 { /* ... */ }
-//!     fn remote_port(&self) -> u16 { /* ... */ }
+//! struct MyEvent {
+//!     payload: Vec<u8>,
+//!     timestamp_ns: u64,
+//!     direction: Direction,
+//!     connection_id: u64,
+//!     process_id: u32,
+//!     remote_port: u16,
 //! }
 //!
-//! let mut collator = Collator::new();
-//! if let Some(exchange) = collator.add_event(my_event) {
-//!     println!("Complete exchange: {}", exchange);
+//! impl DataEvent for MyEvent {
+//!     fn payload(&self) -> &[u8] { &self.payload }
+//!     fn timestamp_ns(&self) -> u64 { self.timestamp_ns }
+//!     fn direction(&self) -> Direction { self.direction }
+//!     fn connection_id(&self) -> u64 { self.connection_id }
+//!     fn process_id(&self) -> u32 { self.process_id }
+//!     fn remote_port(&self) -> u16 { self.remote_port }
+//! }
+//!
+//! let collator = Collator::<MyEvent>::new();
+//! # let my_event = MyEvent { payload: vec![], timestamp_ns: 0, direction: Direction::Write, connection_id: 1, process_id: 1, remote_port: 80 };
+//! for event in collator.add_event(my_event) {
+//!     match event {
+//!         CollationEvent::Message { message, metadata } => {
+//!             println!("parsed message for conn {}", metadata.connection_id);
+//!         }
+//!         CollationEvent::Exchange(exchange) => {
+//!             println!("complete exchange: {exchange}");
+//!         }
+//!     }
 //! }
 //! ```
 
 mod connection;
 mod exchange;
+#[cfg(feature = "_internal-h1")]
 pub mod h1;
+#[cfg(not(feature = "_internal-h1"))]
+mod h1;
 mod traits;
 
 use std::marker::PhantomData;
 
-use connection::Connection as Conn;
-pub use connection::{Connection, DataChunk, Protocol};
+pub use connection::Protocol;
+use connection::{Connection as Conn, DataChunk};
 use dashmap::DashMap;
 pub use exchange::{CollationEvent, CollatorConfig, Exchange, MessageMetadata, ParsedHttpMessage};
 pub use h1::{HttpRequest, HttpResponse};
@@ -584,6 +604,11 @@ fn reset_connection_for_protocol_change(conn: &mut Conn, new_protocol: Protocol)
     conn.protocol = new_protocol;
 }
 
+/// Detect whether raw bytes look like HTTP/1.x or HTTP/2 traffic.
+///
+/// Checks for the HTTP/2 connection preface, HTTP/2 frame headers,
+/// and HTTP/1.x request/response patterns. Returns [`Protocol::Unknown`]
+/// if no pattern matches.
 pub fn detect_protocol(data: &[u8]) -> Protocol {
     // Check for HTTP/2 preface
     if is_http2_preface(data) {

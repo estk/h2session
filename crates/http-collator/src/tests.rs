@@ -173,14 +173,13 @@ fn build_data_frame(stream_id: u32, data: &[u8], end_stream: bool) -> Vec<u8> {
 
 /// Build HPACK for a complete GET request
 fn hpack_get_request() -> Vec<u8> {
-    let mut block = Vec::new();
-    block.push(0x82); // :method: GET (static index 2)
-    block.push(0x87); // :scheme: https (static index 7)
-    block.push(0x84); // :path: / (static index 4)
-    // :authority literal without indexing (0x00 + name index 1 (from :authority))
-    // Index 1 is :authority in static table, so use 0x01 for indexed name
-    block.push(0x01); // Indexed name :authority (index 1)
-    block.push(0x0b); // Value length 11
+    let mut block = vec![
+        0x82, // :method: GET (static index 2)
+        0x87, // :scheme: https (static index 7)
+        0x84, // :path: / (static index 4)
+        0x01, // Indexed name :authority (index 1)
+        0x0b, // Value length 11
+    ];
     block.extend_from_slice(b"example.com");
     block
 }
@@ -285,10 +284,10 @@ fn test_h2_large_payload_exceeding_max_buf_size() {
 
     // Should have emitted a request Message with the full 32KB body
     let request_msg = events.iter().find_map(|e| {
-        if let Some((msg, _)) = e.as_message() {
-            if msg.is_request() {
-                return Some(msg.clone());
-            }
+        if let Some((msg, _)) = e.as_message()
+            && msg.is_request()
+        {
+            return Some(msg.clone());
         }
         None
     });
@@ -378,10 +377,10 @@ fn test_h2_fd_reuse_resets_parser_on_new_preface() {
 
     // Should have emitted a request Message for the second connection
     let request_msg = events2.iter().find_map(|e| {
-        if let Some((msg, _)) = e.as_message() {
-            if msg.is_request() {
-                return Some(msg.clone());
-            }
+        if let Some((msg, _)) = e.as_message()
+            && msg.is_request()
+        {
+            return Some(msg.clone());
         }
         None
     });
@@ -471,12 +470,13 @@ fn test_h2_fd_reuse_split_chunks_with_response() {
     let body = vec![0x42u8; 32768]; // 32KB of 'B'
 
     // Use a POST request HPACK block
-    let mut post_hpack = Vec::new();
-    post_hpack.push(0x83); // :method: POST (static index 3)
-    post_hpack.push(0x87); // :scheme: https (static index 7)
-    post_hpack.push(0x84); // :path: / (static index 4)
-    post_hpack.push(0x01); // :authority indexed name
-    post_hpack.push(0x0b); // value length 11
+    let mut post_hpack = vec![
+        0x83, // :method: POST (static index 3)
+        0x87, // :scheme: https (static index 7)
+        0x84, // :path: / (static index 4)
+        0x01, // :authority indexed name
+        0x0b, // value length 11
+    ];
     post_hpack.extend_from_slice(b"example.com");
 
     let mut full_request = H2_PREFACE.to_vec();
@@ -937,10 +937,10 @@ fn test_h2_server_side_monitoring() {
 
     // Should have emitted a request Message event
     let request_msg = events.iter().find_map(|e| {
-        if let Some((msg, _)) = e.as_message() {
-            if msg.is_request() {
-                return Some(msg.clone());
-            }
+        if let Some((msg, _)) = e.as_message()
+            && msg.is_request()
+        {
+            return Some(msg.clone());
         }
         None
     });
@@ -1287,7 +1287,7 @@ fn test_close_connection_finalizes_http1_response() {
     assert!(
         !events
             .iter()
-            .any(|e| { e.as_message().map_or(false, |(msg, _)| msg.is_response()) }),
+            .any(|e| { e.as_message().is_some_and(|(msg, _)| msg.is_response()) }),
         "Response without framing should not be emitted yet"
     );
 
@@ -1297,7 +1297,7 @@ fn test_close_connection_finalizes_http1_response() {
     // Should have emitted the response and/or exchange
     let has_response = close_events
         .iter()
-        .any(|e| e.as_message().map_or(false, |(msg, _)| msg.is_response()));
+        .any(|e| e.as_message().is_some_and(|(msg, _)| msg.is_response()));
     let has_exchange = close_events.iter().any(|e| e.is_exchange());
     assert!(
         has_response || has_exchange,

@@ -173,6 +173,7 @@ impl<E: DataEvent> Collator<E> {
 
     /// Core event processing logic, called with a mutable reference to the
     /// connection (obtained from a `DashMap` entry guard).
+    #[allow(clippy::too_many_arguments)]
     fn process_event_for_conn(
         conn: &mut Conn,
         chunk: DataChunk,

@@ -47,10 +47,7 @@
 
 mod connection;
 mod exchange;
-#[cfg(feature = "_internal-h1")]
 pub mod h1;
-#[cfg(not(feature = "_internal-h1"))]
-mod h1;
 mod traits;
 
 use std::marker::PhantomData;

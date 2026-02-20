@@ -471,7 +471,7 @@ impl ParsedH2Message {
             headers:      self.http_headers(),
             body:         self.body.clone(),
             timestamp_ns: self.end_stream_timestamp_ns,
-            version:      None,
+            version:      Some(2),
         })
     }
 
@@ -486,7 +486,7 @@ impl ParsedH2Message {
             headers:      self.http_headers(),
             body:         self.body.clone(),
             timestamp_ns: self.first_frame_timestamp_ns,
-            version:      None,
+            version:      Some(2),
             reason:       None,
         })
     }

@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "h2session"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "dashmap",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "http-collator"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "dashmap",

@@ -44,8 +44,8 @@ pub(crate) struct Connection {
 
     // HTTP/1 growable buffers — new data is appended as it arrives, avoiding
     // repeated clone-and-concatenate of all previous chunks.
-    pub(crate) h1_request_buffer:  Vec<u8>,
-    pub(crate) h1_response_buffer: Vec<u8>,
+    pub(crate) h1_write_buffer: Vec<u8>,
+    pub(crate) h1_read_buffer:  Vec<u8>,
 
     // Accumulated body size per direction for enforcing max_body_size limit
     pub(crate) request_body_size:  usize,
@@ -54,6 +54,11 @@ pub(crate) struct Connection {
     // HTTP/1 parsed messages (when complete)
     pub(crate) h1_request:  Option<HttpRequest>,
     pub(crate) h1_response: Option<HttpResponse>,
+
+    // HTTP/1 per-direction parse tracking — have we extracted a message from
+    // this direction's buffer? Prevents redundant re-parsing on subsequent chunks.
+    pub(crate) h1_write_parsed: bool,
+    pub(crate) h1_read_parsed:  bool,
 
     // HTTP/1 emission tracking - have we already emitted Message events for these?
     pub(crate) h1_request_emitted:  bool,
@@ -93,12 +98,14 @@ impl Connection {
             last_activity_ns: TimestampNs(0),
             request_complete: false,
             response_complete: false,
-            h1_request_buffer: Vec::new(),
-            h1_response_buffer: Vec::new(),
+            h1_write_buffer: Vec::new(),
+            h1_read_buffer: Vec::new(),
             request_body_size: 0,
             response_body_size: 0,
             h1_request: None,
             h1_response: None,
+            h1_write_parsed: false,
+            h1_read_parsed: false,
             h1_request_emitted: false,
             h1_response_emitted: false,
             h2_write_state: H2ConnectionState::new(),

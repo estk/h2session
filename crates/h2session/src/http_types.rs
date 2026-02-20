@@ -20,6 +20,9 @@ pub struct HttpRequest {
     pub body:         Vec<u8>,
     /// When this request was observed (nanosecond monotonic timestamp)
     pub timestamp_ns: TimestampNs,
+    /// HTTP version: None for HTTP/2, Some(0) for HTTP/1.0, Some(1) for
+    /// HTTP/1.1
+    pub version:      Option<u8>,
 }
 
 /// HTTP response parsed from any HTTP version
@@ -33,4 +36,9 @@ pub struct HttpResponse {
     pub body:         Vec<u8>,
     /// When this response was observed (nanosecond monotonic timestamp)
     pub timestamp_ns: TimestampNs,
+    /// HTTP version: None for HTTP/2, Some(0) for HTTP/1.0, Some(1) for
+    /// HTTP/1.1
+    pub version:      Option<u8>,
+    /// Reason phrase: None for HTTP/2, Some("OK") etc for HTTP/1
+    pub reason:       Option<String>,
 }

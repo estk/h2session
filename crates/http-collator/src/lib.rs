@@ -235,23 +235,34 @@ impl<E: DataEvent> Collator<E> {
                     return Vec::new();
                 }
 
-                if conn.protocol == Protocol::Http1 {
-                    conn.h1_request_buffer.extend_from_slice(buf);
+                // Buffer for HTTP/1 and Unknown (Unknown may resolve to Http1)
+                if conn.protocol == Protocol::Http1 || conn.protocol == Protocol::Unknown {
+                    conn.h1_write_buffer.extend_from_slice(buf);
                 }
                 conn.request_chunks.push(chunk);
 
                 match conn.protocol {
-                    Protocol::Http1 if conn.h1_request.is_none() => {
-                        try_parse_http1_request_chunks(conn);
+                    Protocol::Http1 if !conn.h1_write_parsed => {
+                        try_parse_http1_write_chunks(conn);
                     },
                     Protocol::Http2 => {
                         parse_http2_chunks(conn, direction);
                     },
+                    // For Unknown protocol, try HTTP/1 parsing — handles non-standard
+                    // methods (WebDAV, etc.) that detect_protocol() doesn't recognize.
+                    Protocol::Unknown => {
+                        try_parse_http1_unknown_write(conn);
+                    },
                     _ => {},
                 }
 
+                // Content-based parsing: a response can be parsed from the
+                // Write direction (server-side), so check both.
                 if is_request_complete(conn) {
                     conn.request_complete = true;
+                }
+                if is_response_complete(conn) {
+                    conn.response_complete = true;
                 }
             },
             Direction::Read => {
@@ -261,21 +272,32 @@ impl<E: DataEvent> Collator<E> {
                     return Vec::new();
                 }
 
-                if conn.protocol == Protocol::Http1 {
-                    conn.h1_response_buffer.extend_from_slice(buf);
+                // Buffer for HTTP/1 and Unknown (Unknown may resolve to Http1)
+                if conn.protocol == Protocol::Http1 || conn.protocol == Protocol::Unknown {
+                    conn.h1_read_buffer.extend_from_slice(buf);
                 }
                 conn.response_chunks.push(chunk);
 
                 match conn.protocol {
-                    Protocol::Http1 if conn.h1_response.is_none() => {
-                        try_parse_http1_response_chunks(conn);
+                    Protocol::Http1 if !conn.h1_read_parsed => {
+                        try_parse_http1_read_chunks(conn);
                     },
                     Protocol::Http2 => {
                         parse_http2_chunks(conn, direction);
                     },
+                    // For Unknown protocol, try HTTP/1 parsing — handles non-standard
+                    // methods (WebDAV, etc.) that detect_protocol() doesn't recognize.
+                    Protocol::Unknown => {
+                        try_parse_http1_unknown_read(conn);
+                    },
                     _ => {},
                 }
 
+                // Content-based parsing: a request can be parsed from the
+                // Read direction (server-side), so check both.
+                if is_request_complete(conn) {
+                    conn.request_complete = true;
+                }
                 if is_response_complete(conn) {
                     conn.response_complete = true;
                 }
@@ -387,14 +409,14 @@ fn finalize_and_emit(
     // Finalize any pending HTTP/1 response with body accumulated so far
     if conn.protocol == Protocol::Http1
         && conn.h1_response.is_none()
-        && !conn.h1_response_buffer.is_empty()
+        && !conn.h1_read_buffer.is_empty()
     {
         let timestamp = conn
             .response_chunks
             .first()
             .map(|c| c.timestamp_ns)
             .unwrap_or(TimestampNs(0));
-        conn.h1_response = h1::try_finalize_http1_response(&conn.h1_response_buffer, timestamp);
+        conn.h1_response = h1::try_finalize_http1_response(&conn.h1_read_buffer, timestamp);
         if conn.h1_response.is_some() {
             conn.response_complete = true;
         }
@@ -527,10 +549,12 @@ fn reset_connection_after_exchange(conn: &mut Conn) {
         conn.response_chunks.clear();
         conn.h1_request = None;
         conn.h1_response = None;
+        conn.h1_write_parsed = false;
+        conn.h1_read_parsed = false;
         conn.h1_request_emitted = false;
         conn.h1_response_emitted = false;
-        conn.h1_request_buffer.clear();
-        conn.h1_response_buffer.clear();
+        conn.h1_write_buffer.clear();
+        conn.h1_read_buffer.clear();
         conn.protocol = Protocol::Unknown;
     } else if conn.protocol == Protocol::Http2 {
         // HTTP/2: only clear chunks if no other pending messages remain.
@@ -556,10 +580,12 @@ fn reset_connection_after_exchange(conn: &mut Conn) {
 fn reset_connection_body_limit(conn: &mut Conn) {
     conn.request_chunks.clear();
     conn.response_chunks.clear();
-    conn.h1_request_buffer.clear();
-    conn.h1_response_buffer.clear();
+    conn.h1_write_buffer.clear();
+    conn.h1_read_buffer.clear();
     conn.h1_request = None;
     conn.h1_response = None;
+    conn.h1_write_parsed = false;
+    conn.h1_read_parsed = false;
     conn.h1_request_emitted = false;
     conn.h1_response_emitted = false;
     conn.h2_write_state = H2ConnectionState::new();
@@ -581,10 +607,12 @@ fn reset_connection_body_limit(conn: &mut Conn) {
 fn reset_connection_for_protocol_change(conn: &mut Conn, new_protocol: Protocol) {
     conn.request_chunks.clear();
     conn.response_chunks.clear();
-    conn.h1_request_buffer.clear();
-    conn.h1_response_buffer.clear();
+    conn.h1_write_buffer.clear();
+    conn.h1_read_buffer.clear();
     conn.h1_request = None;
     conn.h1_response = None;
+    conn.h1_write_parsed = false;
+    conn.h1_read_parsed = false;
     conn.h1_request_emitted = false;
     conn.h1_response_emitted = false;
     conn.h2_write_state = H2ConnectionState::new();
@@ -702,26 +730,76 @@ fn find_complete_h2_stream(conn: &Conn) -> Option<StreamId> {
     conn.ready_streams.iter().next().copied()
 }
 
-/// Try to parse HTTP/1 request from accumulated buffer.
-/// If complete, stores the parsed request in conn.h1_request.
-fn try_parse_http1_request_chunks(conn: &mut Conn) {
+/// Try to parse HTTP/1 message from accumulated write-direction buffer.
+/// Tries request first (client-side), then response (server-side).
+fn try_parse_http1_write_chunks(conn: &mut Conn) {
     let timestamp = conn
         .request_chunks
         .last()
         .map(|c| c.timestamp_ns)
         .unwrap_or(TimestampNs(0));
-    conn.h1_request = h1::try_parse_http1_request(&conn.h1_request_buffer, timestamp);
+    if let Some(req) = h1::try_parse_http1_request(&conn.h1_write_buffer, timestamp) {
+        conn.h1_request = Some(req);
+        conn.h1_write_parsed = true;
+    } else if let Some(resp) = h1::try_parse_http1_response(&conn.h1_write_buffer, timestamp) {
+        conn.h1_response = Some(resp);
+        conn.h1_write_parsed = true;
+    }
 }
 
-/// Try to parse HTTP/1 response from accumulated buffer.
-/// If complete, stores the parsed response in conn.h1_response.
-fn try_parse_http1_response_chunks(conn: &mut Conn) {
+/// Try to parse HTTP/1 message from accumulated read-direction buffer.
+/// Tries response first (client-side), then request (server-side).
+fn try_parse_http1_read_chunks(conn: &mut Conn) {
     let timestamp = conn
         .response_chunks
         .first()
         .map(|c| c.timestamp_ns)
         .unwrap_or(TimestampNs(0));
-    conn.h1_response = h1::try_parse_http1_response(&conn.h1_response_buffer, timestamp);
+    if let Some(resp) = h1::try_parse_http1_response(&conn.h1_read_buffer, timestamp) {
+        conn.h1_response = Some(resp);
+        conn.h1_read_parsed = true;
+    } else if let Some(req) = h1::try_parse_http1_request(&conn.h1_read_buffer, timestamp) {
+        conn.h1_request = Some(req);
+        conn.h1_read_parsed = true;
+    }
+}
+
+/// Try HTTP/1 parsing on Unknown-protocol write buffer. If successful,
+/// promotes the connection to Http1.
+fn try_parse_http1_unknown_write(conn: &mut Conn) {
+    let timestamp = conn
+        .request_chunks
+        .last()
+        .map(|c| c.timestamp_ns)
+        .unwrap_or(TimestampNs(0));
+    if let Some(req) = h1::try_parse_http1_request(&conn.h1_write_buffer, timestamp) {
+        conn.protocol = Protocol::Http1;
+        conn.h1_request = Some(req);
+        conn.h1_write_parsed = true;
+    } else if let Some(resp) = h1::try_parse_http1_response(&conn.h1_write_buffer, timestamp) {
+        conn.protocol = Protocol::Http1;
+        conn.h1_response = Some(resp);
+        conn.h1_write_parsed = true;
+    }
+}
+
+/// Try HTTP/1 parsing on Unknown-protocol read buffer. If successful,
+/// promotes the connection to Http1.
+fn try_parse_http1_unknown_read(conn: &mut Conn) {
+    let timestamp = conn
+        .response_chunks
+        .first()
+        .map(|c| c.timestamp_ns)
+        .unwrap_or(TimestampNs(0));
+    if let Some(resp) = h1::try_parse_http1_response(&conn.h1_read_buffer, timestamp) {
+        conn.protocol = Protocol::Http1;
+        conn.h1_response = Some(resp);
+        conn.h1_read_parsed = true;
+    } else if let Some(req) = h1::try_parse_http1_request(&conn.h1_read_buffer, timestamp) {
+        conn.protocol = Protocol::Http1;
+        conn.h1_request = Some(req);
+        conn.h1_read_parsed = true;
+    }
 }
 
 fn is_request_complete(conn: &Conn) -> bool {

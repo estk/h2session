@@ -672,12 +672,15 @@ fn test_exchange_display_port(#[case] remote_port: Option<u16>, #[case] expected
             headers:      http::HeaderMap::new(),
             body:         vec![],
             timestamp_ns: TimestampNs(0),
+            version:      None,
         },
         response: HttpResponse {
             status:       http::StatusCode::OK,
             headers:      http::HeaderMap::new(),
             body:         vec![],
             timestamp_ns: TimestampNs(0),
+            version:      None,
+            reason:       None,
         },
         latency_ns: 1_000_000,
         protocol: Protocol::Http2,
@@ -1277,4 +1280,191 @@ fn test_close_connection_finalizes_http1_response() {
         collator.connections.get(&1).is_none(),
         "Connection should be removed after close"
     );
+}
+
+// =========================================================================
+// Server-side HTTP/1 (request on Read, response on Write)
+// =========================================================================
+
+#[test]
+fn test_h1_server_side_request_on_read() {
+    let collator: Collator<TestEvent> = Collator::new();
+
+    // Server receives request on Read direction (from client)
+    let req_event = make_event(
+        Direction::Read,
+        1,
+        1234,
+        8080,
+        1_000_000,
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+    let events = collator.add_event(req_event);
+
+    // Should have parsed the request even though it arrived on Read
+    let has_request = events
+        .iter()
+        .any(|e| e.as_message().is_some_and(|(msg, _)| msg.is_request()));
+    assert!(
+        has_request,
+        "Server should see request arriving on Read direction"
+    );
+}
+
+#[test]
+fn test_h1_server_side_full_exchange() {
+    let collator: Collator<TestEvent> = Collator::new();
+
+    // Server receives request on Read
+    let req_event = make_event(
+        Direction::Read,
+        1,
+        1234,
+        8080,
+        1_000_000,
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+    let _ = collator.add_event(req_event);
+
+    // Server sends response on Write
+    let resp_event = make_event(
+        Direction::Write,
+        1,
+        1234,
+        8080,
+        2_000_000,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+    );
+    let events = collator.add_event(resp_event);
+
+    // Should produce both a response Message and an Exchange
+    let has_response = events
+        .iter()
+        .any(|e| e.as_message().is_some_and(|(msg, _)| msg.is_response()));
+    let has_exchange = events.iter().any(|e| e.is_exchange());
+    assert!(has_response, "Server should emit response on Write");
+    assert!(has_exchange, "Server-side exchange should complete");
+}
+
+// =========================================================================
+// Unknown protocol with non-standard method parsed as HTTP/1
+// =========================================================================
+
+#[test]
+fn test_unknown_protocol_webdav_propfind() {
+    let collator: Collator<TestEvent> = Collator::with_config(CollatorConfig::messages_only());
+
+    // PROPFIND is not recognized by detect_protocol (not in the standard
+    // method list), so the connection starts as Unknown. The collator
+    // should still parse it via the Unknown→Http1 fallback.
+    let event = make_event(
+        Direction::Write,
+        1,
+        1234,
+        8080,
+        1_000_000,
+        b"PROPFIND / HTTP/1.1\r\nHost: example.com\r\nDepth: 1\r\n\r\n",
+    );
+    let events = collator.add_event(event);
+
+    assert_eq!(events.len(), 1, "PROPFIND should be parsed as HTTP/1");
+    let (msg, metadata) = events[0].as_message().expect("Should be a Message");
+    assert!(msg.is_request());
+    assert_eq!(
+        metadata.protocol,
+        Protocol::Http1,
+        "Protocol should be promoted to Http1"
+    );
+
+    // Verify the connection was promoted
+    let conn = collator.connections.get(&1).unwrap();
+    assert_eq!(conn.protocol, Protocol::Http1);
+}
+
+#[test]
+fn test_unknown_protocol_webdav_mkcol() {
+    let collator: Collator<TestEvent> = Collator::with_config(CollatorConfig::messages_only());
+
+    let event = make_event(
+        Direction::Write,
+        1,
+        1234,
+        8080,
+        1_000_000,
+        b"MKCOL /newdir HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+    let events = collator.add_event(event);
+
+    assert_eq!(events.len(), 1, "MKCOL should be parsed as HTTP/1");
+    let (msg, _) = events[0].as_message().expect("Should be a Message");
+    assert!(msg.is_request());
+}
+
+// =========================================================================
+// HTTP/1 version and reason fields populated correctly
+// =========================================================================
+
+#[test]
+fn test_h1_version_and_reason_populated() {
+    let collator: Collator<TestEvent> = Collator::with_config(CollatorConfig::messages_only());
+
+    // Send HTTP/1.1 request
+    let req_event = make_event(
+        Direction::Write,
+        1,
+        1234,
+        8080,
+        1_000_000,
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+    let events = collator.add_event(req_event);
+    let (msg, _) = events[0].as_message().unwrap();
+    let req = msg.as_request().unwrap();
+    assert_eq!(req.version, Some(1), "HTTP/1.1 should have version=Some(1)");
+
+    // Send HTTP/1.1 response
+    let resp_event = make_event(
+        Direction::Read,
+        1,
+        1234,
+        8080,
+        2_000_000,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n",
+    );
+    let events = collator.add_event(resp_event);
+    let (msg, _) = events[0].as_message().unwrap();
+    let resp = msg.as_response().unwrap();
+    assert_eq!(
+        resp.version,
+        Some(1),
+        "HTTP/1.1 should have version=Some(1)"
+    );
+    assert_eq!(
+        resp.reason.as_deref(),
+        Some("OK"),
+        "Reason phrase should be preserved"
+    );
+}
+
+#[test]
+fn test_h1_version_10() {
+    let collator: Collator<TestEvent> = Collator::with_config(CollatorConfig::messages_only());
+
+    let resp_event = make_event(
+        Direction::Read,
+        1,
+        1234,
+        8080,
+        1_000_000,
+        b"HTTP/1.0 301 Moved Permanently\r\nContent-Length: 0\r\n\r\n",
+    );
+    let events = collator.add_event(resp_event);
+    let (msg, _) = events[0].as_message().unwrap();
+    let resp = msg.as_response().unwrap();
+    assert_eq!(
+        resp.version,
+        Some(0),
+        "HTTP/1.0 should have version=Some(0)"
+    );
+    assert_eq!(resp.reason.as_deref(), Some("Moved Permanently"));
 }

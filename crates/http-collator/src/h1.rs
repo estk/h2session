@@ -59,6 +59,7 @@ pub fn try_parse_http1_request(data: &[u8], timestamp_ns: TimestampNs) -> Option
         headers: header_map,
         body,
         timestamp_ns,
+        version: Some(req.version?),
     })
 }
 
@@ -97,6 +98,8 @@ pub fn try_parse_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Optio
         headers: header_map,
         body,
         timestamp_ns,
+        version: Some(res.version?),
+        reason: res.reason.map(String::from),
     })
 }
 
@@ -134,6 +137,8 @@ pub fn try_finalize_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Op
         headers: header_map,
         body,
         timestamp_ns,
+        version: Some(res.version?),
+        reason: res.reason.map(String::from),
     })
 }
 

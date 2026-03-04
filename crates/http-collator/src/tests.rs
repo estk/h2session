@@ -9,7 +9,7 @@ struct TestEvent {
     payload:      Vec<u8>,
     timestamp_ns: u64,
     direction:    Direction,
-    conn_id:      u64,
+    conn_id:      u128,
     process_id:   u32,
     remote_port:  u16,
 }
@@ -27,7 +27,7 @@ impl DataEvent for TestEvent {
         self.direction
     }
 
-    fn connection_id(&self) -> u64 {
+    fn connection_id(&self) -> u128 {
         self.conn_id
     }
 
@@ -43,7 +43,7 @@ impl DataEvent for TestEvent {
 /// Helper to create a test event
 fn make_event(
     direction: Direction,
-    conn_id: u64,
+    conn_id: u128,
     process_id: u32,
     remote_port: u16,
     timestamp_ns: u64,
@@ -194,7 +194,7 @@ fn hpack_status_200() -> Vec<u8> {
 #[test]
 fn test_h2_incremental_parsing_no_body_duplication() {
     let mut collator: Collator<TestEvent> = Collator::new();
-    let conn_id = 12345u64;
+    let conn_id = 12345u128;
     let process_id = 1000u32;
 
     // Build HTTP/2 request: preface + settings + headers + data in chunks
@@ -256,7 +256,7 @@ fn test_h2_incremental_parsing_no_body_duplication() {
 #[test]
 fn test_h2_large_payload_exceeding_max_buf_size() {
     let mut collator: Collator<TestEvent> = Collator::new();
-    let conn_id = 54321u64;
+    let conn_id = 54321u128;
     let process_id = 4000u32;
 
     // Build a single buffer containing: preface + settings + headers + 32KB DATA
@@ -320,7 +320,7 @@ fn test_h2_large_payload_exceeding_max_buf_size() {
 #[test]
 fn test_h2_fd_reuse_resets_parser_on_new_preface() {
     let mut collator: Collator<TestEvent> = Collator::new();
-    let conn_id = 88888u64;
+    let conn_id = 88888u128;
     let process_id = 5000u32;
 
     // --- First exchange on this connection_id ---
@@ -408,7 +408,7 @@ fn test_h2_fd_reuse_resets_parser_on_new_preface() {
 #[test]
 fn test_h2_fd_reuse_split_chunks_with_response() {
     let mut collator: Collator<TestEvent> = Collator::new();
-    let conn_id = 88889u64;
+    let conn_id = 88889u128;
     let process_id = 5001u32;
 
     // --- First exchange: small GET on stream 1 (server-side monitoring) ---
@@ -580,7 +580,7 @@ fn test_h2_fd_reuse_split_chunks_with_response() {
 #[test]
 fn test_h2_per_stream_latency() {
     let mut collator: Collator<TestEvent> = Collator::new();
-    let conn_id = 99999u64;
+    let conn_id = 99999u128;
     let process_id = 2000u32;
 
     // Request at t=1_000_000_000 (1 second)
@@ -873,7 +873,7 @@ fn test_h2_server_side_monitoring() {
     // client) This is inverted from client-side monitoring where Write =
     // request, Read = response
     let mut collator: Collator<TestEvent> = Collator::new();
-    let conn_id = 77777u64;
+    let conn_id = 77777u128;
     let process_id = 3000u32;
 
     // Server receives request on Read (from client)
@@ -1024,7 +1024,7 @@ fn test_cleanup_removes_stale_connections() {
 #[test]
 fn test_cleanup_evicts_stale_h2_streams() {
     let mut collator: Collator<TestEvent> = Collator::new();
-    let conn_id = 42u64;
+    let conn_id = 42u128;
 
     // Send H2 preface + settings + HEADERS (no END_STREAM) at t=1s
     let hpack = hpack_get_request();
@@ -1150,7 +1150,7 @@ fn test_body_size_limit_normal_request_works() {
 #[test]
 fn test_fd_reuse_http2_to_http1() {
     let mut collator: Collator<TestEvent> = Collator::new();
-    let conn_id = 55555u64;
+    let conn_id = 55555u128;
 
     // First: HTTP/2 exchange
     let hpack = hpack_get_request();
@@ -1467,4 +1467,89 @@ fn test_h1_version_10() {
         "HTTP/1.0 should have version=Some(0)"
     );
     assert_eq!(resp.reason.as_deref(), Some("Moved Permanently"));
+}
+
+// =========================================================================
+// HTTP/1.1 keep-alive pipelining on the same connection_id
+// =========================================================================
+//
+// Regression for an http-collator bug: when two complete HTTP/1 requests
+// arrive on the same connection_id (keep-alive + pipelining, or back-to-back
+// request-then-response-then-next-request), the second request never
+// surfaces as a `Message` event. The h1_*_parsed and h1_*_emitted flags
+// latch on the first parse, `reset_connection_after_exchange` only fires
+// when a matching response has also been observed, and between those two
+// events every incoming byte is appended to the buffer and then silently
+// dropped on the floor.
+//
+// This manifests in sysrasp as events_count=0 for 99%+ of SSL reads under
+// loadgen keep-alive traffic.
+
+#[test]
+fn test_h1_two_pipelined_requests_on_same_connection() {
+    let mut collator: Collator<TestEvent> = Collator::new();
+
+    let ev1 = make_event(
+        Direction::Read,
+        42,
+        1234,
+        443,
+        1_000_000,
+        b"GET /first HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+    let events1 = collator.add_event(ev1);
+    assert_eq!(
+        events1.len(),
+        1,
+        "first request must surface as a Message event, got: {events1:?}"
+    );
+    let (msg1, _) = events1[0].as_message().unwrap();
+    assert_eq!(msg1.as_request().unwrap().uri.path(), "/first");
+
+    let ev2 = make_event(
+        Direction::Read,
+        42,
+        1234,
+        443,
+        2_000_000,
+        b"GET /second HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+    let events2 = collator.add_event(ev2);
+    assert_eq!(
+        events2.len(),
+        1,
+        "second pipelined request on same conn_id must surface as a Message event, got: {events2:?}"
+    );
+    let (msg2, _) = events2[0].as_message().unwrap();
+    assert_eq!(msg2.as_request().unwrap().uri.path(), "/second");
+}
+
+#[test]
+fn test_h1_ten_sequential_requests_on_same_connection() {
+    let mut collator: Collator<TestEvent> = Collator::new();
+
+    for i in 0..10 {
+        let path = format!("/req{i}");
+        let buf = format!("GET {path} HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        let ev = make_event(
+            Direction::Read,
+            99,
+            4321,
+            443,
+            (i + 1) as u64 * 1_000_000,
+            buf.as_bytes(),
+        );
+        let events = collator.add_event(ev);
+        assert_eq!(
+            events.len(),
+            1,
+            "iteration {i}: expected one Message event per request on keep-alive conn, got: {events:?}"
+        );
+        let (msg, _) = events[0].as_message().unwrap();
+        assert_eq!(
+            msg.as_request().unwrap().uri.path(),
+            path,
+            "iteration {i}: wrong path in emitted message"
+        );
+    }
 }

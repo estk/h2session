@@ -25,6 +25,16 @@ pub fn is_http1_response(data: &[u8]) -> bool {
 /// Try to parse an HTTP/1.x request, returning Some only if complete.
 /// This combines header parsing and body completeness checking in one pass.
 pub fn try_parse_http1_request(data: &[u8], timestamp_ns: TimestampNs) -> Option<HttpRequest> {
+    try_parse_http1_request_sized(data, timestamp_ns).map(|(req, _)| req)
+}
+
+/// Try to parse an HTTP/1.x request, returning both the parsed message and
+/// the number of bytes consumed from `data` (headers + body). Enables the
+/// caller to drain those bytes and parse any pipelined follow-on request.
+pub fn try_parse_http1_request_sized(
+    data: &[u8],
+    timestamp_ns: TimestampNs,
+) -> Option<(HttpRequest, usize)> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
 
@@ -34,8 +44,8 @@ pub fn try_parse_http1_request(data: &[u8], timestamp_ns: TimestampNs) -> Option
     };
 
     let body_data = &data[body_offset..];
-    let body = match determine_body(req.headers, body_data, None) {
-        BodyResult::Complete(b) => b,
+    let (body, body_len) = match determine_body(req.headers, body_data, None) {
+        BodyResult::Complete { body, consumed } => (body, consumed),
         BodyResult::Incomplete => return None,
     };
 
@@ -53,19 +63,33 @@ pub fn try_parse_http1_request(data: &[u8], timestamp_ns: TimestampNs) -> Option
         }
     }
 
-    Some(HttpRequest {
-        method,
-        uri,
-        headers: header_map,
-        body,
-        timestamp_ns,
-        version: Some(req.version?),
-    })
+    let consumed = body_offset + body_len;
+    Some((
+        HttpRequest {
+            method,
+            uri,
+            headers: header_map,
+            body,
+            timestamp_ns,
+            version: Some(req.version?),
+        },
+        consumed,
+    ))
 }
 
 /// Try to parse an HTTP/1.x response, returning Some only if complete.
 /// This combines header parsing and body completeness checking in one pass.
 pub fn try_parse_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Option<HttpResponse> {
+    try_parse_http1_response_sized(data, timestamp_ns).map(|(resp, _)| resp)
+}
+
+/// Try to parse an HTTP/1.x response, returning both the parsed message and
+/// the number of bytes consumed from `data`. Enables the caller to drain
+/// those bytes and parse any pipelined follow-on response.
+pub fn try_parse_http1_response_sized(
+    data: &[u8],
+    timestamp_ns: TimestampNs,
+) -> Option<(HttpResponse, usize)> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut res = httparse::Response::new(&mut headers);
 
@@ -75,8 +99,8 @@ pub fn try_parse_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Optio
     };
 
     let body_data = &data[body_offset..];
-    let body = match determine_body(res.headers, body_data, res.code) {
-        BodyResult::Complete(b) => b,
+    let (body, body_len) = match determine_body(res.headers, body_data, res.code) {
+        BodyResult::Complete { body, consumed } => (body, consumed),
         BodyResult::Incomplete => return None,
     };
 
@@ -93,14 +117,18 @@ pub fn try_parse_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Optio
         }
     }
 
-    Some(HttpResponse {
-        status,
-        headers: header_map,
-        body,
-        timestamp_ns,
-        version: Some(res.version?),
-        reason: res.reason.map(String::from),
-    })
+    let consumed = body_offset + body_len;
+    Some((
+        HttpResponse {
+            status,
+            headers: header_map,
+            body,
+            timestamp_ns,
+            version: Some(res.version?),
+            reason: res.reason.map(String::from),
+        },
+        consumed,
+    ))
 }
 
 /// Finalize an HTTP/1.x response when the connection closes.
@@ -144,8 +172,10 @@ pub fn try_finalize_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Op
 
 /// Result of body determination for an HTTP/1.x message.
 enum BodyResult {
-    /// Body is complete with the given bytes
-    Complete(Vec<u8>),
+    /// Body is complete. `body` is the decoded payload; `consumed` is the
+    /// number of raw bytes from the body_data slice that belong to this
+    /// message (for chunked encoding this differs from body.len()).
+    Complete { body: Vec<u8>, consumed: usize },
     /// Not enough data yet
     Incomplete,
 }
@@ -172,7 +202,10 @@ fn determine_body(
                 && let Ok(content_length) = len_str.trim().parse::<usize>()
             {
                 if body_data.len() >= content_length {
-                    return BodyResult::Complete(body_data[..content_length].to_vec());
+                    return BodyResult::Complete {
+                        body:     body_data[..content_length].to_vec(),
+                        consumed: content_length,
+                    };
                 }
                 return BodyResult::Incomplete;
             }
@@ -193,10 +226,16 @@ fn determine_body(
     // No Content-Length and not chunked
     match response_status {
         // Requests have no body by default
-        None => BodyResult::Complete(Vec::new()),
+        None => BodyResult::Complete {
+            body:     Vec::new(),
+            consumed: 0,
+        },
         // 1xx, 204, and 304 responses explicitly have no body (RFC 7230 §3.3.3)
         Some(code) if (100..200).contains(&code) || code == 204 || code == 304 => {
-            BodyResult::Complete(Vec::new())
+            BodyResult::Complete {
+                body:     Vec::new(),
+                consumed: 0,
+            }
         },
         // Other responses: body is read until connection close
         Some(_) => BodyResult::Incomplete,
@@ -244,11 +283,19 @@ fn decode_chunked_body(data: &[u8]) -> BodyResult {
             if data[pos..pos + 2] != *b"\r\n" {
                 // Could be trailers; scan for the final \r\n\r\n
                 match find_crlf_crlf(data, pos) {
-                    Some(_) => return BodyResult::Complete(decoded),
+                    Some(trailer_start) => {
+                        return BodyResult::Complete {
+                            body:     decoded,
+                            consumed: trailer_start + 4,
+                        };
+                    },
                     None => return BodyResult::Incomplete,
                 }
             }
-            return BodyResult::Complete(decoded);
+            return BodyResult::Complete {
+                body:     decoded,
+                consumed: pos + 2,
+            };
         }
 
         // Read chunk data

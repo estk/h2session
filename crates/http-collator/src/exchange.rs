@@ -48,7 +48,7 @@ impl ParsedHttpMessage {
 #[derive(Debug, Clone)]
 pub struct MessageMetadata {
     /// Connection identifier (0 if unavailable, falls back to process_id)
-    pub connection_id: u64,
+    pub connection_id: u128,
     /// Process ID for connection tracking
     pub process_id:    u32,
     /// Timestamp in nanoseconds

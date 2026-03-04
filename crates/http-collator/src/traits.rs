@@ -38,7 +38,7 @@ pub trait DataEvent {
     fn direction(&self) -> Direction;
 
     /// Connection identifier (0 if unavailable, falls back to process_id)
-    fn connection_id(&self) -> u64;
+    fn connection_id(&self) -> u128;
 
     /// Process ID for connection tracking
     fn process_id(&self) -> u32;

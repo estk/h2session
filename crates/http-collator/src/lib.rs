@@ -17,7 +17,7 @@
 //!     payload: Vec<u8>,
 //!     timestamp_ns: u64,
 //!     direction: Direction,
-//!     connection_id: u64,
+//!     connection_id: u128,
 //!     process_id: u32,
 //!     remote_port: u16,
 //! }
@@ -26,7 +26,7 @@
 //!     fn payload(&self) -> &[u8] { &self.payload }
 //!     fn timestamp_ns(&self) -> u64 { self.timestamp_ns }
 //!     fn direction(&self) -> Direction { self.direction }
-//!     fn connection_id(&self) -> u64 { self.connection_id }
+//!     fn connection_id(&self) -> u128 { self.connection_id }
 //!     fn process_id(&self) -> u32 { self.process_id }
 //!     fn remote_port(&self) -> u16 { self.remote_port }
 //! }
@@ -76,7 +76,7 @@ pub const MAX_BUF_SIZE: usize = 16384;
 /// do not serialize through a single mutex.
 pub struct Collator<E: DataEvent> {
     /// Connections tracked by conn_id (for socket events)
-    connections:     DashMap<u64, Conn>,
+    connections:     DashMap<u128, Conn>,
     /// SSL connections tracked by process_id (no conn_id available)
     ssl_connections: DashMap<u32, Conn>,
     /// Configuration for what events to emit
@@ -202,7 +202,7 @@ impl<E: DataEvent> Collator<E> {
         direction: Direction,
         timestamp_ns: TimestampNs,
         remote_port: u16,
-        conn_id: u64,
+        conn_id: u128,
         process_id: u32,
         config: &CollatorConfig,
     ) -> Vec<CollationEvent> {
@@ -226,6 +226,8 @@ impl<E: DataEvent> Collator<E> {
             }
         }
 
+        let mut events = Vec::new();
+
         // Add chunk to appropriate buffer based on direction
         match direction {
             Direction::Write => {
@@ -242,8 +244,14 @@ impl<E: DataEvent> Collator<E> {
                 conn.request_chunks.push(chunk);
 
                 match conn.protocol {
-                    Protocol::Http1 if !conn.h1_write_parsed => {
-                        try_parse_http1_write_chunks(conn);
+                    Protocol::Http1 => {
+                        drain_parse_emit_http1_write(
+                            conn,
+                            conn_id,
+                            process_id,
+                            config,
+                            &mut events,
+                        );
                     },
                     Protocol::Http2 => {
                         parse_http2_chunks(conn, direction);
@@ -251,9 +259,14 @@ impl<E: DataEvent> Collator<E> {
                     // For Unknown protocol, try HTTP/1 parsing — handles non-standard
                     // methods (WebDAV, etc.) that detect_protocol() doesn't recognize.
                     Protocol::Unknown => {
-                        try_parse_http1_unknown_write(conn);
+                        drain_parse_emit_http1_unknown_write(
+                            conn,
+                            conn_id,
+                            process_id,
+                            config,
+                            &mut events,
+                        );
                     },
-                    _ => {},
                 }
 
                 // Content-based parsing: a response can be parsed from the
@@ -279,8 +292,14 @@ impl<E: DataEvent> Collator<E> {
                 conn.response_chunks.push(chunk);
 
                 match conn.protocol {
-                    Protocol::Http1 if !conn.h1_read_parsed => {
-                        try_parse_http1_read_chunks(conn);
+                    Protocol::Http1 => {
+                        drain_parse_emit_http1_read(
+                            conn,
+                            conn_id,
+                            process_id,
+                            config,
+                            &mut events,
+                        );
                     },
                     Protocol::Http2 => {
                         parse_http2_chunks(conn, direction);
@@ -288,9 +307,14 @@ impl<E: DataEvent> Collator<E> {
                     // For Unknown protocol, try HTTP/1 parsing — handles non-standard
                     // methods (WebDAV, etc.) that detect_protocol() doesn't recognize.
                     Protocol::Unknown => {
-                        try_parse_http1_unknown_read(conn);
+                        drain_parse_emit_http1_unknown_read(
+                            conn,
+                            conn_id,
+                            process_id,
+                            config,
+                            &mut events,
+                        );
                     },
-                    _ => {},
                 }
 
                 // Content-based parsing: a request can be parsed from the
@@ -313,8 +337,11 @@ impl<E: DataEvent> Collator<E> {
             conn.response_complete = true;
         }
 
-        let mut events = Vec::new();
-
+        // HTTP/1 Messages were already pushed directly by the drain-parse-emit
+        // helpers above (so pipelined keep-alive requests all surface). This
+        // call is still needed for HTTP/2 messages and for the finalize path
+        // where a connection-close produces an h1_response that hasn't been
+        // emitted yet.
         if config.emit_messages {
             emit_message_events(conn, conn_id, process_id, &mut events);
         }
@@ -356,7 +383,7 @@ impl<E: DataEvent> Collator<E> {
     ///
     /// Call this when a connection is closed to free resources immediately.
     /// If connection_id is 0, removes based on process_id from SSL connections.
-    pub fn remove_connection(&self, connection_id: u64, process_id: u32) {
+    pub fn remove_connection(&self, connection_id: u128, process_id: u32) {
         if connection_id != 0 {
             self.connections.remove(&connection_id);
         } else {
@@ -371,7 +398,7 @@ impl<E: DataEvent> Collator<E> {
     /// connection closes. This method finalizes such responses with whatever
     /// body has accumulated so far, emits any resulting events, then removes
     /// the connection.
-    pub fn close_connection(&self, connection_id: u64, process_id: u32) -> Vec<CollationEvent> {
+    pub fn close_connection(&self, connection_id: u128, process_id: u32) -> Vec<CollationEvent> {
         let events = if connection_id != 0 {
             match self.connections.get_mut(&connection_id) {
                 Some(mut guard) => {
@@ -402,7 +429,7 @@ impl<E: DataEvent> Collator<E> {
 /// Finalize any pending HTTP/1 response and emit events on connection close.
 fn finalize_and_emit(
     conn: &mut Conn,
-    connection_id: u64,
+    connection_id: u128,
     process_id: u32,
     config: &CollatorConfig,
 ) -> Vec<CollationEvent> {
@@ -443,7 +470,7 @@ fn finalize_and_emit(
 /// yet
 fn emit_message_events(
     conn: &mut Conn,
-    conn_id: u64,
+    conn_id: u128,
     process_id: u32,
     events: &mut Vec<CollationEvent>,
 ) {
@@ -730,76 +757,196 @@ fn find_complete_h2_stream(conn: &Conn) -> Option<StreamId> {
     conn.ready_streams.iter().next().copied()
 }
 
-/// Try to parse HTTP/1 message from accumulated write-direction buffer.
-/// Tries request first (client-side), then response (server-side).
-fn try_parse_http1_write_chunks(conn: &mut Conn) {
+/// Drain complete HTTP/1 messages from the write-direction buffer, emitting a
+/// `Message` event for each one. Supports HTTP/1.1 keep-alive pipelining: as
+/// long as the buffer holds another complete request or response, we slice
+/// its bytes off and keep parsing.
+///
+/// The last parsed message (if any) remains in `conn.h1_request` /
+/// `conn.h1_response` so the exchange-matching path in
+/// `process_event_for_conn` still works for the final unpaired message.
+fn drain_parse_emit_http1_write(
+    conn: &mut Conn,
+    conn_id: u128,
+    process_id: u32,
+    config: &CollatorConfig,
+    events: &mut Vec<CollationEvent>,
+) {
+    loop {
+        let timestamp = conn
+            .request_chunks
+            .last()
+            .map(|c| c.timestamp_ns)
+            .unwrap_or(TimestampNs(0));
+
+        // Try request first (client-side), then response (server-side).
+        if let Some((req, consumed)) =
+            h1::try_parse_http1_request_sized(&conn.h1_write_buffer, timestamp)
+        {
+            conn.h1_write_buffer.drain(..consumed);
+            emit_h1_request(conn, conn_id, process_id, config, events, req);
+        } else if let Some((resp, consumed)) =
+            h1::try_parse_http1_response_sized(&conn.h1_write_buffer, timestamp)
+        {
+            conn.h1_write_buffer.drain(..consumed);
+            emit_h1_response(conn, conn_id, process_id, config, events, resp);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Drain complete HTTP/1 messages from the read-direction buffer, emitting a
+/// `Message` event for each one. See `drain_parse_emit_http1_write`.
+fn drain_parse_emit_http1_read(
+    conn: &mut Conn,
+    conn_id: u128,
+    process_id: u32,
+    config: &CollatorConfig,
+    events: &mut Vec<CollationEvent>,
+) {
+    loop {
+        let timestamp = conn
+            .response_chunks
+            .last()
+            .map(|c| c.timestamp_ns)
+            .unwrap_or(TimestampNs(0));
+
+        // Tries response first (client-side), then request (server-side).
+        if let Some((resp, consumed)) =
+            h1::try_parse_http1_response_sized(&conn.h1_read_buffer, timestamp)
+        {
+            conn.h1_read_buffer.drain(..consumed);
+            emit_h1_response(conn, conn_id, process_id, config, events, resp);
+        } else if let Some((req, consumed)) =
+            h1::try_parse_http1_request_sized(&conn.h1_read_buffer, timestamp)
+        {
+            conn.h1_read_buffer.drain(..consumed);
+            emit_h1_request(conn, conn_id, process_id, config, events, req);
+        } else {
+            break;
+        }
+    }
+}
+
+/// Drain HTTP/1 messages from the write buffer under Unknown protocol; on the
+/// first successful parse, promote the connection to Http1 and keep draining.
+fn drain_parse_emit_http1_unknown_write(
+    conn: &mut Conn,
+    conn_id: u128,
+    process_id: u32,
+    config: &CollatorConfig,
+    events: &mut Vec<CollationEvent>,
+) {
     let timestamp = conn
         .request_chunks
         .last()
         .map(|c| c.timestamp_ns)
         .unwrap_or(TimestampNs(0));
-    if let Some(req) = h1::try_parse_http1_request(&conn.h1_write_buffer, timestamp) {
-        conn.h1_request = Some(req);
-        conn.h1_write_parsed = true;
-    } else if let Some(resp) = h1::try_parse_http1_response(&conn.h1_write_buffer, timestamp) {
-        conn.h1_response = Some(resp);
-        conn.h1_write_parsed = true;
+    if let Some((req, consumed)) =
+        h1::try_parse_http1_request_sized(&conn.h1_write_buffer, timestamp)
+    {
+        conn.protocol = Protocol::Http1;
+        conn.h1_write_buffer.drain(..consumed);
+        emit_h1_request(conn, conn_id, process_id, config, events, req);
+        drain_parse_emit_http1_write(conn, conn_id, process_id, config, events);
+    } else if let Some((resp, consumed)) =
+        h1::try_parse_http1_response_sized(&conn.h1_write_buffer, timestamp)
+    {
+        conn.protocol = Protocol::Http1;
+        conn.h1_write_buffer.drain(..consumed);
+        emit_h1_response(conn, conn_id, process_id, config, events, resp);
+        drain_parse_emit_http1_write(conn, conn_id, process_id, config, events);
     }
 }
 
-/// Try to parse HTTP/1 message from accumulated read-direction buffer.
-/// Tries response first (client-side), then request (server-side).
-fn try_parse_http1_read_chunks(conn: &mut Conn) {
+/// Drain HTTP/1 messages from the read buffer under Unknown protocol; on the
+/// first successful parse, promote the connection to Http1 and keep draining.
+fn drain_parse_emit_http1_unknown_read(
+    conn: &mut Conn,
+    conn_id: u128,
+    process_id: u32,
+    config: &CollatorConfig,
+    events: &mut Vec<CollationEvent>,
+) {
     let timestamp = conn
         .response_chunks
-        .first()
-        .map(|c| c.timestamp_ns)
-        .unwrap_or(TimestampNs(0));
-    if let Some(resp) = h1::try_parse_http1_response(&conn.h1_read_buffer, timestamp) {
-        conn.h1_response = Some(resp);
-        conn.h1_read_parsed = true;
-    } else if let Some(req) = h1::try_parse_http1_request(&conn.h1_read_buffer, timestamp) {
-        conn.h1_request = Some(req);
-        conn.h1_read_parsed = true;
-    }
-}
-
-/// Try HTTP/1 parsing on Unknown-protocol write buffer. If successful,
-/// promotes the connection to Http1.
-fn try_parse_http1_unknown_write(conn: &mut Conn) {
-    let timestamp = conn
-        .request_chunks
         .last()
         .map(|c| c.timestamp_ns)
         .unwrap_or(TimestampNs(0));
-    if let Some(req) = h1::try_parse_http1_request(&conn.h1_write_buffer, timestamp) {
+    if let Some((resp, consumed)) =
+        h1::try_parse_http1_response_sized(&conn.h1_read_buffer, timestamp)
+    {
         conn.protocol = Protocol::Http1;
-        conn.h1_request = Some(req);
-        conn.h1_write_parsed = true;
-    } else if let Some(resp) = h1::try_parse_http1_response(&conn.h1_write_buffer, timestamp) {
+        conn.h1_read_buffer.drain(..consumed);
+        emit_h1_response(conn, conn_id, process_id, config, events, resp);
+        drain_parse_emit_http1_read(conn, conn_id, process_id, config, events);
+    } else if let Some((req, consumed)) =
+        h1::try_parse_http1_request_sized(&conn.h1_read_buffer, timestamp)
+    {
         conn.protocol = Protocol::Http1;
-        conn.h1_response = Some(resp);
-        conn.h1_write_parsed = true;
+        conn.h1_read_buffer.drain(..consumed);
+        emit_h1_request(conn, conn_id, process_id, config, events, req);
+        drain_parse_emit_http1_read(conn, conn_id, process_id, config, events);
     }
 }
 
-/// Try HTTP/1 parsing on Unknown-protocol read buffer. If successful,
-/// promotes the connection to Http1.
-fn try_parse_http1_unknown_read(conn: &mut Conn) {
-    let timestamp = conn
-        .response_chunks
-        .first()
-        .map(|c| c.timestamp_ns)
-        .unwrap_or(TimestampNs(0));
-    if let Some(resp) = h1::try_parse_http1_response(&conn.h1_read_buffer, timestamp) {
-        conn.protocol = Protocol::Http1;
-        conn.h1_response = Some(resp);
-        conn.h1_read_parsed = true;
-    } else if let Some(req) = h1::try_parse_http1_request(&conn.h1_read_buffer, timestamp) {
-        conn.protocol = Protocol::Http1;
-        conn.h1_request = Some(req);
-        conn.h1_read_parsed = true;
+/// Push a Message event for an HTTP/1 request and store it on the connection
+/// as the "current" parsed request (for exchange matching). Sets
+/// `h1_request_emitted` so `emit_message_events` won't re-emit this one.
+fn emit_h1_request(
+    conn: &mut Conn,
+    conn_id: u128,
+    process_id: u32,
+    config: &CollatorConfig,
+    events: &mut Vec<CollationEvent>,
+    req: h1::HttpRequest,
+) {
+    if config.emit_messages {
+        let metadata = MessageMetadata {
+            connection_id: conn_id,
+            process_id,
+            timestamp_ns: req.timestamp_ns,
+            stream_id: None,
+            remote_port: conn.remote_port,
+            protocol: Protocol::Http1,
+        };
+        events.push(CollationEvent::Message {
+            message: ParsedHttpMessage::Request(req.clone()),
+            metadata,
+        });
     }
+    conn.h1_request = Some(req);
+    conn.h1_request_emitted = true;
+}
+
+/// Push a Message event for an HTTP/1 response and store it on the connection
+/// as the "current" parsed response (for exchange matching). Sets
+/// `h1_response_emitted` so `emit_message_events` won't re-emit this one.
+fn emit_h1_response(
+    conn: &mut Conn,
+    conn_id: u128,
+    process_id: u32,
+    config: &CollatorConfig,
+    events: &mut Vec<CollationEvent>,
+    resp: h1::HttpResponse,
+) {
+    if config.emit_messages {
+        let metadata = MessageMetadata {
+            connection_id: conn_id,
+            process_id,
+            timestamp_ns: resp.timestamp_ns,
+            stream_id: None,
+            remote_port: conn.remote_port,
+            protocol: Protocol::Http1,
+        };
+        events.push(CollationEvent::Message {
+            message: ParsedHttpMessage::Response(resp.clone()),
+            metadata,
+        });
+    }
+    conn.h1_response = Some(resp);
+    conn.h1_response_emitted = true;
 }
 
 fn is_request_complete(conn: &Conn) -> bool {

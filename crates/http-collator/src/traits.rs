@@ -46,6 +46,30 @@ pub trait DataEvent {
     /// Remote port (0 if unknown)
     fn remote_port(&self) -> u16;
 
+    /// QUIC stream ID, if this event is from a QUIC connection.
+    /// Returns None for non-QUIC events (TCP/TLS).
+    fn stream_id(&self) -> Option<i64> {
+        None
+    }
+
+    /// Whether this is the final data on a QUIC stream (FIN received).
+    fn is_fin(&self) -> bool {
+        false
+    }
+
+    /// Process/command name (e.g., "curl", "nghttpx")
+    fn command_name(&self) -> &str {
+        ""
+    }
+
+    /// Whether this event carries pre-decoded response headers (plaintext
+    /// "name: value\n" format) captured before QPACK encoding. When true, the
+    /// collator registers the headers for the given stream_id rather than
+    /// feeding the payload to h3session as raw frames.
+    fn is_submit_response(&self) -> bool {
+        false
+    }
+
     /// Consume self and return the payload as `Bytes`.
     ///
     /// The default implementation copies via `payload().to_vec()`. Implementors

@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/h2session", "crates/http-collator", "fuzz"]
-default-members = ["crates/h2session", "crates/http-collator"]
+members = ["crates/h2session", "crates/h3session", "crates/http-collator", "fuzz"]
+default-members = ["crates/h2session", "crates/h3session", "crates/http-collator"]
 resolver = "2"
 
 [workspace.package]
@@ -17,6 +17,7 @@ dashmap = "6.1.0"
 tracing = "0.1"
 rstest = "0.26"
 h2session = { path = "crates/h2session", version = "0.3.0" }
+h3session = { path = "crates/h3session", version = "0.3.0" }
 http-collator = { path = "crates/http-collator", version = "0.3.0" }
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }

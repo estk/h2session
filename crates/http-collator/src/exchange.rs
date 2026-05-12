@@ -51,6 +51,8 @@ pub struct MessageMetadata {
     pub connection_id: u128,
     /// Process ID for connection tracking
     pub process_id:    u32,
+    /// Process/command name
+    pub command:       String,
     /// Timestamp in nanoseconds
     pub timestamp_ns:  TimestampNs,
     /// Stream ID for HTTP/2 (None for HTTP/1)
@@ -165,6 +167,8 @@ pub struct Exchange {
     pub protocol:    Protocol,
     /// OS process ID that handled this connection
     pub process_id:  u32,
+    /// Process/command name
+    pub command:     String,
     /// Remote port, None if unavailable (e.g., SSL without socket fd)
     pub remote_port: Option<u16>,
     /// Stream ID for HTTP/2 (None for HTTP/1)
@@ -176,6 +180,7 @@ impl std::fmt::Display for Exchange {
         let proto_str = match self.protocol {
             Protocol::Http1 => "HTTP/1.1",
             Protocol::Http2 => "HTTP/2",
+            Protocol::Http3 => "HTTP/3",
             Protocol::Unknown => "Unknown",
         };
         let latency_ms = self.latency_ns as f64 / 1_000_000.0;
@@ -185,8 +190,8 @@ impl std::fmt::Display for Exchange {
 
         writeln!(
             f,
-            "=== {} Exchange (PID: {}, Port: {}) ===",
-            proto_str, self.process_id, port_str
+            "=== {} Exchange (PID: {}, Command: {}, Port: {}) ===",
+            proto_str, self.process_id, self.command, port_str
         )?;
         writeln!(f, "Latency: {:.2}ms", latency_ms)?;
         writeln!(f)?;

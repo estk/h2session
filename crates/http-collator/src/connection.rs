@@ -19,6 +19,8 @@ pub enum Protocol {
     Http1,
     /// HTTP/2
     Http2,
+    /// HTTP/3 (over QUIC)
+    Http3,
 }
 
 /// A chunk of data received from a data source
@@ -33,6 +35,8 @@ pub(crate) struct DataChunk {
 /// Tracks state for a single connection
 pub(crate) struct Connection {
     pub(crate) process_id:        u32,
+    /// Process/command name (e.g., "curl", "nghttpx")
+    pub(crate) command:           String,
     /// Remote port, None if unavailable (e.g., SSL without socket fd)
     pub(crate) remote_port:       Option<u16>,
     pub(crate) protocol:          Protocol,
@@ -83,9 +87,10 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    pub(crate) fn new(process_id: u32, remote_port: u16) -> Self {
+    pub(crate) fn new(process_id: u32, remote_port: u16, command: String) -> Self {
         Self {
             process_id,
+            command,
             // Store None for port 0 (unavailable from SSL)
             remote_port: if remote_port == 0 {
                 None

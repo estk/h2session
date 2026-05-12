@@ -1,0 +1,13 @@
+[package]
+name = "h3session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP/3 frame parser and QPACK header decompression for stream-level data"
+
+[dependencies]
+bytes = { workspace = true }
+http = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }

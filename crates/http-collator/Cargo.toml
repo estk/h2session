@@ -11,6 +11,7 @@ categories = ["network-programming", "parser-implementations"]
 bytes.workspace = true
 dashmap.workspace = true
 h2session.workspace = true
+h3session.workspace = true
 http.workspace = true
 httparse.workspace = true
 

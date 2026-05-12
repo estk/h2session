@@ -64,10 +64,23 @@ use h2session::{
     is_http2_preface,
     looks_like_http2_frame,
 };
+use h3session::H3ConnectionState;
 pub use traits::{DataEvent, Direction};
 
 /// Default maximum buffer size for data events (TLS record size)
 pub const MAX_BUF_SIZE: usize = 16384;
+
+/// Tracks HTTP/3 state for a single QUIC connection.
+/// Each QUIC connection can have multiple concurrent streams (requests).
+struct QuicConnection {
+    h3_state:         H3ConnectionState,
+    last_activity_ns: TimestampNs,
+    /// Pending requests awaiting their response (keyed by stream_id)
+    pending_requests: std::collections::HashMap<i64, HttpRequest>,
+    /// Pre-registered response headers from submit_response probes (plaintext,
+    /// captured before QPACK encoding). Keyed by stream_id.
+    submitted_response_headers: std::collections::HashMap<i64, Vec<(String, String)>>,
+}
 
 /// Collates individual data events into complete request/response exchanges.
 ///
@@ -76,13 +89,15 @@ pub const MAX_BUF_SIZE: usize = 16384;
 /// do not serialize through a single mutex.
 pub struct Collator<E: DataEvent> {
     /// Connections tracked by conn_id (for socket events)
-    connections:     DashMap<u128, Conn>,
+    connections:      DashMap<u128, Conn>,
     /// SSL connections tracked by process_id (no conn_id available)
-    ssl_connections: DashMap<u32, Conn>,
+    ssl_connections:  DashMap<u32, Conn>,
+    /// QUIC connections tracked by conn_id (tgid << 64 | conn_ptr)
+    quic_connections: DashMap<u128, QuicConnection>,
     /// Configuration for what events to emit
-    config:          CollatorConfig,
+    config:           CollatorConfig,
     /// Phantom data for the event type
-    _phantom:        PhantomData<E>,
+    _phantom:         PhantomData<E>,
 }
 
 impl<E: DataEvent> Default for Collator<E> {
@@ -103,6 +118,7 @@ impl<E: DataEvent> Collator<E> {
         Self {
             connections: DashMap::new(),
             ssl_connections: DashMap::new(),
+            quic_connections: DashMap::new(),
             config,
             _phantom: PhantomData,
         }
@@ -137,7 +153,33 @@ impl<E: DataEvent> Collator<E> {
         let conn_id = event.connection_id();
         let process_id = event.process_id();
         let remote_port = event.remote_port();
+        let stream_id = event.stream_id();
+        let is_fin = event.is_fin();
         let is_empty = event.payload().is_empty();
+        let command = event.command_name().to_string();
+        let is_submit_response = event.is_submit_response();
+
+        // QUIC/HTTP3 events: route even if empty (FIN-only signals)
+        if let Some(sid) = stream_id {
+            if is_submit_response {
+                let payload = event.into_payload();
+                self.register_submit_response(conn_id, sid, &payload, timestamp_ns);
+                return Vec::new();
+            }
+            if is_empty && !is_fin {
+                return Vec::new();
+            }
+            let payload = event.into_payload();
+            return self.process_quic_event(
+                conn_id,
+                process_id,
+                &command,
+                sid,
+                &payload,
+                timestamp_ns,
+                is_fin,
+            );
+        }
 
         if is_empty {
             return Vec::new();
@@ -164,7 +206,7 @@ impl<E: DataEvent> Collator<E> {
             let mut conn = self
                 .connections
                 .entry(conn_id)
-                .or_insert_with(|| Conn::new(process_id, remote_port));
+                .or_insert_with(|| Conn::new(process_id, remote_port, command.clone()));
             Self::process_event_for_conn(
                 &mut conn,
                 chunk,
@@ -173,13 +215,14 @@ impl<E: DataEvent> Collator<E> {
                 remote_port,
                 conn_id,
                 process_id,
+                &command,
                 &self.config,
             )
         } else {
             let mut conn = self
                 .ssl_connections
                 .entry(process_id)
-                .or_insert_with(|| Conn::new(process_id, remote_port));
+                .or_insert_with(|| Conn::new(process_id, remote_port, command.clone()));
             Self::process_event_for_conn(
                 &mut conn,
                 chunk,
@@ -188,9 +231,220 @@ impl<E: DataEvent> Collator<E> {
                 remote_port,
                 conn_id,
                 process_id,
+                &command,
                 &self.config,
             )
         }
+    }
+
+    /// Process a QUIC/HTTP3 event: feed to h3session and check for completed messages.
+    fn process_quic_event(
+        &self,
+        conn_id: u128,
+        process_id: u32,
+        command: &str,
+        stream_id: i64,
+        payload: &[u8],
+        timestamp_ns: TimestampNs,
+        fin: bool,
+    ) -> Vec<CollationEvent> {
+        use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
+
+        let mut quic_conn = self
+            .quic_connections
+            .entry(conn_id)
+            .or_insert_with(|| QuicConnection {
+                h3_state: H3ConnectionState::new(),
+                last_activity_ns: TimestampNs(0),
+                pending_requests: std::collections::HashMap::new(),
+                submitted_response_headers: std::collections::HashMap::new(),
+            });
+
+        quic_conn.last_activity_ns = timestamp_ns;
+        quic_conn.h3_state.feed(stream_id, payload, timestamp_ns.0, fin);
+
+        let mut events = Vec::new();
+        while let Some((sid, msg)) = quic_conn.h3_state.try_pop() {
+            // Client-initiated bidirectional streams (sid % 4 == 0) carry
+            // request/response pairs. If QPACK decoding failed (empty headers),
+            // treat the message as a response on these streams.
+            let is_request = msg.is_request();
+            let is_response = msg.is_response()
+                || (!is_request && sid % 4 == 0 && (msg.headers.is_empty() || !msg.body.is_empty()));
+
+            if is_request {
+                let Some(method) = msg.method().and_then(|m| m.parse::<Method>().ok()) else {
+                    continue;
+                };
+                let uri: Uri = msg.path().unwrap_or("/").parse().unwrap_or(Uri::from_static("/"));
+
+                let mut headers = HeaderMap::new();
+                for (name, value) in &msg.headers {
+                    if name == ":method" || name == ":path" {
+                        continue;
+                    }
+                    let header_name = name.strip_prefix(':').unwrap_or(name.as_str());
+                    if let (Ok(hn), Ok(hv)) = (
+                        HeaderName::from_bytes(header_name.as_bytes()),
+                        HeaderValue::from_str(value),
+                    ) {
+                        headers.append(hn, hv);
+                    }
+                }
+
+                let request = HttpRequest {
+                    method,
+                    uri,
+                    headers,
+                    body: msg.body.to_vec(),
+                    timestamp_ns: TimestampNs(msg.end_stream_timestamp_ns),
+                    version: None,
+                };
+
+                if self.config.emit_messages {
+                    events.push(CollationEvent::Message {
+                        message: ParsedHttpMessage::Request(request.clone()),
+                        metadata: MessageMetadata {
+                            connection_id: conn_id,
+                            process_id,
+                            command: command.to_string(),
+                            timestamp_ns,
+                            stream_id: Some(StreamId(sid as u32)),
+                            remote_port: None,
+                            protocol: Protocol::Http3,
+                        },
+                    });
+                }
+
+                // Store pending request — response will arrive on the same stream
+                quic_conn.pending_requests.insert(sid, request);
+            } else if is_response {
+                // Use pre-registered headers from submit_response if QPACK
+                // decode yielded nothing beyond :status
+                let submitted = quic_conn.submitted_response_headers.remove(&sid);
+                let use_submitted = submitted.is_some()
+                    && msg.headers.iter().all(|(n, _)| n.starts_with(':'));
+
+                let effective_headers: &[(String, String)] = if use_submitted {
+                    submitted.as_ref().unwrap()
+                } else {
+                    &msg.headers
+                };
+
+                let status = if use_submitted {
+                    effective_headers
+                        .iter()
+                        .find(|(n, _)| n == ":status")
+                        .and_then(|(_, v)| v.parse::<u16>().ok())
+                        .and_then(|s| StatusCode::from_u16(s).ok())
+                        .unwrap_or_else(|| {
+                            msg.status()
+                                .and_then(|s| StatusCode::from_u16(s).ok())
+                                .unwrap_or(StatusCode::OK)
+                        })
+                } else {
+                    msg.status()
+                        .and_then(|s| StatusCode::from_u16(s).ok())
+                        .unwrap_or(StatusCode::OK)
+                };
+
+                let mut headers = HeaderMap::new();
+                for (name, value) in effective_headers {
+                    if name == ":status" {
+                        continue;
+                    }
+                    let header_name = name.strip_prefix(':').unwrap_or(name.as_str());
+                    if let (Ok(hn), Ok(hv)) = (
+                        HeaderName::from_bytes(header_name.as_bytes()),
+                        HeaderValue::from_str(value),
+                    ) {
+                        headers.append(hn, hv);
+                    }
+                }
+
+                let response = HttpResponse {
+                    status,
+                    headers,
+                    body: msg.body.to_vec(),
+                    timestamp_ns: TimestampNs(msg.first_frame_timestamp_ns),
+                    version: None,
+                    reason: None,
+                };
+
+                // Pair with pending request on the same stream, or emit with placeholder
+                let (request, latency_ns) =
+                    if let Some(req) = quic_conn.pending_requests.remove(&sid) {
+                        let latency = msg
+                            .first_frame_timestamp_ns
+                            .saturating_sub(req.timestamp_ns.0);
+                        (req, latency)
+                    } else {
+                        // No captured request (write probe may not have fired)
+                        let placeholder = HttpRequest {
+                            method: Method::GET,
+                            uri: Uri::from_static("/"),
+                            headers: HeaderMap::new(),
+                            body: Vec::new(),
+                            timestamp_ns: TimestampNs(msg.first_frame_timestamp_ns),
+                            version: None,
+                        };
+                        (placeholder, 0)
+                    };
+
+                let exchange = Exchange {
+                    request,
+                    response,
+                    latency_ns,
+                    protocol: Protocol::Http3,
+                    process_id,
+                    command: command.to_string(),
+                    remote_port: None,
+                    stream_id: Some(StreamId(sid as u32)),
+                };
+
+                if self.config.emit_exchanges {
+                    events.push(CollationEvent::Exchange(exchange));
+                }
+            }
+        }
+
+        events
+    }
+
+    /// Register pre-decoded response headers captured from nghttp3_conn_submit_response.
+    /// The payload is "name: value\n" lines (plaintext, before QPACK encoding).
+    fn register_submit_response(
+        &self,
+        conn_id: u128,
+        stream_id: i64,
+        payload: &[u8],
+        timestamp_ns: TimestampNs,
+    ) {
+        let payload_str = String::from_utf8_lossy(payload);
+        let headers: Vec<(String, String)> = payload_str
+            .lines()
+            .filter_map(|line| {
+                let (name, value) = line.split_once(": ")?;
+                Some((name.to_string(), value.to_string()))
+            })
+            .collect();
+
+        if headers.is_empty() {
+            return;
+        }
+
+        let mut quic_conn = self
+            .quic_connections
+            .entry(conn_id)
+            .or_insert_with(|| QuicConnection {
+                h3_state: H3ConnectionState::new(),
+                last_activity_ns: TimestampNs(0),
+                pending_requests: std::collections::HashMap::new(),
+                submitted_response_headers: std::collections::HashMap::new(),
+            });
+
+        quic_conn.last_activity_ns = timestamp_ns;
+        quic_conn.submitted_response_headers.insert(stream_id, headers);
     }
 
     /// Core event processing logic, called with a mutable reference to the
@@ -204,6 +458,7 @@ impl<E: DataEvent> Collator<E> {
         remote_port: u16,
         conn_id: u128,
         process_id: u32,
+        command: &str,
         config: &CollatorConfig,
     ) -> Vec<CollationEvent> {
         let buf: &[u8] = &chunk.data;
@@ -211,6 +466,9 @@ impl<E: DataEvent> Collator<E> {
         conn.last_activity_ns = timestamp_ns;
         if remote_port != 0 && conn.remote_port.is_none() {
             conn.remote_port = Some(remote_port);
+        }
+        if !command.is_empty() && conn.command.is_empty() {
+            conn.command = command.to_string();
         }
 
         // Detect protocol from first chunk if unknown
@@ -267,6 +525,8 @@ impl<E: DataEvent> Collator<E> {
                             &mut events,
                         );
                     },
+                    // HTTP/3 is handled via separate quic_connections path
+                    Protocol::Http3 => {},
                 }
 
                 // Content-based parsing: a response can be parsed from the
@@ -315,6 +575,8 @@ impl<E: DataEvent> Collator<E> {
                             &mut events,
                         );
                     },
+                    // HTTP/3 is handled via separate quic_connections path
+                    Protocol::Http3 => {},
                 }
 
                 // Content-based parsing: a request can be parsed from the
@@ -367,6 +629,9 @@ impl<E: DataEvent> Collator<E> {
         self.ssl_connections.retain(|_, conn| {
             current_time_ns.saturating_sub(conn.last_activity_ns) < self.config.timeout_ns
         });
+        self.quic_connections.retain(|_, conn| {
+            current_time_ns.saturating_sub(conn.last_activity_ns) < self.config.timeout_ns
+        });
 
         // Evict stale H2 streams within surviving connections
         for mut entry in self.connections.iter_mut() {
@@ -376,6 +641,10 @@ impl<E: DataEvent> Collator<E> {
         for mut entry in self.ssl_connections.iter_mut() {
             entry.h2_write_state.evict_stale_streams(current_time_ns);
             entry.h2_read_state.evict_stale_streams(current_time_ns);
+        }
+        // Evict stale HTTP/3 streams within surviving QUIC connections
+        for mut entry in self.quic_connections.iter_mut() {
+            entry.h3_state.cleanup_stale_streams(current_time_ns.0, self.config.timeout_ns);
         }
     }
 
@@ -483,6 +752,7 @@ fn emit_message_events(
                 let metadata = MessageMetadata {
                     connection_id: conn_id,
                     process_id,
+                    command: conn.command.clone(),
                     timestamp_ns: req.timestamp_ns,
                     stream_id: None,
                     remote_port: conn.remote_port,
@@ -502,6 +772,7 @@ fn emit_message_events(
                 let metadata = MessageMetadata {
                     connection_id: conn_id,
                     process_id,
+                    command: conn.command.clone(),
                     timestamp_ns: resp.timestamp_ns,
                     stream_id: None,
                     remote_port: conn.remote_port,
@@ -523,6 +794,7 @@ fn emit_message_events(
                     let metadata = MessageMetadata {
                         connection_id: conn_id,
                         process_id,
+                        command: conn.command.clone(),
                         timestamp_ns: msg.end_stream_timestamp_ns,
                         stream_id: Some(stream_id),
                         remote_port: conn.remote_port,
@@ -546,6 +818,7 @@ fn emit_message_events(
                     let metadata = MessageMetadata {
                         connection_id: conn_id,
                         process_id,
+                        command: conn.command.clone(),
                         timestamp_ns: msg.first_frame_timestamp_ns,
                         stream_id: Some(stream_id),
                         remote_port: conn.remote_port,
@@ -561,7 +834,7 @@ fn emit_message_events(
             conn.h2_emitted_responses
                 .extend(conn.pending_responses.keys().copied());
         },
-        Protocol::Unknown => {},
+        Protocol::Unknown | Protocol::Http3 => {},
     }
 }
 
@@ -906,6 +1179,7 @@ fn emit_h1_request(
         let metadata = MessageMetadata {
             connection_id: conn_id,
             process_id,
+            command: conn.command.clone(),
             timestamp_ns: req.timestamp_ns,
             stream_id: None,
             remote_port: conn.remote_port,
@@ -935,6 +1209,7 @@ fn emit_h1_response(
         let metadata = MessageMetadata {
             connection_id: conn_id,
             process_id,
+            command: conn.command.clone(),
             timestamp_ns: resp.timestamp_ns,
             stream_id: None,
             remote_port: conn.remote_port,
@@ -953,7 +1228,7 @@ fn is_request_complete(conn: &Conn) -> bool {
     match conn.protocol {
         Protocol::Http1 => conn.h1_request.is_some(),
         Protocol::Http2 => find_complete_h2_stream(conn).is_some(),
-        Protocol::Unknown => false,
+        Protocol::Unknown | Protocol::Http3 => false,
     }
 }
 
@@ -961,7 +1236,7 @@ fn is_response_complete(conn: &Conn) -> bool {
     match conn.protocol {
         Protocol::Http1 => conn.h1_response.is_some(),
         Protocol::Http2 => find_complete_h2_stream(conn).is_some(),
-        Protocol::Unknown => false,
+        Protocol::Unknown | Protocol::Http3 => false,
     }
 }
 
@@ -996,7 +1271,7 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
             let latency = response_start_time.saturating_sub(request_complete_time);
             (req, resp, Some(sid), latency)
         },
-        Protocol::Unknown => return None,
+        Protocol::Unknown | Protocol::Http3 => return None,
     };
 
     Some(Exchange {
@@ -1005,6 +1280,7 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
         latency_ns,
         protocol: conn.protocol,
         process_id: conn.process_id,
+        command: conn.command.clone(),
         remote_port: conn.remote_port,
         stream_id,
     })

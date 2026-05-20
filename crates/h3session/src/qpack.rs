@@ -2,108 +2,116 @@
 ///
 /// Supports static table references and literal header fields.
 /// Dynamic table support is deferred until encoder stream data is available.
-
 /// QPACK static table (RFC 9204, Appendix A)
 const STATIC_TABLE: &[(&str, &str)] = &[
-    (":authority", ""),                        // 0
-    (":path", "/"),                            // 1
-    ("age", "0"),                              // 2
-    ("content-disposition", ""),               // 3
-    ("content-length", "0"),                   // 4
-    ("cookie", ""),                            // 5
-    ("date", ""),                              // 6
-    ("etag", ""),                              // 7
-    ("if-modified-since", ""),                 // 8
-    ("if-none-match", ""),                     // 9
-    ("last-modified", ""),                     // 10
-    ("link", ""),                              // 11
-    ("location", ""),                          // 12
-    ("referer", ""),                           // 13
-    ("set-cookie", ""),                        // 14
-    (":method", "CONNECT"),                    // 15
-    (":method", "DELETE"),                     // 16
-    (":method", "GET"),                        // 17
-    (":method", "HEAD"),                       // 18
-    (":method", "OPTIONS"),                    // 19
-    (":method", "POST"),                       // 20
-    (":method", "PUT"),                        // 21
-    (":scheme", "http"),                       // 22
-    (":scheme", "https"),                      // 23
-    (":status", "103"),                        // 24
-    (":status", "200"),                        // 25
-    (":status", "304"),                        // 26
-    (":status", "404"),                        // 27
-    (":status", "503"),                        // 28
-    ("accept", "*/*"),                         // 29
-    ("accept", "application/dns-message"),     // 30
-    ("accept-encoding", "gzip, deflate, br"), // 31
-    ("accept-ranges", "bytes"),               // 32
-    ("access-control-allow-headers", "cache-control"),      // 33
-    ("access-control-allow-headers", "content-type"),       // 34
-    ("access-control-allow-origin", "*"),                   // 35
-    ("cache-control", "max-age=0"),                         // 36
-    ("cache-control", "max-age=2592000"),                   // 37
-    ("cache-control", "max-age=604800"),                    // 38
-    ("cache-control", "no-cache"),                          // 39
-    ("cache-control", "no-store"),                          // 40
-    ("cache-control", "public, max-age=31536000"),          // 41
-    ("content-encoding", "br"),               // 42
-    ("content-encoding", "gzip"),             // 43
-    ("content-type", "application/dns-message"),            // 44
-    ("content-type", "application/javascript"),             // 45
-    ("content-type", "application/json"),                   // 46
-    ("content-type", "application/x-www-form-urlencoded"),  // 47
-    ("content-type", "image/gif"),            // 48
-    ("content-type", "image/jpeg"),           // 49
-    ("content-type", "image/png"),            // 50
-    ("content-type", "text/css"),             // 51
-    ("content-type", "text/html; charset=utf-8"),           // 52
-    ("content-type", "text/plain"),           // 53
-    ("content-type", "text/plain;charset=utf-8"),           // 54
-    ("range", "bytes=0-"),                    // 55
-    ("strict-transport-security", "max-age=31536000"),                        // 56
-    ("strict-transport-security", "max-age=31536000; includesubdomains"),     // 57
-    ("strict-transport-security", "max-age=31536000; includesubdomains; preload"), // 58
-    ("vary", "accept-encoding"),              // 59
-    ("vary", "origin"),                       // 60
-    ("x-content-type-options", "nosniff"),    // 61
-    ("x-xss-protection", "1; mode=block"),   // 62
-    (":status", "100"),                       // 63
-    (":status", "204"),                       // 64
-    (":status", "206"),                       // 65
-    (":status", "302"),                       // 66
-    (":status", "400"),                       // 67
-    (":status", "403"),                       // 68
-    (":status", "421"),                       // 69
-    (":status", "425"),                       // 70
-    (":status", "500"),                       // 71
-    ("accept-language", ""),                  // 72
+    (":authority", ""),                                    // 0
+    (":path", "/"),                                        // 1
+    ("age", "0"),                                          // 2
+    ("content-disposition", ""),                           // 3
+    ("content-length", "0"),                               // 4
+    ("cookie", ""),                                        // 5
+    ("date", ""),                                          // 6
+    ("etag", ""),                                          // 7
+    ("if-modified-since", ""),                             // 8
+    ("if-none-match", ""),                                 // 9
+    ("last-modified", ""),                                 // 10
+    ("link", ""),                                          // 11
+    ("location", ""),                                      // 12
+    ("referer", ""),                                       // 13
+    ("set-cookie", ""),                                    // 14
+    (":method", "CONNECT"),                                // 15
+    (":method", "DELETE"),                                 // 16
+    (":method", "GET"),                                    // 17
+    (":method", "HEAD"),                                   // 18
+    (":method", "OPTIONS"),                                // 19
+    (":method", "POST"),                                   // 20
+    (":method", "PUT"),                                    // 21
+    (":scheme", "http"),                                   // 22
+    (":scheme", "https"),                                  // 23
+    (":status", "103"),                                    // 24
+    (":status", "200"),                                    // 25
+    (":status", "304"),                                    // 26
+    (":status", "404"),                                    // 27
+    (":status", "503"),                                    // 28
+    ("accept", "*/*"),                                     // 29
+    ("accept", "application/dns-message"),                 // 30
+    ("accept-encoding", "gzip, deflate, br"),              // 31
+    ("accept-ranges", "bytes"),                            // 32
+    ("access-control-allow-headers", "cache-control"),     // 33
+    ("access-control-allow-headers", "content-type"),      // 34
+    ("access-control-allow-origin", "*"),                  // 35
+    ("cache-control", "max-age=0"),                        // 36
+    ("cache-control", "max-age=2592000"),                  // 37
+    ("cache-control", "max-age=604800"),                   // 38
+    ("cache-control", "no-cache"),                         // 39
+    ("cache-control", "no-store"),                         // 40
+    ("cache-control", "public, max-age=31536000"),         // 41
+    ("content-encoding", "br"),                            // 42
+    ("content-encoding", "gzip"),                          // 43
+    ("content-type", "application/dns-message"),           // 44
+    ("content-type", "application/javascript"),            // 45
+    ("content-type", "application/json"),                  // 46
+    ("content-type", "application/x-www-form-urlencoded"), // 47
+    ("content-type", "image/gif"),                         // 48
+    ("content-type", "image/jpeg"),                        // 49
+    ("content-type", "image/png"),                         // 50
+    ("content-type", "text/css"),                          // 51
+    ("content-type", "text/html; charset=utf-8"),          // 52
+    ("content-type", "text/plain"),                        // 53
+    ("content-type", "text/plain;charset=utf-8"),          // 54
+    ("range", "bytes=0-"),                                 // 55
+    ("strict-transport-security", "max-age=31536000"),     // 56
+    (
+        "strict-transport-security",
+        "max-age=31536000; includesubdomains",
+    ), // 57
+    (
+        "strict-transport-security",
+        "max-age=31536000; includesubdomains; preload",
+    ), // 58
+    ("vary", "accept-encoding"),                           // 59
+    ("vary", "origin"),                                    // 60
+    ("x-content-type-options", "nosniff"),                 // 61
+    ("x-xss-protection", "1; mode=block"),                 // 62
+    (":status", "100"),                                    // 63
+    (":status", "204"),                                    // 64
+    (":status", "206"),                                    // 65
+    (":status", "302"),                                    // 66
+    (":status", "400"),                                    // 67
+    (":status", "403"),                                    // 68
+    (":status", "421"),                                    // 69
+    (":status", "425"),                                    // 70
+    (":status", "500"),                                    // 71
+    ("accept-language", ""),                               // 72
     ("access-control-allow-credentials", "FALSE"),         // 73
     ("access-control-allow-credentials", "TRUE"),          // 74
-    ("access-control-allow-headers", "*"),                  // 75
-    ("access-control-allow-methods", "get"),                // 76
+    ("access-control-allow-headers", "*"),                 // 75
+    ("access-control-allow-methods", "get"),               // 76
     ("access-control-allow-methods", "get, post, options"), // 77
-    ("access-control-allow-methods", "options"),            // 78
-    ("access-control-expose-headers", "content-length"),    // 79
-    ("access-control-request-headers", "content-type"),     // 80
-    ("access-control-request-method", "get"),               // 81
-    ("access-control-request-method", "post"),              // 82
-    ("alt-svc", "clear"),                     // 83
-    ("authorization", ""),                    // 84
-    ("content-security-policy", "script-src 'none'; object-src 'none'; base-uri 'none'"), // 85
-    ("early-data", "1"),                      // 86
-    ("expect-ct", ""),                        // 87
-    ("forwarded", ""),                        // 88
-    ("if-range", ""),                         // 89
-    ("origin", ""),                           // 90
-    ("purpose", "prefetch"),                  // 91
-    ("server", ""),                           // 92
-    ("timing-allow-origin", "*"),             // 93
-    ("upgrade-insecure-requests", "1"),       // 94
-    ("user-agent", ""),                       // 95
-    ("x-forwarded-for", ""),                  // 96
-    ("x-frame-options", "deny"),             // 97
-    ("x-frame-options", "sameorigin"),       // 98
+    ("access-control-allow-methods", "options"),           // 78
+    ("access-control-expose-headers", "content-length"),   // 79
+    ("access-control-request-headers", "content-type"),    // 80
+    ("access-control-request-method", "get"),              // 81
+    ("access-control-request-method", "post"),             // 82
+    ("alt-svc", "clear"),                                  // 83
+    ("authorization", ""),                                 // 84
+    (
+        "content-security-policy",
+        "script-src 'none'; object-src 'none'; base-uri 'none'",
+    ), // 85
+    ("early-data", "1"),                                   // 86
+    ("expect-ct", ""),                                     // 87
+    ("forwarded", ""),                                     // 88
+    ("if-range", ""),                                      // 89
+    ("origin", ""),                                        // 90
+    ("purpose", "prefetch"),                               // 91
+    ("server", ""),                                        // 92
+    ("timing-allow-origin", "*"),                          // 93
+    ("upgrade-insecure-requests", "1"),                    // 94
+    ("user-agent", ""),                                    // 95
+    ("x-forwarded-for", ""),                               // 96
+    ("x-frame-options", "deny"),                           // 97
+    ("x-frame-options", "sameorigin"),                     // 98
 ];
 
 /// QPACK header field decoder.
@@ -580,7 +588,7 @@ fn decode_huffman(data: &[u8]) -> Result<String, DecodeError> {
     // Node in the binary decode tree. Left = bit 0, Right = bit 1.
     // A leaf stores Some(symbol), internal nodes store None.
     struct Node {
-        symbol: Option<u16>,
+        symbol:   Option<u16>,
         children: [u16; 2], // 0 = no child
     }
 
@@ -588,11 +596,11 @@ fn decode_huffman(data: &[u8]) -> Result<String, DecodeError> {
     // in practice, but allocate generously.
     let mut nodes: Vec<Node> = Vec::with_capacity(1024);
     nodes.push(Node {
-        symbol: None,
+        symbol:   None,
         children: [0, 0],
     }); // root = index 0 (but we use 1-indexed, so push a dummy)
     nodes.push(Node {
-        symbol: None,
+        symbol:   None,
         children: [0, 0],
     }); // root at index 1
 
@@ -605,7 +613,7 @@ fn decode_huffman(data: &[u8]) -> Result<String, DecodeError> {
             let bit = ((code >> i) & 1) as usize;
             if nodes[current as usize].children[bit] == 0 {
                 nodes.push(Node {
-                    symbol: None,
+                    symbol:   None,
                     children: [0, 0],
                 });
                 let new_idx = (nodes.len() - 1) as u16;
@@ -683,8 +691,8 @@ mod tests {
     #[test]
     fn test_decode_static_indexed_header() {
         let mut decoder = QpackDecoder::new();
-        // Header block: RIC=0, DeltaBase=0, then indexed static field for :method GET (index 17)
-        // RIC: 0x00 (8-bit prefix, value 0)
+        // Header block: RIC=0, DeltaBase=0, then indexed static field for :method GET
+        // (index 17) RIC: 0x00 (8-bit prefix, value 0)
         // DeltaBase: 0x00 (7-bit prefix, value 0)
         // Indexed static: 1_1_010001 = 0xC0 | 0x11 = 0xD1 (S=1, index=17)
         let block = [0x00, 0x00, 0xd1];
@@ -699,7 +707,8 @@ mod tests {
         // RIC=0, DeltaBase=0, :method GET (17), :scheme https (23), :path / (1)
         // Indexed static: 0xC0 | index (with S=1 bit set at position 6)
         // Pattern: 1Sxxxxxx where S=1 means static
-        // For 6-bit prefix: 0b11_010001=0xD1 (17), 0b11_010111=0xD7 (23), 0b11_000001=0xC1 (1)
+        // For 6-bit prefix: 0b11_010001=0xD1 (17), 0b11_010111=0xD7 (23),
+        // 0b11_000001=0xC1 (1)
         let block = [0x00, 0x00, 0xd1, 0xd7, 0xc1];
         let headers = decoder.decode_header_block(&block).unwrap();
         assert_eq!(headers.len(), 3);
@@ -775,7 +784,9 @@ mod tests {
     fn test_huffman_decode_localhost_8443() {
         // From a raw QPACK capture: 0x8a is the length prefix (H=1, len=10),
         // followed by 10 bytes of Huffman-encoded "localhost:8443"
-        let wire = [0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33];
+        let wire = [
+            0x8a, 0xa0, 0xe4, 0x1d, 0x13, 0x9d, 0x09, 0xb8, 0xf3, 0x4d, 0x33,
+        ];
         let (decoded, consumed) = decode_string(&wire).unwrap();
         assert_eq!(decoded, "localhost:8443");
         assert_eq!(consumed, 11);

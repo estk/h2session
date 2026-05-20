@@ -1211,7 +1211,9 @@ fn test_cleanup_clock_skew_no_panic() {
     let collator: Collator<TestEvent> = Collator::with_config(config);
 
     // Manually insert a connection with last_activity in the "future"
-    collator.connections.insert(1, Conn::new(1234, 8080, String::new()));
+    collator
+        .connections
+        .insert(1, Conn::new(1234, 8080, String::new()));
     collator.connections.get_mut(&1).unwrap().last_activity_ns = TimestampNs(10_000_000_000);
 
     // Cleanup with a current_time BEFORE the last activity (clock skew).
@@ -1519,7 +1521,8 @@ fn test_h1_two_pipelined_requests_on_same_connection() {
     assert_eq!(
         events2.len(),
         1,
-        "second pipelined request on same conn_id must surface as a Message event, got: {events2:?}"
+        "second pipelined request on same conn_id must surface as a Message event, got: \
+         {events2:?}"
     );
     let (msg2, _) = events2[0].as_message().unwrap();
     assert_eq!(msg2.as_request().unwrap().uri.path(), "/second");
@@ -1544,7 +1547,8 @@ fn test_h1_ten_sequential_requests_on_same_connection() {
         assert_eq!(
             events.len(),
             1,
-            "iteration {i}: expected one Message event per request on keep-alive conn, got: {events:?}"
+            "iteration {i}: expected one Message event per request on keep-alive conn, got: \
+             {events:?}"
         );
         let (msg, _) = events[0].as_message().unwrap();
         assert_eq!(

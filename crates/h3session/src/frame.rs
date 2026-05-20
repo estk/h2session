@@ -32,7 +32,7 @@ impl From<u64> for FrameType {
 #[derive(Debug, Clone)]
 pub struct Frame {
     pub frame_type: FrameType,
-    pub payload: Bytes,
+    pub payload:    Bytes,
 }
 
 /// Decode a QUIC variable-length integer (RFC 9000 Section 16).
@@ -55,17 +55,17 @@ pub fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
         2 => {
             let raw = u16::from_be_bytes([buf[0], buf[1]]);
             (raw & 0x3fff) as u64
-        }
+        },
         4 => {
             let raw = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
             (raw & 0x3fff_ffff) as u64
-        }
+        },
         8 => {
             let raw = u64::from_be_bytes([
                 buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
             ]);
             raw & 0x3fff_ffff_ffff_ffff
-        }
+        },
         _ => unreachable!(),
     };
 

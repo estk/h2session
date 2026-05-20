@@ -73,7 +73,7 @@ pub const MAX_BUF_SIZE: usize = 16384;
 /// Tracks HTTP/3 state for a single QUIC connection.
 /// Each QUIC connection can have multiple concurrent streams (requests).
 struct QuicConnection {
-    h3_state:         H3ConnectionState,
+    h3_state: H3ConnectionState,
     last_activity_ns: TimestampNs,
     /// Pending requests awaiting their response (keyed by stream_id)
     pending_requests: std::collections::HashMap<i64, HttpRequest>,
@@ -237,7 +237,9 @@ impl<E: DataEvent> Collator<E> {
         }
     }
 
-    /// Process a QUIC/HTTP3 event: feed to h3session and check for completed messages.
+    /// Process a QUIC/HTTP3 event: feed to h3session and check for completed
+    /// messages.
+    #[allow(clippy::too_many_arguments)]
     fn process_quic_event(
         &self,
         conn_id: u128,
@@ -250,18 +252,20 @@ impl<E: DataEvent> Collator<E> {
     ) -> Vec<CollationEvent> {
         use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 
-        let mut quic_conn = self
-            .quic_connections
-            .entry(conn_id)
-            .or_insert_with(|| QuicConnection {
-                h3_state: H3ConnectionState::new(),
-                last_activity_ns: TimestampNs(0),
-                pending_requests: std::collections::HashMap::new(),
-                submitted_response_headers: std::collections::HashMap::new(),
-            });
+        let mut quic_conn =
+            self.quic_connections
+                .entry(conn_id)
+                .or_insert_with(|| QuicConnection {
+                    h3_state: H3ConnectionState::new(),
+                    last_activity_ns: TimestampNs(0),
+                    pending_requests: std::collections::HashMap::new(),
+                    submitted_response_headers: std::collections::HashMap::new(),
+                });
 
         quic_conn.last_activity_ns = timestamp_ns;
-        quic_conn.h3_state.feed(stream_id, payload, timestamp_ns.0, fin);
+        quic_conn
+            .h3_state
+            .feed(stream_id, payload, timestamp_ns.0, fin);
 
         let mut events = Vec::new();
         while let Some((sid, msg)) = quic_conn.h3_state.try_pop() {
@@ -270,13 +274,19 @@ impl<E: DataEvent> Collator<E> {
             // treat the message as a response on these streams.
             let is_request = msg.is_request();
             let is_response = msg.is_response()
-                || (!is_request && sid % 4 == 0 && (msg.headers.is_empty() || !msg.body.is_empty()));
+                || (!is_request
+                    && sid % 4 == 0
+                    && (msg.headers.is_empty() || !msg.body.is_empty()));
 
             if is_request {
                 let Some(method) = msg.method().and_then(|m| m.parse::<Method>().ok()) else {
                     continue;
                 };
-                let uri: Uri = msg.path().unwrap_or("/").parse().unwrap_or(Uri::from_static("/"));
+                let uri: Uri = msg
+                    .path()
+                    .unwrap_or("/")
+                    .parse()
+                    .unwrap_or(Uri::from_static("/"));
 
                 let mut headers = HeaderMap::new();
                 for (name, value) in &msg.headers {
@@ -303,7 +313,7 @@ impl<E: DataEvent> Collator<E> {
 
                 if self.config.emit_messages {
                     events.push(CollationEvent::Message {
-                        message: ParsedHttpMessage::Request(request.clone()),
+                        message:  ParsedHttpMessage::Request(request.clone()),
                         metadata: MessageMetadata {
                             connection_id: conn_id,
                             process_id,
@@ -322,8 +332,8 @@ impl<E: DataEvent> Collator<E> {
                 // Use pre-registered headers from submit_response if QPACK
                 // decode yielded nothing beyond :status
                 let submitted = quic_conn.submitted_response_headers.remove(&sid);
-                let use_submitted = submitted.is_some()
-                    && msg.headers.iter().all(|(n, _)| n.starts_with(':'));
+                let use_submitted =
+                    submitted.is_some() && msg.headers.iter().all(|(n, _)| n.starts_with(':'));
 
                 let effective_headers: &[(String, String)] = if use_submitted {
                     submitted.as_ref().unwrap()
@@ -381,12 +391,12 @@ impl<E: DataEvent> Collator<E> {
                     } else {
                         // No captured request (write probe may not have fired)
                         let placeholder = HttpRequest {
-                            method: Method::GET,
-                            uri: Uri::from_static("/"),
-                            headers: HeaderMap::new(),
-                            body: Vec::new(),
+                            method:       Method::GET,
+                            uri:          Uri::from_static("/"),
+                            headers:      HeaderMap::new(),
+                            body:         Vec::new(),
                             timestamp_ns: TimestampNs(msg.first_frame_timestamp_ns),
-                            version: None,
+                            version:      None,
                         };
                         (placeholder, 0)
                     };
@@ -411,8 +421,9 @@ impl<E: DataEvent> Collator<E> {
         events
     }
 
-    /// Register pre-decoded response headers captured from nghttp3_conn_submit_response.
-    /// The payload is "name: value\n" lines (plaintext, before QPACK encoding).
+    /// Register pre-decoded response headers captured from
+    /// nghttp3_conn_submit_response. The payload is "name: value\n" lines
+    /// (plaintext, before QPACK encoding).
     fn register_submit_response(
         &self,
         conn_id: u128,
@@ -433,18 +444,20 @@ impl<E: DataEvent> Collator<E> {
             return;
         }
 
-        let mut quic_conn = self
-            .quic_connections
-            .entry(conn_id)
-            .or_insert_with(|| QuicConnection {
-                h3_state: H3ConnectionState::new(),
-                last_activity_ns: TimestampNs(0),
-                pending_requests: std::collections::HashMap::new(),
-                submitted_response_headers: std::collections::HashMap::new(),
-            });
+        let mut quic_conn =
+            self.quic_connections
+                .entry(conn_id)
+                .or_insert_with(|| QuicConnection {
+                    h3_state: H3ConnectionState::new(),
+                    last_activity_ns: TimestampNs(0),
+                    pending_requests: std::collections::HashMap::new(),
+                    submitted_response_headers: std::collections::HashMap::new(),
+                });
 
         quic_conn.last_activity_ns = timestamp_ns;
-        quic_conn.submitted_response_headers.insert(stream_id, headers);
+        quic_conn
+            .submitted_response_headers
+            .insert(stream_id, headers);
     }
 
     /// Core event processing logic, called with a mutable reference to the
@@ -553,13 +566,7 @@ impl<E: DataEvent> Collator<E> {
 
                 match conn.protocol {
                     Protocol::Http1 => {
-                        drain_parse_emit_http1_read(
-                            conn,
-                            conn_id,
-                            process_id,
-                            config,
-                            &mut events,
-                        );
+                        drain_parse_emit_http1_read(conn, conn_id, process_id, config, &mut events);
                     },
                     Protocol::Http2 => {
                         parse_http2_chunks(conn, direction);
@@ -644,7 +651,9 @@ impl<E: DataEvent> Collator<E> {
         }
         // Evict stale HTTP/3 streams within surviving QUIC connections
         for mut entry in self.quic_connections.iter_mut() {
-            entry.h3_state.cleanup_stale_streams(current_time_ns.0, self.config.timeout_ns);
+            entry
+                .h3_state
+                .cleanup_stale_streams(current_time_ns.0, self.config.timeout_ns);
         }
     }
 

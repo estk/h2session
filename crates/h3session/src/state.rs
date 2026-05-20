@@ -1,9 +1,12 @@
 use bytes::{Bytes, BytesMut};
 
-use crate::frame::{self, Frame, FrameType};
-use crate::qpack::{DecodeError, QpackDecoder};
+use crate::{
+    frame::{self, Frame, FrameType},
+    qpack::{DecodeError, QpackDecoder},
+};
 
-/// A fully parsed HTTP/3 message (request or response) from a single QUIC stream.
+/// A fully parsed HTTP/3 message (request or response) from a single QUIC
+/// stream.
 #[derive(Debug, Clone)]
 pub struct ParsedH3Message {
     pub headers: Vec<(String, String)>,
@@ -16,16 +19,13 @@ pub struct ParsedH3Message {
 impl ParsedH3Message {
     /// Returns true if this message has a :method pseudo-header (is a request).
     pub fn is_request(&self) -> bool {
-        self.headers
-            .iter()
-            .any(|(name, _)| name == ":method")
+        self.headers.iter().any(|(name, _)| name == ":method")
     }
 
-    /// Returns true if this message has a :status pseudo-header (is a response).
+    /// Returns true if this message has a :status pseudo-header (is a
+    /// response).
     pub fn is_response(&self) -> bool {
-        self.headers
-            .iter()
-            .any(|(name, _)| name == ":status")
+        self.headers.iter().any(|(name, _)| name == ":status")
     }
 
     /// Convert to http_collator-compatible HttpRequest (if this is a request).
@@ -61,21 +61,21 @@ impl ParsedH3Message {
 /// Per-stream accumulation state.
 #[derive(Debug)]
 pub struct H3StreamState {
-    buffer: BytesMut,
-    headers: Option<Vec<(String, String)>>,
-    body: BytesMut,
+    buffer:         BytesMut,
+    headers:        Option<Vec<(String, String)>>,
+    body:           BytesMut,
     first_frame_ts: Option<u64>,
-    fin_received: bool,
+    fin_received:   bool,
 }
 
 impl H3StreamState {
     fn new() -> Self {
         Self {
-            buffer: BytesMut::new(),
-            headers: None,
-            body: BytesMut::new(),
+            buffer:         BytesMut::new(),
+            headers:        None,
+            body:           BytesMut::new(),
             first_frame_ts: None,
-            fin_received: false,
+            fin_received:   false,
         }
     }
 
@@ -123,7 +123,10 @@ impl H3ConnectionState {
             return;
         }
 
-        let stream = self.streams.entry(stream_id).or_insert_with(H3StreamState::new);
+        let stream = self
+            .streams
+            .entry(stream_id)
+            .or_insert_with(H3StreamState::new);
 
         if stream.first_frame_ts.is_none() {
             stream.first_frame_ts = Some(timestamp_ns);
@@ -146,19 +149,19 @@ impl H3ConnectionState {
         }
 
         // Check if stream is complete and move to completed queue
-        if let Some(stream) = self.streams.get(&stream_id) {
-            if stream.is_complete() {
-                let stream = self.streams.remove(&stream_id).unwrap();
-                *self.stream_completions.entry(stream_id).or_insert(0) += 1;
-                let msg = ParsedH3Message {
-                    headers: stream.headers.unwrap_or_default(),
-                    body: stream.body.freeze(),
-                    stream_id,
-                    first_frame_timestamp_ns: stream.first_frame_ts.unwrap_or(timestamp_ns),
-                    end_stream_timestamp_ns: timestamp_ns,
-                };
-                self.completed.push((stream_id, msg));
-            }
+        if let Some(stream) = self.streams.get(&stream_id)
+            && stream.is_complete()
+        {
+            let stream = self.streams.remove(&stream_id).unwrap();
+            *self.stream_completions.entry(stream_id).or_insert(0) += 1;
+            let msg = ParsedH3Message {
+                headers: stream.headers.unwrap_or_default(),
+                body: stream.body.freeze(),
+                stream_id,
+                first_frame_timestamp_ns: stream.first_frame_ts.unwrap_or(timestamp_ns),
+                end_stream_timestamp_ns: timestamp_ns,
+            };
+            self.completed.push((stream_id, msg));
         }
     }
 
@@ -173,24 +176,24 @@ impl H3ConnectionState {
                 match self.decoder.decode_header_block(&frame.payload) {
                     Ok(headers) => {
                         stream.headers = Some(headers);
-                    }
+                    },
                     Err(DecodeError::DynamicTableRequired(_)) => {
                         // Missing dynamic table context (mid-connection attach).
                         // Store empty headers — we can still capture the body.
                         stream.headers = Some(Vec::new());
-                    }
+                    },
                     Err(_) => {
                         // Other decode errors — store empty headers
                         stream.headers = Some(Vec::new());
-                    }
+                    },
                 }
-            }
+            },
             FrameType::Data => {
                 stream.body.extend_from_slice(&frame.payload);
-            }
+            },
             _ => {
                 // SETTINGS, GOAWAY, etc. — ignored for message parsing
-            }
+            },
         }
     }
 
@@ -251,7 +254,8 @@ mod tests {
     fn test_simple_request_stream() {
         let mut state = H3ConnectionState::new();
 
-        // QPACK encoded: RIC=0, DeltaBase=0, :method GET (static 17), :path / (static 1)
+        // QPACK encoded: RIC=0, DeltaBase=0, :method GET (static 17), :path / (static
+        // 1)
         let qpack_block = vec![0x00, 0x00, 0xd1, 0xc1];
         let headers_frame = make_headers_frame(&qpack_block);
 

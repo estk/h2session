@@ -54,7 +54,6 @@ use std::marker::PhantomData;
 
 pub use connection::Protocol;
 use connection::{Connection as Conn, DataChunk};
-use scc::HashMap as ConcurrentMap;
 pub use exchange::{CollationEvent, CollatorConfig, Exchange, MessageMetadata, ParsedHttpMessage};
 pub use h1::{HttpRequest, HttpResponse};
 use h2session::{
@@ -65,6 +64,7 @@ use h2session::{
     looks_like_http2_frame,
 };
 use h3session::H3ConnectionState;
+use scc::HashMap as ConcurrentMap;
 pub use traits::{DataEvent, Direction};
 
 /// Default maximum buffer size for data events (TLS record size)

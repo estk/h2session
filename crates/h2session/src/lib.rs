@@ -78,9 +78,9 @@ macro_rules! trace_warn {
 }
 use std::{collections::HashMap, hash::Hash, sync::Mutex};
 
-use scc::HashMap as ConcurrentMap;
 pub use frame::{CONNECTION_PREFACE, is_http2_preface, looks_like_http2_frame};
 pub use http_types::{HttpRequest, HttpResponse};
+use scc::HashMap as ConcurrentMap;
 pub use state::{
     H2ConnectionState,
     H2Limits,

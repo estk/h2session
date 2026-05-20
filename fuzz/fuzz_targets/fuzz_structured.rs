@@ -50,27 +50,27 @@ impl FuzzFrame {
                 flags |= FLAG_PADDED;
                 let mut new_payload = vec![pad_len];
                 new_payload.extend(&payload);
-                new_payload.extend(std::iter::repeat(0u8).take(pad_len as usize));
+                new_payload.extend(std::iter::repeat_n(0u8, pad_len as usize));
                 payload = new_payload;
             }
         }
 
         // Handle PRIORITY flag for HEADERS
-        if self.add_priority && frame_type == FRAME_TYPE_HEADERS {
-            if payload.len() + 5 <= 16384 {
-                flags |= FLAG_PRIORITY;
-                let mut new_payload = Vec::new();
-                // If already padded, insert priority after pad length
-                if flags & FLAG_PADDED != 0 && !payload.is_empty() {
-                    new_payload.push(payload[0]); // Pad length
-                    new_payload.extend(&[0, 0, 0, 0, 16]); // Priority: dep=0, weight=16
-                    new_payload.extend(&payload[1..]);
-                } else {
-                    new_payload.extend(&[0, 0, 0, 0, 16]); // Priority
-                    new_payload.extend(&payload);
-                }
-                payload = new_payload;
+        if self.add_priority && frame_type == FRAME_TYPE_HEADERS
+            && payload.len() + 5 <= 16384
+        {
+            flags |= FLAG_PRIORITY;
+            let mut new_payload = Vec::new();
+            // If already padded, insert priority after pad length
+            if flags & FLAG_PADDED != 0 && !payload.is_empty() {
+                new_payload.push(payload[0]); // Pad length
+                new_payload.extend(&[0, 0, 0, 0, 16]); // Priority: dep=0, weight=16
+                new_payload.extend(&payload[1..]);
+            } else {
+                new_payload.extend(&[0, 0, 0, 0, 16]); // Priority
+                new_payload.extend(&payload);
             }
+            payload = new_payload;
         }
 
         // Limit payload size

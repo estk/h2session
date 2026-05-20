@@ -1064,11 +1064,7 @@ fn test_cleanup_evicts_stale_h2_streams() {
 
     // Cleanup at t=40s (> default 30s stream timeout) with a recent last_activity
     // First update last_activity so the connection itself survives
-    collator
-        .connections
-        .get(&conn_id)
-        .unwrap()
-        .last_activity_ns = TimestampNs(39_000_000_000);
+    collator.connections.get(&conn_id).unwrap().last_activity_ns = TimestampNs(39_000_000_000);
     collator.cleanup(TimestampNs(40_000_000_000));
 
     // Connection should survive but stale stream should be evicted

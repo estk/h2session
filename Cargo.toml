@@ -1,6 +1,15 @@
 [workspace]
-members = ["crates/h2session", "crates/h3session", "crates/http-collator", "fuzz"]
-default-members = ["crates/h2session", "crates/h3session", "crates/http-collator"]
+members = [
+    "crates/h2session",
+    "crates/h3session",
+    "crates/http-collator",
+    "fuzz",
+]
+default-members = [
+    "crates/h2session",
+    "crates/h3session",
+    "crates/http-collator",
+]
 resolver = "2"
 
 [workspace.package]
@@ -13,7 +22,7 @@ bytes = "1"
 http = "1"
 httparse = "1"
 loona-hpack = "0.4"
-dashmap = "6.1.0"
+dashmap = "6.2.0"
 tracing = "0.1"
 rstest = "0.26"
 h2session = { path = "crates/h2session", version = "0.4.0" }

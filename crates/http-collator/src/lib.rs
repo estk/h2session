@@ -54,7 +54,7 @@ use std::marker::PhantomData;
 
 pub use connection::Protocol;
 use connection::{Connection as Conn, DataChunk};
-use dashmap::DashMap;
+use scc::HashMap as ConcurrentMap;
 pub use exchange::{CollationEvent, CollatorConfig, Exchange, MessageMetadata, ParsedHttpMessage};
 pub use h1::{HttpRequest, HttpResponse};
 use h2session::{
@@ -85,15 +85,15 @@ struct QuicConnection {
 /// Collates individual data events into complete request/response exchanges.
 ///
 /// Generic over the event type `E` which must implement [`DataEvent`].
-/// Uses per-connection locking via `DashMap` so concurrent HTTP/2 connections
-/// do not serialize through a single mutex.
+/// Uses per-connection locking via `scc::HashMap` so concurrent HTTP/2
+/// connections do not serialize through a single mutex.
 pub struct Collator<E: DataEvent> {
     /// Connections tracked by conn_id (for socket events)
-    connections:      DashMap<u128, Conn>,
+    connections:      ConcurrentMap<u128, Conn>,
     /// SSL connections tracked by process_id (no conn_id available)
-    ssl_connections:  DashMap<u32, Conn>,
+    ssl_connections:  ConcurrentMap<u32, Conn>,
     /// QUIC connections tracked by conn_id (tgid << 64 | conn_ptr)
-    quic_connections: DashMap<u128, QuicConnection>,
+    quic_connections: ConcurrentMap<u128, QuicConnection>,
     /// Configuration for what events to emit
     config:           CollatorConfig,
     /// Phantom data for the event type
@@ -116,9 +116,9 @@ impl<E: DataEvent> Collator<E> {
     /// Create a new collator with custom configuration
     pub fn with_config(config: CollatorConfig) -> Self {
         Self {
-            connections: DashMap::new(),
-            ssl_connections: DashMap::new(),
-            quic_connections: DashMap::new(),
+            connections: ConcurrentMap::new(),
+            ssl_connections: ConcurrentMap::new(),
+            quic_connections: ConcurrentMap::new(),
             config,
             _phantom: PhantomData,
         }
@@ -200,15 +200,13 @@ impl<E: DataEvent> Collator<E> {
             direction,
         };
 
-        // DashMap entry() locks only the shard for this connection, allowing
-        // concurrent access to other connections.
         if conn_id != 0 {
-            let mut conn = self
+            let mut entry = self
                 .connections
                 .entry(conn_id)
                 .or_insert_with(|| Conn::new(process_id, remote_port, command.clone()));
             Self::process_event_for_conn(
-                &mut conn,
+                entry.get_mut(),
                 chunk,
                 direction,
                 timestamp_ns,
@@ -219,12 +217,12 @@ impl<E: DataEvent> Collator<E> {
                 &self.config,
             )
         } else {
-            let mut conn = self
+            let mut entry = self
                 .ssl_connections
                 .entry(process_id)
                 .or_insert_with(|| Conn::new(process_id, remote_port, command.clone()));
             Self::process_event_for_conn(
-                &mut conn,
+                entry.get_mut(),
                 chunk,
                 direction,
                 timestamp_ns,
@@ -252,7 +250,7 @@ impl<E: DataEvent> Collator<E> {
     ) -> Vec<CollationEvent> {
         use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 
-        let mut quic_conn =
+        let mut quic_entry =
             self.quic_connections
                 .entry(conn_id)
                 .or_insert_with(|| QuicConnection {
@@ -261,6 +259,7 @@ impl<E: DataEvent> Collator<E> {
                     pending_requests: std::collections::HashMap::new(),
                     submitted_response_headers: std::collections::HashMap::new(),
                 });
+        let quic_conn = quic_entry.get_mut();
 
         quic_conn.last_activity_ns = timestamp_ns;
         quic_conn
@@ -444,7 +443,7 @@ impl<E: DataEvent> Collator<E> {
             return;
         }
 
-        let mut quic_conn =
+        let mut quic_entry =
             self.quic_connections
                 .entry(conn_id)
                 .or_insert_with(|| QuicConnection {
@@ -453,6 +452,7 @@ impl<E: DataEvent> Collator<E> {
                     pending_requests: std::collections::HashMap::new(),
                     submitted_response_headers: std::collections::HashMap::new(),
                 });
+        let quic_conn = quic_entry.get_mut();
 
         quic_conn.last_activity_ns = timestamp_ns;
         quic_conn
@@ -461,7 +461,7 @@ impl<E: DataEvent> Collator<E> {
     }
 
     /// Core event processing logic, called with a mutable reference to the
-    /// connection (obtained from a `DashMap` entry guard).
+    /// connection (obtained from an `scc::HashMap` entry guard).
     #[allow(clippy::too_many_arguments)]
     fn process_event_for_conn(
         conn: &mut Conn,
@@ -631,30 +631,29 @@ impl<E: DataEvent> Collator<E> {
     /// abandoned connections and incomplete HTTP/2 streams.
     pub fn cleanup(&self, current_time_ns: TimestampNs) {
         self.connections.retain(|_, conn| {
-            current_time_ns.saturating_sub(conn.last_activity_ns) < self.config.timeout_ns
+            if current_time_ns.saturating_sub(conn.last_activity_ns) >= self.config.timeout_ns {
+                return false;
+            }
+            conn.h2_write_state.evict_stale_streams(current_time_ns);
+            conn.h2_read_state.evict_stale_streams(current_time_ns);
+            true
         });
         self.ssl_connections.retain(|_, conn| {
-            current_time_ns.saturating_sub(conn.last_activity_ns) < self.config.timeout_ns
+            if current_time_ns.saturating_sub(conn.last_activity_ns) >= self.config.timeout_ns {
+                return false;
+            }
+            conn.h2_write_state.evict_stale_streams(current_time_ns);
+            conn.h2_read_state.evict_stale_streams(current_time_ns);
+            true
         });
         self.quic_connections.retain(|_, conn| {
-            current_time_ns.saturating_sub(conn.last_activity_ns) < self.config.timeout_ns
-        });
-
-        // Evict stale H2 streams within surviving connections
-        for mut entry in self.connections.iter_mut() {
-            entry.h2_write_state.evict_stale_streams(current_time_ns);
-            entry.h2_read_state.evict_stale_streams(current_time_ns);
-        }
-        for mut entry in self.ssl_connections.iter_mut() {
-            entry.h2_write_state.evict_stale_streams(current_time_ns);
-            entry.h2_read_state.evict_stale_streams(current_time_ns);
-        }
-        // Evict stale HTTP/3 streams within surviving QUIC connections
-        for mut entry in self.quic_connections.iter_mut() {
-            entry
-                .h3_state
+            if current_time_ns.saturating_sub(conn.last_activity_ns) >= self.config.timeout_ns {
+                return false;
+            }
+            conn.h3_state
                 .cleanup_stale_streams(current_time_ns.0, self.config.timeout_ns);
-        }
+            true
+        });
     }
 
     /// Remove a connection explicitly (e.g., on connection close)
@@ -663,9 +662,9 @@ impl<E: DataEvent> Collator<E> {
     /// If connection_id is 0, removes based on process_id from SSL connections.
     pub fn remove_connection(&self, connection_id: u128, process_id: u32) {
         if connection_id != 0 {
-            self.connections.remove(&connection_id);
+            let _ = self.connections.remove(&connection_id);
         } else {
-            self.ssl_connections.remove(&process_id);
+            let _ = self.ssl_connections.remove(&process_id);
         }
     }
 
@@ -678,16 +677,16 @@ impl<E: DataEvent> Collator<E> {
     /// the connection.
     pub fn close_connection(&self, connection_id: u128, process_id: u32) -> Vec<CollationEvent> {
         let events = if connection_id != 0 {
-            match self.connections.get_mut(&connection_id) {
-                Some(mut guard) => {
-                    finalize_and_emit(&mut guard, connection_id, process_id, &self.config)
+            match self.connections.get(&connection_id) {
+                Some(mut entry) => {
+                    finalize_and_emit(entry.get_mut(), connection_id, process_id, &self.config)
                 },
                 None => Vec::new(),
             }
         } else {
-            match self.ssl_connections.get_mut(&process_id) {
-                Some(mut guard) => {
-                    finalize_and_emit(&mut guard, connection_id, process_id, &self.config)
+            match self.ssl_connections.get(&process_id) {
+                Some(mut entry) => {
+                    finalize_and_emit(entry.get_mut(), connection_id, process_id, &self.config)
                 },
                 None => Vec::new(),
             }
@@ -695,9 +694,9 @@ impl<E: DataEvent> Collator<E> {
 
         // Remove the connection after releasing the guard
         if connection_id != 0 {
-            self.connections.remove(&connection_id);
+            let _ = self.connections.remove(&connection_id);
         } else {
-            self.ssl_connections.remove(&process_id);
+            let _ = self.ssl_connections.remove(&process_id);
         }
 
         events

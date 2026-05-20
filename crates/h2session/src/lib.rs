@@ -78,8 +78,7 @@ macro_rules! trace_warn {
 }
 use std::{collections::HashMap, hash::Hash, sync::Mutex};
 
-// Public re-exports for direct state management
-use dashmap::DashMap;
+use scc::HashMap as ConcurrentMap;
 pub use frame::{CONNECTION_PREFACE, is_http2_preface, looks_like_http2_frame};
 pub use http_types::{HttpRequest, HttpResponse};
 pub use state::{
@@ -95,21 +94,19 @@ pub(crate) use trace_warn;
 
 /// HTTP/2 session cache with generic connection keys.
 ///
-/// Uses `DashMap<K, Mutex<H2ConnectionState>>` to provide per-key
-/// serialization. The DashMap shard lock is held only briefly (to look up or
-/// insert the entry), while the per-key Mutex serializes concurrent same-key
-/// calls to `parse()`. This prevents the remove-and-reinsert race where two
-/// threads would both create default state for the same key, losing one
-/// thread's HPACK table.
+/// Uses `scc::HashMap<K, Mutex<H2ConnectionState>>` to provide per-key
+/// serialization. The bucket lock is held only briefly (to look up or insert
+/// the entry), while the per-key Mutex serializes concurrent same-key calls
+/// to `parse()`.
 pub struct H2SessionCache<K> {
-    connections: DashMap<K, Mutex<H2ConnectionState>>,
+    connections: ConcurrentMap<K, Mutex<H2ConnectionState>>,
 }
 
 impl<K: Hash + Eq + Clone> H2SessionCache<K> {
     /// Create a new cache
     pub fn new() -> Self {
         Self {
-            connections: DashMap::new(),
+            connections: ConcurrentMap::new(),
         }
     }
 
@@ -123,14 +120,11 @@ impl<K: Hash + Eq + Clone> H2SessionCache<K> {
         key: K,
         buffer: &[u8],
     ) -> Result<HashMap<StreamId, ParsedH2Message>, ParseError> {
-        // Atomic insert-if-absent
-        self.connections
-            .entry(key.clone())
+        let entry = self
+            .connections
+            .entry(key)
             .or_insert_with(|| Mutex::new(H2ConnectionState::default()));
-
-        // Get shared shard read lock + per-key mutex lock
-        let entry = self.connections.get(&key).expect("entry was just ensured");
-        let mut state = entry.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = entry.get().lock().unwrap_or_else(|e| e.into_inner());
         parse::parse_frames_stateful(buffer, &mut state)
     }
 
@@ -143,7 +137,7 @@ impl<K: Hash + Eq + Clone> H2SessionCache<K> {
 
     /// Check if connection state exists
     pub fn contains(&self, key: &K) -> bool {
-        self.connections.contains_key(key)
+        self.connections.contains(key)
     }
 
     /// Get number of tracked connections

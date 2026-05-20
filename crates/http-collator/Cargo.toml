@@ -9,7 +9,7 @@ categories = ["network-programming", "parser-implementations"]
 
 [dependencies]
 bytes.workspace = true
-dashmap.workspace = true
+scc.workspace = true
 h2session.workspace = true
 h3session.workspace = true
 http.workspace = true

@@ -1066,7 +1066,7 @@ fn test_cleanup_evicts_stale_h2_streams() {
     // First update last_activity so the connection itself survives
     collator
         .connections
-        .get_mut(&conn_id)
+        .get(&conn_id)
         .unwrap()
         .last_activity_ns = TimestampNs(39_000_000_000);
     collator.cleanup(TimestampNs(40_000_000_000));
@@ -1211,10 +1211,10 @@ fn test_cleanup_clock_skew_no_panic() {
     let collator: Collator<TestEvent> = Collator::with_config(config);
 
     // Manually insert a connection with last_activity in the "future"
-    collator
+    let _ = collator
         .connections
         .insert(1, Conn::new(1234, 8080, String::new()));
-    collator.connections.get_mut(&1).unwrap().last_activity_ns = TimestampNs(10_000_000_000);
+    collator.connections.get(&1).unwrap().last_activity_ns = TimestampNs(10_000_000_000);
 
     // Cleanup with a current_time BEFORE the last activity (clock skew).
     // With unsigned subtraction this would panic; saturating_sub prevents it.

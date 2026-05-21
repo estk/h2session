@@ -8,6 +8,7 @@ description = "HTTP/3 frame parser and QPACK header decompression for stream-lev
 [dependencies]
 bytes = { workspace = true }
 http = { workspace = true }
+log = "0.4"
 
 [dev-dependencies]
 rstest = { workspace = true }

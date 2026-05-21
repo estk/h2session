@@ -79,10 +79,15 @@ impl H3StreamState {
         }
     }
 
-    /// Returns true if the stream has HEADERS and either FIN or enough data
-    /// to consider it complete.
-    fn is_complete(&self) -> bool {
-        self.headers.is_some() && self.fin_received
+    /// Returns true if the stream has HEADERS and either FIN, body data, or
+    /// this is the second message on the stream (i.e. the response after a
+    /// request). For server-side instrumentation, we may not see FIN before
+    /// the process exits — having parsed HEADERS is sufficient for a response.
+    fn is_complete(&self, is_second_on_stream: bool) -> bool {
+        if self.headers.is_none() {
+            return false;
+        }
+        self.fin_received || !self.body.is_empty() || is_second_on_stream
     }
 }
 
@@ -117,9 +122,16 @@ impl H3ConnectionState {
     /// `timestamp_ns`: when this data was captured
     /// `fin`: whether this is the final data on the stream
     pub fn feed(&mut self, stream_id: i64, data: &[u8], timestamp_ns: u64, fin: bool) {
+        let completions = *self.stream_completions.get(&stream_id).unwrap_or(&0);
+        log::debug!(
+            "h3: feed stream={} len={} fin={} completions={}",
+            stream_id, data.len(), fin, completions
+        );
+
         // HTTP/3 bidirectional streams carry one request + one response (2 messages).
         // A 3rd completion would be a ghost from a redundant FIN-only event.
-        if *self.stream_completions.get(&stream_id).unwrap_or(&0) >= 2 {
+        if completions >= 2 {
+            log::debug!("h3: stream={} skipped (completions>=2)", stream_id);
             return;
         }
 
@@ -140,8 +152,19 @@ impl H3ConnectionState {
 
         // Parse any complete frames from the buffer
         let (frames, consumed) = frame::parse_frames(&stream.buffer);
+        log::debug!(
+            "h3: stream={} buffer_len={} parsed_frames={} consumed={}",
+            stream_id, stream.buffer.len(), frames.len(), consumed
+        );
         if consumed > 0 {
             let _ = stream.buffer.split_to(consumed);
+        }
+
+        for frame in &frames {
+            log::debug!(
+                "h3: stream={} frame type={:?} payload_len={}",
+                stream_id, frame.frame_type, frame.payload.len()
+            );
         }
 
         for frame in frames {
@@ -149,9 +172,14 @@ impl H3ConnectionState {
         }
 
         // Check if stream is complete and move to completed queue
+        let is_second = completions >= 1;
         if let Some(stream) = self.streams.get(&stream_id)
-            && stream.is_complete()
+            && stream.is_complete(is_second)
         {
+            log::debug!(
+                "h3: stream={} COMPLETE (is_second={} headers={} body_len={} fin={})",
+                stream_id, is_second, stream.headers.is_some(), stream.body.len(), stream.fin_received
+            );
             let stream = self.streams.remove(&stream_id).unwrap();
             *self.stream_completions.entry(stream_id).or_insert(0) += 1;
             let msg = ParsedH3Message {

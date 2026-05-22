@@ -114,6 +114,7 @@ pub(crate) fn parse_frames_stateful(
 /// the decoder's dynamic table and are fatal — parsing stops immediately.
 /// The buffer is always drained up to the last consumed position regardless
 /// of errors, preventing re-processing of already-consumed frames.
+#[cfg_attr(feature = "tracing", tracing::instrument(skip_all, fields(buf_len = state.buffer.len())))]
 pub(crate) fn parse_buffer_incremental(state: &mut H2ConnectionState) -> Result<(), ParseError> {
     let mut pos = 0;
     let timestamp_ns = state.current_timestamp_ns;

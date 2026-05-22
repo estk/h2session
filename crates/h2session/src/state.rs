@@ -268,6 +268,7 @@ impl H2ConnectionState {
     ///
     /// Returns Ok(()) if data was processed (even if no messages completed
     /// yet). Returns Err only for fatal parse errors.
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all, fields(len = data.len())))]
     pub fn feed(&mut self, data: &[u8], timestamp_ns: TimestampNs) -> Result<(), ParseError> {
         if self.buffer.len() + data.len() > self.limits.max_buffer_size {
             return Err(ParseError::new(ParseErrorKind::Http2BufferTooLarge));

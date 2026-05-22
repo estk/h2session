@@ -122,16 +122,16 @@ impl H3ConnectionState {
     /// `timestamp_ns`: when this data was captured
     /// `fin`: whether this is the final data on the stream
     pub fn feed(&mut self, stream_id: i64, data: &[u8], timestamp_ns: u64, fin: bool) {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!("h3_feed", stream_id, len = data.len(), fin).entered();
+
         let completions = *self.stream_completions.get(&stream_id).unwrap_or(&0);
-        log::debug!(
-            "h3: feed stream={} len={} fin={} completions={}",
-            stream_id, data.len(), fin, completions
-        );
+        crate::trace_debug!(completions, "feed");
 
         // HTTP/3 bidirectional streams carry one request + one response (2 messages).
         // A 3rd completion would be a ghost from a redundant FIN-only event.
         if completions >= 2 {
-            log::debug!("h3: stream={} skipped (completions>=2)", stream_id);
+            crate::trace_debug!("skipped (completions>=2)");
             return;
         }
 
@@ -152,18 +152,22 @@ impl H3ConnectionState {
 
         // Parse any complete frames from the buffer
         let (frames, consumed) = frame::parse_frames(&stream.buffer);
-        log::debug!(
-            "h3: stream={} buffer_len={} parsed_frames={} consumed={}",
-            stream_id, stream.buffer.len(), frames.len(), consumed
+        crate::trace_debug!(
+            buffer_len = stream.buffer.len(),
+            parsed_frames = frames.len(),
+            consumed,
+            "parsed"
         );
         if consumed > 0 {
             let _ = stream.buffer.split_to(consumed);
         }
 
-        for frame in &frames {
-            log::debug!(
-                "h3: stream={} frame type={:?} payload_len={}",
-                stream_id, frame.frame_type, frame.payload.len()
+        #[cfg(feature = "tracing")]
+        for _frame in &frames {
+            crate::trace_debug!(
+                frame_type = ?_frame.frame_type,
+                payload_len = _frame.payload.len(),
+                "frame"
             );
         }
 
@@ -176,11 +180,17 @@ impl H3ConnectionState {
         if let Some(stream) = self.streams.get(&stream_id)
             && stream.is_complete(is_second)
         {
-            log::debug!(
-                "h3: stream={} COMPLETE (is_second={} headers={} body_len={} fin={})",
-                stream_id, is_second, stream.headers.is_some(), stream.body.len(), stream.fin_received
+            crate::trace_debug!(
+                is_second,
+                has_headers = stream.headers.is_some(),
+                body_len = stream.body.len(),
+                fin = stream.fin_received,
+                "COMPLETE"
             );
-            let stream = self.streams.remove(&stream_id).unwrap();
+            // BUG: stream must exist here — the if-let guard on line above confirmed it.
+            // Only reachable via programming error (concurrent mutation or broken guard logic).
+            let stream = self.streams.remove(&stream_id)
+                .expect("stream must exist: is_complete guard confirmed presence");
             *self.stream_completions.entry(stream_id).or_insert(0) += 1;
             let msg = ParsedH3Message {
                 headers: stream.headers.unwrap_or_default(),

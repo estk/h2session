@@ -1,3 +1,13 @@
+#[cfg(feature = "tracing")]
+macro_rules! trace_debug {
+    ($($arg:tt)*) => { ::tracing::debug!($($arg)*) }
+}
+#[cfg(not(feature = "tracing"))]
+macro_rules! trace_debug {
+    ($($arg:tt)*) => {};
+}
+pub(crate) use trace_debug;
+
 mod frame;
 mod qpack;
 mod state;

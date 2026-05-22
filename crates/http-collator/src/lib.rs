@@ -44,6 +44,21 @@
 //!     }
 //! }
 //! ```
+//!
+//! # Feature flags
+//!
+//! - **`tracing`** — emit `tracing` spans and events for connection processing
+//!   and parse errors. Enables tracing in `h2session` and `h3session`
+//!   dependencies as well.
+
+#[cfg(feature = "tracing")]
+macro_rules! trace_warn {
+    ($($arg:tt)*) => { ::tracing::warn!($($arg)*) }
+}
+#[cfg(not(feature = "tracing"))]
+macro_rules! trace_warn {
+    ($($arg:tt)*) => {};
+}
 
 mod connection;
 mod exchange;
@@ -146,6 +161,11 @@ impl<E: DataEvent> Collator<E> {
     /// - HTTP/2 can have multiple streams complete in one buffer
     /// - A single buffer might contain complete request AND start of next
     /// - Config might emit both messages AND exchanges
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all, fields(
+        conn_id = event.connection_id(),
+        pid = event.process_id(),
+        dir = ?event.direction(),
+    )))]
     pub fn add_event(&self, event: E) -> Vec<CollationEvent> {
         // Extract all scalar metadata before consuming the event
         let direction = event.direction();
@@ -238,6 +258,9 @@ impl<E: DataEvent> Collator<E> {
     /// Process a QUIC/HTTP3 event: feed to h3session and check for completed
     /// messages.
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, payload), fields(
+        conn_id, stream_id, fin
+    )))]
     fn process_quic_event(
         &self,
         conn_id: u128,
@@ -463,6 +486,9 @@ impl<E: DataEvent> Collator<E> {
     /// Core event processing logic, called with a mutable reference to the
     /// connection (obtained from an `scc::HashMap` entry guard).
     #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip_all, fields(
+        conn_id, pid = process_id, protocol = ?conn.protocol, dir = ?direction,
+    )))]
     fn process_event_for_conn(
         conn: &mut Conn,
         chunk: DataChunk,
@@ -1012,8 +1038,9 @@ fn parse_http2_chunks(conn: &mut Conn, direction: Direction) {
         None => return,
     };
 
-    // Feed to direction-specific h2 parser; errors are non-fatal
-    let _ = h2_state.feed(&chunk.data, chunk.timestamp_ns);
+    if let Err(_e) = h2_state.feed(&chunk.data, chunk.timestamp_ns) {
+        trace_warn!(error = %_e, "h2 parse error (non-fatal, dropping frame)");
+    }
 
     // Pop completed messages and classify by content, not direction.
     // Maintain ready_streams set for O(1) complete-pair lookup.

@@ -8,6 +8,7 @@ keywords = ["http2", "hpack", "parser", "network", "monitoring"]
 categories = ["network-programming", "parser-implementations"]
 
 [features]
+default = ["tracing"]
 tracing = ["dep:tracing"]
 
 [dependencies]

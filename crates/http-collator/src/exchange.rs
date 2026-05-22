@@ -59,6 +59,8 @@ pub struct MessageMetadata {
     pub stream_id:     Option<StreamId>,
     /// Remote port (None if unavailable)
     pub remote_port:   Option<u16>,
+    /// Local port (None if unavailable)
+    pub local_port:    Option<u16>,
     /// Protocol detected for this connection
     pub protocol:      Protocol,
 }
@@ -171,6 +173,8 @@ pub struct Exchange {
     pub command:     String,
     /// Remote port, None if unavailable (e.g., SSL without socket fd)
     pub remote_port: Option<u16>,
+    /// Local port, None if unavailable
+    pub local_port:  Option<u16>,
     /// Stream ID for HTTP/2 (None for HTTP/1)
     pub stream_id:   Option<StreamId>,
 }

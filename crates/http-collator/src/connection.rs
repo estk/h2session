@@ -39,6 +39,8 @@ pub(crate) struct Connection {
     pub(crate) command:           String,
     /// Remote port, None if unavailable (e.g., SSL without socket fd)
     pub(crate) remote_port:       Option<u16>,
+    /// Local port, None if unavailable
+    pub(crate) local_port:        Option<u16>,
     pub(crate) protocol:          Protocol,
     pub(crate) request_chunks:    Vec<DataChunk>,
     pub(crate) response_chunks:   Vec<DataChunk>,
@@ -87,7 +89,7 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    pub(crate) fn new(process_id: u32, remote_port: u16, command: String) -> Self {
+    pub(crate) fn new(process_id: u32, remote_port: u16, local_port: u16, command: String) -> Self {
         Self {
             process_id,
             command,
@@ -96,6 +98,11 @@ impl Connection {
                 None
             } else {
                 Some(remote_port)
+            },
+            local_port: if local_port == 0 {
+                None
+            } else {
+                Some(local_port)
             },
             protocol: Protocol::Unknown,
             request_chunks: Vec::new(),

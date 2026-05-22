@@ -46,6 +46,11 @@ pub trait DataEvent {
     /// Remote port (0 if unknown)
     fn remote_port(&self) -> u16;
 
+    /// Local port (0 if unknown)
+    fn local_port(&self) -> u16 {
+        0
+    }
+
     /// QUIC stream ID, if this event is from a QUIC connection.
     /// Returns None for non-QUIC events (TCP/TLS).
     fn stream_id(&self) -> Option<i64> {

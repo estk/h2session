@@ -687,6 +687,7 @@ fn test_exchange_display_port(#[case] remote_port: Option<u16>, #[case] expected
         process_id: 1234,
         command: String::new(),
         remote_port,
+        local_port: None,
         stream_id: Some(StreamId(1)),
     };
 
@@ -1209,7 +1210,7 @@ fn test_cleanup_clock_skew_no_panic() {
     // Manually insert a connection with last_activity in the "future"
     let _ = collator
         .connections
-        .insert(1, Conn::new(1234, 8080, String::new()));
+        .insert(1, Conn::new(1234, 8080, 0, String::new()));
     collator.connections.get(&1).unwrap().last_activity_ns = TimestampNs(10_000_000_000);
 
     // Cleanup with a current_time BEFORE the last activity (clock skew).

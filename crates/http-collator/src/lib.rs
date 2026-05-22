@@ -173,6 +173,7 @@ impl<E: DataEvent> Collator<E> {
         let conn_id = event.connection_id();
         let process_id = event.process_id();
         let remote_port = event.remote_port();
+        let local_port = event.local_port();
         let stream_id = event.stream_id();
         let is_fin = event.is_fin();
         let is_empty = event.payload().is_empty();
@@ -226,7 +227,7 @@ impl<E: DataEvent> Collator<E> {
             let mut entry = self
                 .connections
                 .entry(conn_id)
-                .or_insert_with(|| Conn::new(process_id, remote_port, command.clone()));
+                .or_insert_with(|| Conn::new(process_id, remote_port, local_port, command.clone()));
             Self::process_event_for_conn(
                 entry.get_mut(),
                 chunk,
@@ -242,7 +243,7 @@ impl<E: DataEvent> Collator<E> {
             let mut entry = self
                 .ssl_connections
                 .entry(process_id)
-                .or_insert_with(|| Conn::new(process_id, remote_port, command.clone()));
+                .or_insert_with(|| Conn::new(process_id, remote_port, local_port, command.clone()));
             Self::process_event_for_conn(
                 entry.get_mut(),
                 chunk,
@@ -352,6 +353,7 @@ impl<E: DataEvent> Collator<E> {
                             timestamp_ns,
                             stream_id: Some(StreamId(sid as u32)),
                             remote_port: None,
+                            local_port: None,
                             protocol: Protocol::Http3,
                         },
                     });
@@ -440,6 +442,7 @@ impl<E: DataEvent> Collator<E> {
                     process_id,
                     command: command.to_string(),
                     remote_port: None,
+                    local_port: None,
                     stream_id: Some(StreamId(sid as u32)),
                 };
 
@@ -799,6 +802,7 @@ fn emit_message_events(
                     timestamp_ns: req.timestamp_ns,
                     stream_id: None,
                     remote_port: conn.remote_port,
+                    local_port: conn.local_port,
                     protocol: conn.protocol,
                 };
                 events.push(CollationEvent::Message {
@@ -819,6 +823,7 @@ fn emit_message_events(
                     timestamp_ns: resp.timestamp_ns,
                     stream_id: None,
                     remote_port: conn.remote_port,
+                    local_port: conn.local_port,
                     protocol: conn.protocol,
                 };
                 events.push(CollationEvent::Message {
@@ -841,6 +846,7 @@ fn emit_message_events(
                         timestamp_ns: msg.end_stream_timestamp_ns,
                         stream_id: Some(stream_id),
                         remote_port: conn.remote_port,
+                        local_port: conn.local_port,
                         protocol: conn.protocol,
                     };
                     events.push(CollationEvent::Message {
@@ -865,6 +871,7 @@ fn emit_message_events(
                         timestamp_ns: msg.first_frame_timestamp_ns,
                         stream_id: Some(stream_id),
                         remote_port: conn.remote_port,
+                        local_port: conn.local_port,
                         protocol: conn.protocol,
                     };
                     events.push(CollationEvent::Message {
@@ -1227,6 +1234,7 @@ fn emit_h1_request(
             timestamp_ns: req.timestamp_ns,
             stream_id: None,
             remote_port: conn.remote_port,
+            local_port: conn.local_port,
             protocol: Protocol::Http1,
         };
         events.push(CollationEvent::Message {
@@ -1257,6 +1265,7 @@ fn emit_h1_response(
             timestamp_ns: resp.timestamp_ns,
             stream_id: None,
             remote_port: conn.remote_port,
+            local_port: conn.local_port,
             protocol: Protocol::Http1,
         };
         events.push(CollationEvent::Message {
@@ -1326,6 +1335,7 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
         process_id: conn.process_id,
         command: conn.command.clone(),
         remote_port: conn.remote_port,
+        local_port: conn.local_port,
         stream_id,
     })
 }

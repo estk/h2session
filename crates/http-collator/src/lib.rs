@@ -178,6 +178,7 @@ impl<E: DataEvent> Collator<E> {
         let is_empty = event.payload().is_empty();
         let command = event.command_name().to_string();
         let is_submit_response = event.is_submit_response();
+        let is_unframed = event.is_quiche_unframed();
 
         // QUIC/HTTP3 events: route even if empty (FIN-only signals)
         if let Some(sid) = stream_id {
@@ -198,6 +199,7 @@ impl<E: DataEvent> Collator<E> {
                 &payload,
                 timestamp_ns,
                 is_fin,
+                is_unframed,
             );
         }
 
@@ -270,6 +272,7 @@ impl<E: DataEvent> Collator<E> {
         payload: &[u8],
         timestamp_ns: TimestampNs,
         fin: bool,
+        unframed: bool,
     ) -> Vec<CollationEvent> {
         use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 
@@ -285,9 +288,15 @@ impl<E: DataEvent> Collator<E> {
         let quic_conn = quic_entry.get_mut();
 
         quic_conn.last_activity_ns = timestamp_ns;
-        quic_conn
-            .h3_state
-            .feed(stream_id, payload, timestamp_ns.0, fin);
+        if unframed {
+            quic_conn
+                .h3_state
+                .feed_unframed(stream_id, payload, timestamp_ns.0, fin);
+        } else {
+            quic_conn
+                .h3_state
+                .feed(stream_id, payload, timestamp_ns.0, fin);
+        }
 
         let mut events = Vec::new();
         while let Some((sid, msg)) = quic_conn.h3_state.try_pop() {

@@ -70,6 +70,12 @@ pub trait DataEvent {
         false
     }
 
+    /// Whether this event carries unframed H3 body data (quiche captures data
+    /// after frame deframing, unlike nghttp3 which captures wire-format frames).
+    fn is_quiche_unframed(&self) -> bool {
+        false
+    }
+
     /// Consume self and return the payload as `Bytes`.
     ///
     /// The default implementation copies via `payload().to_vec()`. Implementors

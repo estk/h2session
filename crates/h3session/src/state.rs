@@ -115,6 +115,66 @@ impl H3ConnectionState {
         }
     }
 
+    /// Feed unframed body data from a specific QUIC stream (quiche only).
+    ///
+    /// Quiche captures data after frame parsing — the payload IS the body, no
+    /// frame headers included. This method skips frame parsing and buffers
+    /// directly to the body, completing the message on FIN.
+    ///
+    /// `stream_id`: the QUIC stream ID this data belongs to
+    /// `data`: unframed body bytes (no HTTP/3 frame headers)
+    /// `timestamp_ns`: when this data was captured
+    /// `fin`: whether this is the final data on the stream
+    pub fn feed_unframed(&mut self, stream_id: i64, data: &[u8], timestamp_ns: u64, fin: bool) {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::debug_span!("h3_feed_unframed", stream_id, len = data.len(), fin).entered();
+
+        let completions = *self.stream_completions.get(&stream_id).unwrap_or(&0);
+        crate::trace_debug!(completions, "feed_unframed");
+
+        if completions >= 2 {
+            crate::trace_debug!("skipped (completions>=2)");
+            return;
+        }
+
+        let stream = self
+            .streams
+            .entry(stream_id)
+            .or_insert_with(H3StreamState::new);
+
+        if stream.first_frame_ts.is_none() {
+            stream.first_frame_ts = Some(timestamp_ns);
+        }
+
+        if !data.is_empty() {
+            stream.body.extend_from_slice(data);
+        }
+
+        if fin {
+            stream.fin_received = true;
+        }
+
+        // Complete the message on FIN
+        if stream.fin_received {
+            crate::trace_debug!(
+                body_len = stream.body.len(),
+                has_headers = stream.headers.is_some(),
+                "COMPLETE (unframed)"
+            );
+            let stream = self.streams.remove(&stream_id)
+                .expect("stream must exist: entry() confirmed presence");
+            *self.stream_completions.entry(stream_id).or_insert(0) += 1;
+            let msg = ParsedH3Message {
+                headers: stream.headers.unwrap_or_default(),
+                body: stream.body.freeze(),
+                stream_id,
+                first_frame_timestamp_ns: stream.first_frame_ts.unwrap_or(timestamp_ns),
+                end_stream_timestamp_ns: timestamp_ns,
+            };
+            self.completed.push((stream_id, msg));
+        }
+    }
+
     /// Feed data from a specific QUIC stream.
     ///
     /// `stream_id`: the QUIC stream ID this data belongs to

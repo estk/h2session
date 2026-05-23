@@ -14,7 +14,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2024"
-version = "0.4.0"
+version = "0.5.0"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
@@ -25,9 +25,9 @@ loona-hpack = "0.4"
 scc = "2"
 tracing = "0.1"
 rstest = "0.26"
-h2session = { path = "crates/h2session", version = "0.4.0" }
-h3session = { path = "crates/h3session", version = "0.4.0" }
-http-collator = { path = "crates/http-collator", version = "0.4.0" }
+h2session = { path = "crates/h2session", version = "0.5.0" }
+h3session = { path = "crates/h3session", version = "0.5.0" }
+http-collator = { path = "crates/http-collator", version = "0.5.0" }
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 

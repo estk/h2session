@@ -127,7 +127,8 @@ impl H3ConnectionState {
     /// `fin`: whether this is the final data on the stream
     pub fn feed_unframed(&mut self, stream_id: i64, data: &[u8], timestamp_ns: u64, fin: bool) {
         #[cfg(feature = "tracing")]
-        let _span = tracing::debug_span!("h3_feed_unframed", stream_id, len = data.len(), fin).entered();
+        let _span =
+            tracing::debug_span!("h3_feed_unframed", stream_id, len = data.len(), fin).entered();
 
         let completions = *self.stream_completions.get(&stream_id).unwrap_or(&0);
         crate::trace_debug!(completions, "feed_unframed");
@@ -161,7 +162,9 @@ impl H3ConnectionState {
                 has_headers = stream.headers.is_some(),
                 "COMPLETE (unframed)"
             );
-            let stream = self.streams.remove(&stream_id)
+            let stream = self
+                .streams
+                .remove(&stream_id)
                 .expect("stream must exist: entry() confirmed presence");
             *self.stream_completions.entry(stream_id).or_insert(0) += 1;
             let msg = ParsedH3Message {
@@ -248,8 +251,11 @@ impl H3ConnectionState {
                 "COMPLETE"
             );
             // BUG: stream must exist here — the if-let guard on line above confirmed it.
-            // Only reachable via programming error (concurrent mutation or broken guard logic).
-            let stream = self.streams.remove(&stream_id)
+            // Only reachable via programming error (concurrent mutation or broken guard
+            // logic).
+            let stream = self
+                .streams
+                .remove(&stream_id)
                 .expect("stream must exist: is_complete guard confirmed presence");
             *self.stream_completions.entry(stream_id).or_insert(0) += 1;
             let msg = ParsedH3Message {

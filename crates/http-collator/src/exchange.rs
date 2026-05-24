@@ -160,23 +160,25 @@ impl CollatorConfig {
 #[derive(Debug)]
 pub struct Exchange {
     /// The HTTP request
-    pub request:     HttpRequest,
+    pub request:        HttpRequest,
     /// The matched HTTP response
-    pub response:    HttpResponse,
+    pub response:       HttpResponse,
     /// Time between request completion and response start, in nanoseconds
-    pub latency_ns:  u64,
+    pub latency_ns:     u64,
     /// Protocol used for this exchange
-    pub protocol:    Protocol,
+    pub protocol:       Protocol,
     /// OS process ID that handled this connection
-    pub process_id:  u32,
+    pub process_id:     u32,
     /// Process/command name
-    pub command:     String,
+    pub command:        String,
     /// Remote port, None if unavailable (e.g., SSL without socket fd)
-    pub remote_port: Option<u16>,
+    pub remote_port:    Option<u16>,
     /// Local port, None if unavailable
-    pub local_port:  Option<u16>,
+    pub local_port:     Option<u16>,
     /// Stream ID for HTTP/2 (None for HTTP/1)
-    pub stream_id:   Option<StreamId>,
+    pub stream_id:      Option<StreamId>,
+    /// Opaque metadata from the data source, propagated for proxy correlation
+    pub proxy_metadata: u64,
 }
 
 impl std::fmt::Display for Exchange {

@@ -76,6 +76,8 @@ pub(crate) struct Connection {
     pub(crate) h2_read_state:  H2ConnectionState,
 
     // Completed messages from h2session, keyed by stream_id
+    pub(crate) proxy_metadata: u64,
+
     pub(crate) pending_requests:  HashMap<StreamId, ParsedH2Message>,
     pub(crate) pending_responses: HashMap<StreamId, ParsedH2Message>,
 
@@ -127,6 +129,7 @@ impl Connection {
             h2_emitted_requests: HashSet::new(),
             h2_emitted_responses: HashSet::new(),
             ready_streams: HashSet::new(),
+            proxy_metadata: 0,
         }
     }
 }

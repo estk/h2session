@@ -76,9 +76,17 @@ pub trait DataEvent {
     }
 
     /// Whether this event carries unframed H3 body data (quiche captures data
-    /// after frame deframing, unlike nghttp3 which captures wire-format frames).
+    /// after frame deframing, unlike nghttp3 which captures wire-format
+    /// frames).
     fn is_quiche_unframed(&self) -> bool {
         false
+    }
+
+    /// Opaque metadata propagated through the collator onto the Exchange.
+    /// Used by proxy-aware layers to tag data events with a correlation key
+    /// (e.g., HAProxy stream ID) without the collator needing to understand it.
+    fn proxy_metadata(&self) -> u64 {
+        0
     }
 
     /// Consume self and return the payload as `Bytes`.

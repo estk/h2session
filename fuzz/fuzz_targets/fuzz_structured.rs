@@ -56,9 +56,7 @@ impl FuzzFrame {
         }
 
         // Handle PRIORITY flag for HEADERS
-        if self.add_priority && frame_type == FRAME_TYPE_HEADERS
-            && payload.len() + 5 <= 16384
-        {
+        if self.add_priority && frame_type == FRAME_TYPE_HEADERS && payload.len() + 5 <= 16384 {
             flags |= FLAG_PRIORITY;
             let mut new_payload = Vec::new();
             // If already padded, insert priority after pad length

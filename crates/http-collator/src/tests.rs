@@ -689,6 +689,7 @@ fn test_exchange_display_port(#[case] remote_port: Option<u16>, #[case] expected
         remote_port,
         local_port: None,
         stream_id: Some(StreamId(1)),
+        proxy_metadata: 0,
     };
 
     let display = format!("{exchange}");

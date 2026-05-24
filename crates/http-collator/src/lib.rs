@@ -180,6 +180,7 @@ impl<E: DataEvent> Collator<E> {
         let command = event.command_name().to_string();
         let is_submit_response = event.is_submit_response();
         let is_unframed = event.is_quiche_unframed();
+        let proxy_metadata = event.proxy_metadata();
 
         // QUIC/HTTP3 events: route even if empty (FIN-only signals)
         if let Some(sid) = stream_id {
@@ -228,8 +229,12 @@ impl<E: DataEvent> Collator<E> {
                 .connections
                 .entry(conn_id)
                 .or_insert_with(|| Conn::new(process_id, remote_port, local_port, command.clone()));
+            let conn = entry.get_mut();
+            if conn.proxy_metadata == 0 && proxy_metadata != 0 {
+                conn.proxy_metadata = proxy_metadata;
+            }
             Self::process_event_for_conn(
-                entry.get_mut(),
+                conn,
                 chunk,
                 direction,
                 timestamp_ns,
@@ -244,8 +249,12 @@ impl<E: DataEvent> Collator<E> {
                 .ssl_connections
                 .entry(process_id)
                 .or_insert_with(|| Conn::new(process_id, remote_port, local_port, command.clone()));
+            let conn = entry.get_mut();
+            if conn.proxy_metadata == 0 && proxy_metadata != 0 {
+                conn.proxy_metadata = proxy_metadata;
+            }
             Self::process_event_for_conn(
-                entry.get_mut(),
+                conn,
                 chunk,
                 direction,
                 timestamp_ns,
@@ -261,9 +270,10 @@ impl<E: DataEvent> Collator<E> {
     /// Process a QUIC/HTTP3 event: feed to h3session and check for completed
     /// messages.
     #[allow(clippy::too_many_arguments)]
-    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, payload), fields(
-        conn_id, stream_id, fin
-    )))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self, payload), fields(conn_id, stream_id, fin))
+    )]
     fn process_quic_event(
         &self,
         conn_id: u128,
@@ -444,6 +454,7 @@ impl<E: DataEvent> Collator<E> {
                     remote_port: None,
                     local_port: None,
                     stream_id: Some(StreamId(sid as u32)),
+                    proxy_metadata: 0,
                 };
 
                 if self.config.emit_exchanges {
@@ -652,6 +663,19 @@ impl<E: DataEvent> Collator<E> {
         if config.emit_messages {
             emit_message_events(conn, conn_id, process_id, &mut events);
         }
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            conn_id,
+            request_complete = conn.request_complete,
+            response_complete = conn.response_complete,
+            protocol = ?conn.protocol,
+            h1_req = conn.h1_request.is_some(),
+            h1_resp = conn.h1_response.is_some(),
+            read_buf = conn.h1_read_buffer.len(),
+            write_buf = conn.h1_write_buffer.len(),
+            "exchange check"
+        );
 
         if config.emit_exchanges && conn.request_complete && conn.response_complete {
             if let Some(exchange) = build_exchange(conn) {
@@ -1337,6 +1361,7 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
         remote_port: conn.remote_port,
         local_port: conn.local_port,
         stream_id,
+        proxy_metadata: conn.proxy_metadata,
     })
 }
 

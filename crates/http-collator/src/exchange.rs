@@ -169,6 +169,10 @@ pub struct Exchange {
     pub protocol:       Protocol,
     /// OS process ID that handled this connection
     pub process_id:     u32,
+    /// Thread ID (TID/LWP) that handled this connection
+    pub thread_id:      u32,
+    /// Socket file descriptor (-1 if unavailable)
+    pub fd:             i32,
     /// Process/command name
     pub command:        String,
     /// Remote port, None if unavailable (e.g., SSL without socket fd)

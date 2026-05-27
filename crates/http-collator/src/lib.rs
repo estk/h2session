@@ -181,6 +181,8 @@ impl<E: DataEvent> Collator<E> {
         let is_submit_response = event.is_submit_response();
         let is_unframed = event.is_quiche_unframed();
         let proxy_metadata = event.proxy_metadata();
+        let thread_id = event.thread_id();
+        let fd = event.fd();
 
         // QUIC/HTTP3 events: route even if empty (FIN-only signals)
         if let Some(sid) = stream_id {
@@ -228,7 +230,7 @@ impl<E: DataEvent> Collator<E> {
             let mut entry = self
                 .connections
                 .entry(conn_id)
-                .or_insert_with(|| Conn::new(process_id, remote_port, local_port, command.clone()));
+                .or_insert_with(|| Conn::new(process_id, thread_id, fd, remote_port, local_port, command.clone()));
             let conn = entry.get_mut();
             if conn.proxy_metadata == 0 && proxy_metadata != 0 {
                 conn.proxy_metadata = proxy_metadata;
@@ -248,7 +250,7 @@ impl<E: DataEvent> Collator<E> {
             let mut entry = self
                 .ssl_connections
                 .entry(process_id)
-                .or_insert_with(|| Conn::new(process_id, remote_port, local_port, command.clone()));
+                .or_insert_with(|| Conn::new(process_id, thread_id, fd, remote_port, local_port, command.clone()));
             let conn = entry.get_mut();
             if conn.proxy_metadata == 0 && proxy_metadata != 0 {
                 conn.proxy_metadata = proxy_metadata;
@@ -450,6 +452,8 @@ impl<E: DataEvent> Collator<E> {
                     latency_ns,
                     protocol: Protocol::Http3,
                     process_id,
+                    thread_id: 0,
+                    fd: -1,
                     command: command.to_string(),
                     remote_port: None,
                     local_port: None,
@@ -1357,6 +1361,8 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
         latency_ns,
         protocol: conn.protocol,
         process_id: conn.process_id,
+        thread_id: conn.thread_id,
+        fd: conn.fd,
         command: conn.command.clone(),
         remote_port: conn.remote_port,
         local_port: conn.local_port,

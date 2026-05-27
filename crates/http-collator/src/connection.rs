@@ -35,6 +35,9 @@ pub(crate) struct DataChunk {
 /// Tracks state for a single connection
 pub(crate) struct Connection {
     pub(crate) process_id:        u32,
+    pub(crate) thread_id:         u32,
+    /// Socket file descriptor (-1 if unavailable)
+    pub(crate) fd:                i32,
     /// Process/command name (e.g., "curl", "nghttpx")
     pub(crate) command:           String,
     /// Remote port, None if unavailable (e.g., SSL without socket fd)
@@ -91,9 +94,11 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    pub(crate) fn new(process_id: u32, remote_port: u16, local_port: u16, command: String) -> Self {
+    pub(crate) fn new(process_id: u32, thread_id: u32, fd: i32, remote_port: u16, local_port: u16, command: String) -> Self {
         Self {
             process_id,
+            thread_id,
+            fd,
             command,
             // Store None for port 0 (unavailable from SSL)
             remote_port: if remote_port == 0 {

@@ -685,6 +685,8 @@ fn test_exchange_display_port(#[case] remote_port: Option<u16>, #[case] expected
         latency_ns: 1_000_000,
         protocol: Protocol::Http2,
         process_id: 1234,
+        thread_id: 0,
+        fd: -1,
         command: String::new(),
         remote_port,
         local_port: None,

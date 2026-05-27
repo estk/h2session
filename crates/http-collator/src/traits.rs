@@ -82,6 +82,18 @@ pub trait DataEvent {
         false
     }
 
+    /// Thread ID (TID / LWP ID) of the thread that handled this event.
+    /// 0 if unavailable. Used for thread-level proxy correlation.
+    fn thread_id(&self) -> u32 {
+        0
+    }
+
+    /// Socket file descriptor for this event. -1 if unavailable (e.g., SSL
+    /// probes where the fd is not directly accessible).
+    fn fd(&self) -> i32 {
+        -1
+    }
+
     /// Opaque metadata propagated through the collator onto the Exchange.
     /// Used by proxy-aware layers to tag data events with a correlation key
     /// (e.g., HAProxy stream ID) without the collator needing to understand it.

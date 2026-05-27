@@ -157,7 +157,7 @@ impl CollatorConfig {
 }
 
 /// A complete request/response exchange
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Exchange {
     /// The HTTP request
     pub request:        HttpRequest,

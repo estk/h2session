@@ -183,6 +183,13 @@ pub struct Exchange {
     pub stream_id:      Option<StreamId>,
     /// Opaque metadata from the data source, propagated for proxy correlation
     pub proxy_metadata: u64,
+    /// Stable xxhash3-64 fingerprint of canonicalised request headers
+    /// (method, :path, :authority, non-excluded headers; see
+    /// `crate::fingerprint::compute_request_fingerprint`). Set at
+    /// construction; `None` only for hand-built test fixtures. Used by
+    /// the `fifo-fingerprint` correlator to pair ingress↔egress across
+    /// HTTP/2 proxy hops where stream IDs are renumbered.
+    pub request_fingerprint: Option<u64>,
 }
 
 impl std::fmt::Display for Exchange {

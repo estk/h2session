@@ -447,6 +447,12 @@ impl<E: DataEvent> Collator<E> {
                         (placeholder, 0)
                     };
 
+                let request_fingerprint = Some(crate::fingerprint::compute_request_fingerprint(
+                    &request.method,
+                    &request.uri,
+                    &request.headers,
+                ));
+
                 let exchange = Exchange {
                     request,
                     response,
@@ -460,6 +466,7 @@ impl<E: DataEvent> Collator<E> {
                     local_port: None,
                     stream_id: Some(StreamId(sid as u32)),
                     proxy_metadata: 0,
+                    request_fingerprint,
                 };
 
                 if self.config.emit_exchanges {
@@ -1356,6 +1363,12 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
         Protocol::Unknown | Protocol::Http3 => return None,
     };
 
+    let request_fingerprint = Some(crate::fingerprint::compute_request_fingerprint(
+        &request.method,
+        &request.uri,
+        &request.headers,
+    ));
+
     Some(Exchange {
         request,
         response,
@@ -1369,6 +1382,7 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
         local_port: conn.local_port,
         stream_id,
         proxy_metadata: conn.proxy_metadata,
+        request_fingerprint,
     })
 }
 

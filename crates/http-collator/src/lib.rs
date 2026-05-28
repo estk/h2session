@@ -62,6 +62,7 @@ macro_rules! trace_warn {
 
 mod connection;
 mod exchange;
+pub mod fingerprint;
 pub mod h1;
 mod traits;
 

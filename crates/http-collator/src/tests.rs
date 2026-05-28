@@ -801,7 +801,24 @@ fn test_http1_complete_exchange_emits_both_types() {
     // Should have response Message + Exchange
     assert_eq!(events.len(), 2, "Response should emit Message + Exchange");
     assert!(events.iter().any(|e| e.is_message()));
-    assert!(events.iter().any(|e| e.is_exchange()));
+    let exchange = events
+        .iter()
+        .find_map(|e| e.as_exchange())
+        .expect("expected an Exchange event");
+
+    // Fingerprint must be populated by the collator at construction time and
+    // must equal what compute_request_fingerprint returns for the assembled
+    // request — proves the construction site wires through correctly.
+    let expected_fp = crate::fingerprint::compute_request_fingerprint(
+        &exchange.request.method,
+        &exchange.request.uri,
+        &exchange.request.headers,
+    );
+    assert_eq!(
+        exchange.request_fingerprint,
+        Some(expected_fp),
+        "Exchange must carry the fingerprint computed from its own request fields"
+    );
 }
 
 #[test]

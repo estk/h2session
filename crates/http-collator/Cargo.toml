@@ -19,6 +19,7 @@ h3session.workspace = true
 http.workspace = true
 httparse.workspace = true
 tracing = { workspace = true, optional = true }
+twox-hash.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true

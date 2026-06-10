@@ -5,6 +5,7 @@ use h2session::{StreamId, TimestampNs};
 use crate::{
     connection::Protocol,
     h1::{HttpRequest, HttpResponse},
+    traits::Direction,
 };
 
 /// Classification of parsed HTTP message
@@ -183,6 +184,16 @@ pub struct Exchange {
     pub stream_id:      Option<StreamId>,
     /// Opaque metadata from the data source, propagated for proxy correlation
     pub proxy_metadata: u64,
+    /// Direction the request leg arrived on, relative to the monitored
+    /// process: `Read` = the request was received (server/proxy ingress),
+    /// `Write` = the request was sent (proxy egress). `None` for hand-built
+    /// fixtures, HTTP/3, or sources that don't set it.
+    ///
+    /// Captured by the collator at the point the request is parsed — it is
+    /// **not** recoverable from the assembled exchange, because chunk routing
+    /// is by client-convention and a request can be content-parsed from
+    /// either direction (see `lib.rs` request routing).
+    pub request_direction: Option<Direction>,
     /// Stable xxhash3-64 fingerprint of canonicalised request headers
     /// (method, :path, :authority, non-excluded headers; see
     /// `crate::fingerprint::compute_request_fingerprint`). Set at

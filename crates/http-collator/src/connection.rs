@@ -81,6 +81,11 @@ pub(crate) struct Connection {
     // Completed messages from h2session, keyed by stream_id
     pub(crate) proxy_metadata: u64,
 
+    /// Direction the request leg first arrived on (Read = ingress, Write =
+    /// egress). Set once, at the point the request is parsed; later requests
+    /// on a keep-alive connection do not change it. Stamped onto `Exchange`.
+    pub(crate) request_direction: Option<Direction>,
+
     pub(crate) pending_requests:  HashMap<StreamId, ParsedH2Message>,
     pub(crate) pending_responses: HashMap<StreamId, ParsedH2Message>,
 
@@ -135,6 +140,7 @@ impl Connection {
             h2_emitted_responses: HashSet::new(),
             ready_streams: HashSet::new(),
             proxy_metadata: 0,
+            request_direction: None,
         }
     }
 }

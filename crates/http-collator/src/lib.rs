@@ -466,6 +466,8 @@ impl<E: DataEvent> Collator<E> {
                     local_port: None,
                     stream_id: Some(StreamId(sid as u32)),
                     proxy_metadata: 0,
+                    // HTTP/3 side-tagging is not implemented (QUIC follow-up).
+                    request_direction: None,
                     request_fingerprint,
                 };
 
@@ -1098,6 +1100,10 @@ fn parse_http2_chunks(conn: &mut Conn, direction: Direction) {
     // Maintain ready_streams set for O(1) complete-pair lookup.
     while let Some((stream_id, msg)) = h2_state.try_pop() {
         if msg.is_request() {
+            // The direction this request frame arrived on fixes the
+            // connection's side (Read = ingress, Write = egress). First
+            // request wins. See `emit_h1_request` for the H1 analogue.
+            conn.request_direction.get_or_insert(direction);
             conn.pending_requests.insert(stream_id, msg);
             if conn.pending_responses.contains_key(&stream_id) {
                 conn.ready_streams.insert(stream_id);
@@ -1144,7 +1150,7 @@ fn drain_parse_emit_http1_write(
             h1::try_parse_http1_request_sized(&conn.h1_write_buffer, timestamp)
         {
             conn.h1_write_buffer.drain(..consumed);
-            emit_h1_request(conn, conn_id, process_id, config, events, req);
+            emit_h1_request(conn, conn_id, process_id, config, events, req, Direction::Write);
         } else if let Some((resp, consumed)) =
             h1::try_parse_http1_response_sized(&conn.h1_write_buffer, timestamp)
         {
@@ -1182,7 +1188,7 @@ fn drain_parse_emit_http1_read(
             h1::try_parse_http1_request_sized(&conn.h1_read_buffer, timestamp)
         {
             conn.h1_read_buffer.drain(..consumed);
-            emit_h1_request(conn, conn_id, process_id, config, events, req);
+            emit_h1_request(conn, conn_id, process_id, config, events, req, Direction::Read);
         } else {
             break;
         }
@@ -1208,7 +1214,7 @@ fn drain_parse_emit_http1_unknown_write(
     {
         conn.protocol = Protocol::Http1;
         conn.h1_write_buffer.drain(..consumed);
-        emit_h1_request(conn, conn_id, process_id, config, events, req);
+        emit_h1_request(conn, conn_id, process_id, config, events, req, Direction::Write);
         drain_parse_emit_http1_write(conn, conn_id, process_id, config, events);
     } else if let Some((resp, consumed)) =
         h1::try_parse_http1_response_sized(&conn.h1_write_buffer, timestamp)
@@ -1246,7 +1252,7 @@ fn drain_parse_emit_http1_unknown_read(
     {
         conn.protocol = Protocol::Http1;
         conn.h1_read_buffer.drain(..consumed);
-        emit_h1_request(conn, conn_id, process_id, config, events, req);
+        emit_h1_request(conn, conn_id, process_id, config, events, req, Direction::Read);
         drain_parse_emit_http1_read(conn, conn_id, process_id, config, events);
     }
 }
@@ -1261,7 +1267,12 @@ fn emit_h1_request(
     config: &CollatorConfig,
     events: &mut Vec<CollationEvent>,
     req: h1::HttpRequest,
+    direction: Direction,
 ) {
+    // The request's arrival direction defines the connection's side: a request
+    // read from the wire is ingress, a request written to the wire is egress.
+    // First request wins (keep-alive connections reuse the same side).
+    conn.request_direction.get_or_insert(direction);
     if config.emit_messages {
         let metadata = MessageMetadata {
             connection_id: conn_id,
@@ -1382,6 +1393,7 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
         local_port: conn.local_port,
         stream_id,
         proxy_metadata: conn.proxy_metadata,
+        request_direction: conn.request_direction,
         request_fingerprint,
     })
 }

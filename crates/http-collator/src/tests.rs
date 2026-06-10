@@ -692,6 +692,7 @@ fn test_exchange_display_port(#[case] remote_port: Option<u16>, #[case] expected
         local_port: None,
         stream_id: Some(StreamId(1)),
         proxy_metadata: 0,
+        request_direction: None,
         request_fingerprint: None,
     };
 
@@ -819,6 +820,50 @@ fn test_http1_complete_exchange_emits_both_types() {
         Some(expected_fp),
         "Exchange must carry the fingerprint computed from its own request fields"
     );
+}
+
+/// The request leg's arrival direction must survive onto the Exchange. A
+/// request parsed from the Write buffer (proxy egress — it wrote the request
+/// to a backend) yields `request_direction == Some(Write)`; from the Read
+/// buffer (proxy ingress — it read the request from a client) yields
+/// `Some(Read)`. This is the signal `DirectionClassifier` consumes; it cannot
+/// be recovered from the assembled exchange because the collator routes chunks
+/// by client-convention and content-parses requests from either direction.
+#[rstest]
+#[case(Direction::Write, Direction::Read, Direction::Write)] // request on write → egress
+#[case(Direction::Read, Direction::Write, Direction::Read)] // request on read  → ingress
+fn test_http1_exchange_carries_request_direction(
+    #[case] req_dir: Direction,
+    #[case] resp_dir: Direction,
+    #[case] expected: Direction,
+) {
+    let mut collator: Collator<TestEvent> = Collator::new();
+
+    let req_event = make_event(
+        req_dir,
+        1,
+        1234,
+        8080,
+        1_000_000,
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+    let _ = collator.add_event(req_event);
+
+    let resp_event = make_event(
+        resp_dir,
+        1,
+        1234,
+        8080,
+        2_000_000,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+    );
+    let events = collator.add_event(resp_event);
+    let exchange = events
+        .iter()
+        .find_map(|e| e.as_exchange())
+        .expect("expected an Exchange event");
+
+    assert_eq!(exchange.request_direction, Some(expected));
 }
 
 #[test]

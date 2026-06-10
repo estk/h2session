@@ -463,15 +463,18 @@ impl ParsedH2Message {
     /// Convert this HTTP/2 message to an HttpRequest
     ///
     /// Returns None if this is not a valid request (missing :method or :path).
-    /// Uses end_stream_timestamp_ns as the request timestamp (when request was
-    /// fully sent).
+    /// `start` = first frame, `complete` = END_STREAM. HTTP/2 does not thread
+    /// per-frame userspace times, so the userspace fields are 0.
     pub fn to_http_request(&self) -> Option<crate::HttpRequest> {
         Some(crate::HttpRequest {
             method:       self.http_method()?,
             uri:          self.http_uri()?,
             headers:      self.http_headers(),
             body:         self.body.clone(),
-            timestamp_ns: self.end_stream_timestamp_ns,
+            start_timestamp_ns: self.first_frame_timestamp_ns,
+            userspace_start_timestamp_ns: TimestampNs(0),
+            complete_timestamp_ns: self.end_stream_timestamp_ns,
+            userspace_complete_timestamp_ns: TimestampNs(0),
             version:      Some(2),
         })
     }
@@ -479,14 +482,17 @@ impl ParsedH2Message {
     /// Convert this HTTP/2 message to an HttpResponse
     ///
     /// Returns None if this is not a valid response (missing :status).
-    /// Uses first_frame_timestamp_ns as the response timestamp (when response
-    /// started arriving).
+    /// `start` = first frame (response start), `complete` = END_STREAM.
+    /// Userspace fields are 0 (not threaded per-frame for HTTP/2).
     pub fn to_http_response(&self) -> Option<crate::HttpResponse> {
         Some(crate::HttpResponse {
             status:       self.http_status()?,
             headers:      self.http_headers(),
             body:         self.body.clone(),
-            timestamp_ns: self.first_frame_timestamp_ns,
+            start_timestamp_ns: self.first_frame_timestamp_ns,
+            userspace_start_timestamp_ns: TimestampNs(0),
+            complete_timestamp_ns: self.end_stream_timestamp_ns,
+            userspace_complete_timestamp_ns: TimestampNs(0),
             version:      Some(2),
             reason:       None,
         })
@@ -504,7 +510,10 @@ impl ParsedH2Message {
             uri,
             headers,
             body: self.body,
-            timestamp_ns: self.end_stream_timestamp_ns,
+            start_timestamp_ns: self.first_frame_timestamp_ns,
+            userspace_start_timestamp_ns: TimestampNs(0),
+            complete_timestamp_ns: self.end_stream_timestamp_ns,
+            userspace_complete_timestamp_ns: TimestampNs(0),
             version: None,
         })
     }
@@ -520,7 +529,10 @@ impl ParsedH2Message {
             status,
             headers,
             body: self.body,
-            timestamp_ns: self.first_frame_timestamp_ns,
+            start_timestamp_ns: self.first_frame_timestamp_ns,
+            userspace_start_timestamp_ns: TimestampNs(0),
+            complete_timestamp_ns: self.end_stream_timestamp_ns,
+            userspace_complete_timestamp_ns: TimestampNs(0),
             version: None,
             reason: None,
         })

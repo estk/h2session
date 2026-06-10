@@ -5,6 +5,22 @@ use h2session::TimestampNs;
 pub use h2session::{HttpRequest, HttpResponse};
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 
+/// The four per-message lifecycle timestamps a parsed H1 message carries:
+/// kernel and userspace capture times for both the first chunk (start) and the
+/// last chunk (complete). Grouped so the parse functions can't transpose four
+/// same-typed `TimestampNs` arguments.
+#[derive(Debug, Clone, Copy)]
+pub struct MessageTimestamps {
+    /// Kernel-capture time of the first chunk (message start).
+    pub start:             TimestampNs,
+    /// Userspace ring-read time of the first chunk.
+    pub userspace_start:   TimestampNs,
+    /// Kernel-capture time of the last chunk (message complete).
+    pub complete:          TimestampNs,
+    /// Userspace ring-read time of the completing chunk.
+    pub userspace_complete: TimestampNs,
+}
+
 /// Check if data starts with an HTTP/1.x request
 pub fn is_http1_request(data: &[u8]) -> bool {
     data.starts_with(b"GET ")
@@ -24,8 +40,8 @@ pub fn is_http1_response(data: &[u8]) -> bool {
 
 /// Try to parse an HTTP/1.x request, returning Some only if complete.
 /// This combines header parsing and body completeness checking in one pass.
-pub fn try_parse_http1_request(data: &[u8], timestamp_ns: TimestampNs) -> Option<HttpRequest> {
-    try_parse_http1_request_sized(data, timestamp_ns).map(|(req, _)| req)
+pub fn try_parse_http1_request(data: &[u8], timestamps: MessageTimestamps) -> Option<HttpRequest> {
+    try_parse_http1_request_sized(data, timestamps).map(|(req, _)| req)
 }
 
 /// Try to parse an HTTP/1.x request, returning both the parsed message and
@@ -33,7 +49,7 @@ pub fn try_parse_http1_request(data: &[u8], timestamp_ns: TimestampNs) -> Option
 /// caller to drain those bytes and parse any pipelined follow-on request.
 pub fn try_parse_http1_request_sized(
     data: &[u8],
-    timestamp_ns: TimestampNs,
+    timestamps: MessageTimestamps,
 ) -> Option<(HttpRequest, usize)> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut req = httparse::Request::new(&mut headers);
@@ -70,7 +86,10 @@ pub fn try_parse_http1_request_sized(
             uri,
             headers: header_map,
             body,
-            timestamp_ns,
+            start_timestamp_ns: timestamps.start,
+            userspace_start_timestamp_ns: timestamps.userspace_start,
+            complete_timestamp_ns: timestamps.complete,
+            userspace_complete_timestamp_ns: timestamps.userspace_complete,
             version: Some(req.version?),
         },
         consumed,
@@ -79,8 +98,8 @@ pub fn try_parse_http1_request_sized(
 
 /// Try to parse an HTTP/1.x response, returning Some only if complete.
 /// This combines header parsing and body completeness checking in one pass.
-pub fn try_parse_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Option<HttpResponse> {
-    try_parse_http1_response_sized(data, timestamp_ns).map(|(resp, _)| resp)
+pub fn try_parse_http1_response(data: &[u8], timestamps: MessageTimestamps) -> Option<HttpResponse> {
+    try_parse_http1_response_sized(data, timestamps).map(|(resp, _)| resp)
 }
 
 /// Try to parse an HTTP/1.x response, returning both the parsed message and
@@ -88,7 +107,7 @@ pub fn try_parse_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Optio
 /// those bytes and parse any pipelined follow-on response.
 pub fn try_parse_http1_response_sized(
     data: &[u8],
-    timestamp_ns: TimestampNs,
+    timestamps: MessageTimestamps,
 ) -> Option<(HttpResponse, usize)> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut res = httparse::Response::new(&mut headers);
@@ -123,7 +142,10 @@ pub fn try_parse_http1_response_sized(
             status,
             headers: header_map,
             body,
-            timestamp_ns,
+            start_timestamp_ns: timestamps.start,
+            userspace_start_timestamp_ns: timestamps.userspace_start,
+            complete_timestamp_ns: timestamps.complete,
+            userspace_complete_timestamp_ns: timestamps.userspace_complete,
             version: Some(res.version?),
             reason: res.reason.map(String::from),
         },
@@ -137,7 +159,7 @@ pub fn try_parse_http1_response_sized(
 /// Transfer-Encoding), RFC 7230 §3.3.3 says the body is everything until the
 /// connection closes. This function parses the headers and takes all remaining
 /// data as the body.
-pub fn try_finalize_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Option<HttpResponse> {
+pub fn try_finalize_http1_response(data: &[u8], timestamps: MessageTimestamps) -> Option<HttpResponse> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut res = httparse::Response::new(&mut headers);
 
@@ -164,7 +186,10 @@ pub fn try_finalize_http1_response(data: &[u8], timestamp_ns: TimestampNs) -> Op
         status,
         headers: header_map,
         body,
-        timestamp_ns,
+        start_timestamp_ns: timestamps.start,
+        userspace_start_timestamp_ns: timestamps.userspace_start,
+        complete_timestamp_ns: timestamps.complete,
+        userspace_complete_timestamp_ns: timestamps.userspace_complete,
         version: Some(res.version?),
         reason: res.reason.map(String::from),
     })

@@ -671,28 +671,49 @@ fn test_exchange_display_port(#[case] remote_port: Option<u16>, #[case] expected
             uri:          "/".parse().unwrap(),
             headers:      http::HeaderMap::new(),
             body:         vec![],
-            timestamp_ns: TimestampNs(0),
+            start_timestamp_ns: TimestampNs(0),
+            userspace_start_timestamp_ns: TimestampNs(0),
+            complete_timestamp_ns: TimestampNs(0),
+            userspace_complete_timestamp_ns: TimestampNs(0),
             version:      None,
         },
         response: HttpResponse {
             status:       http::StatusCode::OK,
             headers:      http::HeaderMap::new(),
             body:         vec![],
-            timestamp_ns: TimestampNs(0),
+            start_timestamp_ns: TimestampNs(0),
+            userspace_start_timestamp_ns: TimestampNs(0),
+            complete_timestamp_ns: TimestampNs(0),
+            userspace_complete_timestamp_ns: TimestampNs(0),
             version:      None,
             reason:       None,
         },
+        request_meta: MessageMetadata {
+            connection_id: 0,
+            process_id: 1234,
+            command: String::new(),
+            timestamp_ns: TimestampNs(0),
+            stream_id: Some(StreamId(1)),
+            remote_port,
+            local_port: None,
+            protocol: Protocol::Http2,
+            direction: None,
+        },
+        response_meta: MessageMetadata {
+            connection_id: 0,
+            process_id: 1234,
+            command: String::new(),
+            timestamp_ns: TimestampNs(0),
+            stream_id: Some(StreamId(1)),
+            remote_port,
+            local_port: None,
+            protocol: Protocol::Http2,
+            direction: None,
+        },
         latency_ns: 1_000_000,
-        protocol: Protocol::Http2,
-        process_id: 1234,
         thread_id: 0,
         fd: -1,
-        command: String::new(),
-        remote_port,
-        local_port: None,
-        stream_id: Some(StreamId(1)),
         proxy_metadata: 0,
-        request_direction: None,
         request_fingerprint: None,
     };
 
@@ -863,7 +884,159 @@ fn test_http1_exchange_carries_request_direction(
         .find_map(|e| e.as_exchange())
         .expect("expected an Exchange event");
 
-    assert_eq!(exchange.request_direction, Some(expected));
+    assert_eq!(exchange.request_direction(), Some(expected));
+}
+
+/// Each `Message` event carries the socket direction it was observed on:
+/// a request parsed from the Read buffer reports `Some(Read)` (proxy ingress),
+/// from the Write buffer reports `Some(Write)` (proxy egress). The response
+/// reports the opposite leg. This is the message-level signal a fragment
+/// correlator consumes before any exchange is assembled.
+#[rstest]
+#[case(Direction::Read, Direction::Write)] // request read → ingress; response written
+#[case(Direction::Write, Direction::Read)] // request written → egress; response read
+fn test_message_metadata_carries_observed_direction(
+    #[case] req_dir: Direction,
+    #[case] resp_dir: Direction,
+) {
+    let mut collator: Collator<TestEvent> = Collator::with_config(CollatorConfig::messages_only());
+
+    let req_event = make_event(
+        req_dir,
+        1,
+        1234,
+        8080,
+        1_000_000,
+        b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    );
+    let req_events = collator.add_event(req_event);
+    let (_, req_meta) = req_events
+        .iter()
+        .find_map(|e| e.as_message())
+        .expect("expected a request Message event");
+    assert_eq!(req_meta.direction, Some(req_dir));
+
+    let resp_event = make_event(
+        resp_dir,
+        1,
+        1234,
+        8080,
+        2_000_000,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+    );
+    let resp_events = collator.add_event(resp_event);
+    let (_, resp_meta) = resp_events
+        .iter()
+        .find_map(|e| e.as_message())
+        .expect("expected a response Message event");
+    assert_eq!(resp_meta.direction, Some(resp_dir));
+}
+
+/// An H1 request assembled from multiple data chunks carries two distinct
+/// kernel-capture timestamps: `start_timestamp_ns` from the first chunk that
+/// began the message and `complete_timestamp_ns` from the last chunk that
+/// finished it. This is the per-message lifecycle window the ingress→egress
+/// gate keys on (request arrival start vs. completion).
+#[test]
+fn test_h1_request_start_and_complete_timestamps() {
+    let mut collator: Collator<TestEvent> = Collator::with_config(CollatorConfig::messages_only());
+
+    // First chunk: request line + partial headers, no terminator yet.
+    let chunk1 = make_event(
+        Direction::Read,
+        1,
+        1234,
+        8080,
+        1_000_000,
+        b"POST /api HTTP/1.1\r\nContent-Length: 5\r\n",
+    );
+    let events1 = collator.add_event(chunk1);
+    assert!(
+        events1.iter().all(|e| e.as_message().is_none()),
+        "request is incomplete after the first chunk; no Message yet"
+    );
+
+    // Second chunk: blank line + body completes the request.
+    let chunk2 = make_event(Direction::Read, 1, 1234, 8080, 2_000_000, b"\r\nhello");
+    let events2 = collator.add_event(chunk2);
+    let (msg, _) = events2
+        .iter()
+        .find_map(|e| e.as_message())
+        .expect("expected a request Message event after the body chunk");
+    let req = match msg {
+        ParsedHttpMessage::Request(r) => r,
+        _ => panic!("expected a request message"),
+    };
+
+    assert_eq!(
+        req.start_timestamp_ns,
+        TimestampNs(1_000_000),
+        "start_timestamp_ns is the first chunk's capture time"
+    );
+    assert_eq!(
+        req.complete_timestamp_ns,
+        TimestampNs(2_000_000),
+        "complete_timestamp_ns is the last chunk's capture time"
+    );
+}
+
+/// `latency_ns` on an H1 exchange remains request-complete → response-complete
+/// after the timestamp split. Guards against accidentally re-keying latency on
+/// the new `start_timestamp_ns`.
+#[test]
+fn test_h1_exchange_latency_is_complete_to_complete() {
+    let mut collator: Collator<TestEvent> = Collator::with_config(CollatorConfig::exchanges_only());
+
+    // Request: first chunk at 1ms, completes at 2ms.
+    collator.add_event(make_event(
+        Direction::Write,
+        1,
+        1234,
+        8080,
+        1_000_000,
+        b"POST /api HTTP/1.1\r\nContent-Length: 5\r\n",
+    ));
+    collator.add_event(make_event(Direction::Write, 1, 1234, 8080, 2_000_000, b"\r\nhello"));
+
+    // Response: first chunk at 5ms, completes at 9ms.
+    collator.add_event(make_event(
+        Direction::Read,
+        1,
+        1234,
+        8080,
+        5_000_000,
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n",
+    ));
+    let events = collator.add_event(make_event(
+        Direction::Read,
+        1,
+        1234,
+        8080,
+        9_000_000,
+        b"\r\nworld",
+    ));
+
+    let ex = events
+        .iter()
+        .find_map(|e| e.as_exchange())
+        .expect("expected an Exchange event");
+
+    // complete(resp)=9ms − complete(req)=2ms = 7ms — the prior last-chunk
+    // definition, NOT start(resp)=5ms − start(req)=1ms = 4ms.
+    assert_eq!(ex.latency_ns, 7_000_000);
+    assert_eq!(
+        ex.latency_ns,
+        ex.response.complete_timestamp_ns.0 - ex.request.complete_timestamp_ns.0,
+    );
+}
+
+/// A `DataEvent` source that does not override `userspace_timestamp_ns` reports
+/// the kernel `timestamp_ns` — so offline/replay/test sources need no userspace
+/// clock and the field is always populated.
+#[test]
+fn test_dataevent_userspace_timestamp_defaults_to_kernel() {
+    let event = make_event(Direction::Read, 1, 1234, 8080, 4_242_000, b"GET / HTTP/1.1\r\n\r\n");
+    assert_eq!(event.userspace_timestamp_ns(), event.timestamp_ns());
 }
 
 #[test]

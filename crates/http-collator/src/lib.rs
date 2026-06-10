@@ -171,6 +171,7 @@ impl<E: DataEvent> Collator<E> {
         // Extract all scalar metadata before consuming the event
         let direction = event.direction();
         let timestamp_ns = TimestampNs(event.timestamp_ns());
+        let userspace_timestamp_ns = TimestampNs(event.userspace_timestamp_ns());
         let conn_id = event.connection_id();
         let process_id = event.process_id();
         let remote_port = event.remote_port();
@@ -224,6 +225,7 @@ impl<E: DataEvent> Collator<E> {
         let chunk = DataChunk {
             data,
             timestamp_ns,
+            userspace_timestamp_ns,
             direction,
         };
 
@@ -347,12 +349,18 @@ impl<E: DataEvent> Collator<E> {
                     }
                 }
 
+                // HTTP/3 (QUIC) does not thread per-chunk userspace times, so
+                // the userspace fields are 0; kernel start = first frame,
+                // complete = END_STREAM.
                 let request = HttpRequest {
                     method,
                     uri,
                     headers,
                     body: msg.body.to_vec(),
-                    timestamp_ns: TimestampNs(msg.end_stream_timestamp_ns),
+                    start_timestamp_ns: TimestampNs(msg.first_frame_timestamp_ns),
+                    userspace_start_timestamp_ns: TimestampNs(0),
+                    complete_timestamp_ns: TimestampNs(msg.end_stream_timestamp_ns),
+                    userspace_complete_timestamp_ns: TimestampNs(0),
                     version: None,
                 };
 
@@ -368,6 +376,7 @@ impl<E: DataEvent> Collator<E> {
                             remote_port: None,
                             local_port: None,
                             protocol: Protocol::Http3,
+                            direction: None,
                         },
                     });
                 }
@@ -422,7 +431,10 @@ impl<E: DataEvent> Collator<E> {
                     status,
                     headers,
                     body: msg.body.to_vec(),
-                    timestamp_ns: TimestampNs(msg.first_frame_timestamp_ns),
+                    start_timestamp_ns: TimestampNs(msg.first_frame_timestamp_ns),
+                    userspace_start_timestamp_ns: TimestampNs(0),
+                    complete_timestamp_ns: TimestampNs(msg.end_stream_timestamp_ns),
+                    userspace_complete_timestamp_ns: TimestampNs(0),
                     version: None,
                     reason: None,
                 };
@@ -430,9 +442,11 @@ impl<E: DataEvent> Collator<E> {
                 // Pair with pending request on the same stream, or emit with placeholder
                 let (request, latency_ns) =
                     if let Some(req) = quic_conn.pending_requests.remove(&sid) {
+                        // Response-start − request-complete, matching the H2
+                        // latency definition.
                         let latency = msg
                             .first_frame_timestamp_ns
-                            .saturating_sub(req.timestamp_ns.0);
+                            .saturating_sub(req.complete_timestamp_ns.0);
                         (req, latency)
                     } else {
                         // No captured request (write probe may not have fired)
@@ -441,7 +455,10 @@ impl<E: DataEvent> Collator<E> {
                             uri:          Uri::from_static("/"),
                             headers:      HeaderMap::new(),
                             body:         Vec::new(),
-                            timestamp_ns: TimestampNs(msg.first_frame_timestamp_ns),
+                            start_timestamp_ns: TimestampNs(msg.first_frame_timestamp_ns),
+                            userspace_start_timestamp_ns: TimestampNs(0),
+                            complete_timestamp_ns: TimestampNs(msg.first_frame_timestamp_ns),
+                            userspace_complete_timestamp_ns: TimestampNs(0),
                             version:      None,
                         };
                         (placeholder, 0)
@@ -453,21 +470,42 @@ impl<E: DataEvent> Collator<E> {
                     &request.headers,
                 ));
 
+                // HTTP/3 side-tagging is not implemented (QUIC follow-up), so
+                // direction is `None` on both legs; ports are unavailable from
+                // the QUIC path.
+                let stream_id = Some(StreamId(sid as u32));
+                let request_meta = MessageMetadata {
+                    connection_id: conn_id,
+                    process_id,
+                    command: command.to_string(),
+                    timestamp_ns: request.start_timestamp_ns,
+                    stream_id,
+                    remote_port: None,
+                    local_port: None,
+                    protocol: Protocol::Http3,
+                    direction: None,
+                };
+                let response_meta = MessageMetadata {
+                    connection_id: conn_id,
+                    process_id,
+                    command: command.to_string(),
+                    timestamp_ns: response.start_timestamp_ns,
+                    stream_id,
+                    remote_port: None,
+                    local_port: None,
+                    protocol: Protocol::Http3,
+                    direction: None,
+                };
+
                 let exchange = Exchange {
                     request,
                     response,
+                    request_meta,
+                    response_meta,
                     latency_ns,
-                    protocol: Protocol::Http3,
-                    process_id,
                     thread_id: 0,
                     fd: -1,
-                    command: command.to_string(),
-                    remote_port: None,
-                    local_port: None,
-                    stream_id: Some(StreamId(sid as u32)),
                     proxy_metadata: 0,
-                    // HTTP/3 side-tagging is not implemented (QUIC follow-up).
-                    request_direction: None,
                     request_fingerprint,
                 };
 
@@ -692,7 +730,7 @@ impl<E: DataEvent> Collator<E> {
         );
 
         if config.emit_exchanges && conn.request_complete && conn.response_complete {
-            if let Some(exchange) = build_exchange(conn) {
+            if let Some(exchange) = build_exchange(conn, conn_id) {
                 events.push(CollationEvent::Exchange(exchange));
             }
             reset_connection_after_exchange(conn);
@@ -791,12 +829,8 @@ fn finalize_and_emit(
         && conn.h1_response.is_none()
         && !conn.h1_read_buffer.is_empty()
     {
-        let timestamp = conn
-            .response_chunks
-            .first()
-            .map(|c| c.timestamp_ns)
-            .unwrap_or(TimestampNs(0));
-        conn.h1_response = h1::try_finalize_http1_response(&conn.h1_read_buffer, timestamp);
+        let timestamps = message_timestamps(&conn.response_chunks);
+        conn.h1_response = h1::try_finalize_http1_response(&conn.h1_read_buffer, timestamps);
         if conn.h1_response.is_some() {
             conn.response_complete = true;
         }
@@ -811,12 +845,25 @@ fn finalize_and_emit(
     if config.emit_exchanges
         && conn.request_complete
         && conn.response_complete
-        && let Some(exchange) = build_exchange(conn)
+        && let Some(exchange) = build_exchange(conn, connection_id)
     {
         events.push(CollationEvent::Exchange(exchange));
     }
 
     events
+}
+
+/// The socket direction opposite the one given: a response travels the leg the
+/// request did not. `Read`↔`Write`; `Other` and `None` pass through unchanged
+/// (no usable signal to invert). Used to label a response message's direction
+/// from the connection's recorded request direction when the response is
+/// re-emitted outside its parse-buffer context.
+fn invert_direction(dir: Option<Direction>) -> Option<Direction> {
+    match dir {
+        Some(Direction::Read) => Some(Direction::Write),
+        Some(Direction::Write) => Some(Direction::Read),
+        other => other,
+    }
 }
 
 /// Emit Message events for any newly parsed messages that haven't been emitted
@@ -837,11 +884,12 @@ fn emit_message_events(
                     connection_id: conn_id,
                     process_id,
                     command: conn.command.clone(),
-                    timestamp_ns: req.timestamp_ns,
+                    timestamp_ns: req.start_timestamp_ns,
                     stream_id: None,
                     remote_port: conn.remote_port,
                     local_port: conn.local_port,
                     protocol: conn.protocol,
+                    direction: conn.request_direction,
                 };
                 events.push(CollationEvent::Message {
                     message: ParsedHttpMessage::Request(req.clone()),
@@ -858,11 +906,12 @@ fn emit_message_events(
                     connection_id: conn_id,
                     process_id,
                     command: conn.command.clone(),
-                    timestamp_ns: resp.timestamp_ns,
+                    timestamp_ns: resp.start_timestamp_ns,
                     stream_id: None,
                     remote_port: conn.remote_port,
                     local_port: conn.local_port,
                     protocol: conn.protocol,
+                    direction: invert_direction(conn.request_direction),
                 };
                 events.push(CollationEvent::Message {
                     message: ParsedHttpMessage::Response(resp.clone()),
@@ -886,6 +935,7 @@ fn emit_message_events(
                         remote_port: conn.remote_port,
                         local_port: conn.local_port,
                         protocol: conn.protocol,
+                        direction: conn.request_direction,
                     };
                     events.push(CollationEvent::Message {
                         message: ParsedHttpMessage::Request(req),
@@ -911,6 +961,7 @@ fn emit_message_events(
                         remote_port: conn.remote_port,
                         local_port: conn.local_port,
                         protocol: conn.protocol,
+                        direction: invert_direction(conn.request_direction),
                     };
                     events.push(CollationEvent::Message {
                         message: ParsedHttpMessage::Response(resp),
@@ -1123,6 +1174,32 @@ fn find_complete_h2_stream(conn: &Conn) -> Option<StreamId> {
     conn.ready_streams.iter().next().copied()
 }
 
+/// Build the four lifecycle timestamps for a message being parsed from a
+/// direction's accumulated chunks: `start`/`userspace_start` from the first
+/// chunk, `complete`/`userspace_complete` from the last. Empty chunk list
+/// (shouldn't happen at a parse site) yields all-zero.
+///
+/// CAVEAT (HTTP/1.1 pipelining): chunks are tracked per-direction, not
+/// per-message, so the 2nd+ message in a pipelined batch shares the batch's
+/// first/last chunk rather than its own byte-exact boundaries. This is the
+/// same fidelity the previous single-`chunks.last()` timestamp had — it is not
+/// a regression, just an inherited limit. The kernel `complete` value matches
+/// the old `chunks.last()` exactly, so `latency_ns` is unchanged.
+fn message_timestamps(chunks: &[DataChunk]) -> h1::MessageTimestamps {
+    let first = chunks.first();
+    let last = chunks.last();
+    h1::MessageTimestamps {
+        start: first.map(|c| c.timestamp_ns).unwrap_or(TimestampNs(0)),
+        userspace_start: first
+            .map(|c| c.userspace_timestamp_ns)
+            .unwrap_or(TimestampNs(0)),
+        complete: last.map(|c| c.timestamp_ns).unwrap_or(TimestampNs(0)),
+        userspace_complete: last
+            .map(|c| c.userspace_timestamp_ns)
+            .unwrap_or(TimestampNs(0)),
+    }
+}
+
 /// Drain complete HTTP/1 messages from the write-direction buffer, emitting a
 /// `Message` event for each one. Supports HTTP/1.1 keep-alive pipelining: as
 /// long as the buffer holds another complete request or response, we slice
@@ -1139,23 +1216,19 @@ fn drain_parse_emit_http1_write(
     events: &mut Vec<CollationEvent>,
 ) {
     loop {
-        let timestamp = conn
-            .request_chunks
-            .last()
-            .map(|c| c.timestamp_ns)
-            .unwrap_or(TimestampNs(0));
+        let timestamps = message_timestamps(&conn.request_chunks);
 
         // Try request first (client-side), then response (server-side).
         if let Some((req, consumed)) =
-            h1::try_parse_http1_request_sized(&conn.h1_write_buffer, timestamp)
+            h1::try_parse_http1_request_sized(&conn.h1_write_buffer, timestamps)
         {
             conn.h1_write_buffer.drain(..consumed);
             emit_h1_request(conn, conn_id, process_id, config, events, req, Direction::Write);
         } else if let Some((resp, consumed)) =
-            h1::try_parse_http1_response_sized(&conn.h1_write_buffer, timestamp)
+            h1::try_parse_http1_response_sized(&conn.h1_write_buffer, timestamps)
         {
             conn.h1_write_buffer.drain(..consumed);
-            emit_h1_response(conn, conn_id, process_id, config, events, resp);
+            emit_h1_response(conn, conn_id, process_id, config, events, resp, Direction::Write);
         } else {
             break;
         }
@@ -1172,20 +1245,16 @@ fn drain_parse_emit_http1_read(
     events: &mut Vec<CollationEvent>,
 ) {
     loop {
-        let timestamp = conn
-            .response_chunks
-            .last()
-            .map(|c| c.timestamp_ns)
-            .unwrap_or(TimestampNs(0));
+        let timestamps = message_timestamps(&conn.response_chunks);
 
         // Tries response first (client-side), then request (server-side).
         if let Some((resp, consumed)) =
-            h1::try_parse_http1_response_sized(&conn.h1_read_buffer, timestamp)
+            h1::try_parse_http1_response_sized(&conn.h1_read_buffer, timestamps)
         {
             conn.h1_read_buffer.drain(..consumed);
-            emit_h1_response(conn, conn_id, process_id, config, events, resp);
+            emit_h1_response(conn, conn_id, process_id, config, events, resp, Direction::Read);
         } else if let Some((req, consumed)) =
-            h1::try_parse_http1_request_sized(&conn.h1_read_buffer, timestamp)
+            h1::try_parse_http1_request_sized(&conn.h1_read_buffer, timestamps)
         {
             conn.h1_read_buffer.drain(..consumed);
             emit_h1_request(conn, conn_id, process_id, config, events, req, Direction::Read);
@@ -1204,24 +1273,20 @@ fn drain_parse_emit_http1_unknown_write(
     config: &CollatorConfig,
     events: &mut Vec<CollationEvent>,
 ) {
-    let timestamp = conn
-        .request_chunks
-        .last()
-        .map(|c| c.timestamp_ns)
-        .unwrap_or(TimestampNs(0));
+    let timestamps = message_timestamps(&conn.request_chunks);
     if let Some((req, consumed)) =
-        h1::try_parse_http1_request_sized(&conn.h1_write_buffer, timestamp)
+        h1::try_parse_http1_request_sized(&conn.h1_write_buffer, timestamps)
     {
         conn.protocol = Protocol::Http1;
         conn.h1_write_buffer.drain(..consumed);
         emit_h1_request(conn, conn_id, process_id, config, events, req, Direction::Write);
         drain_parse_emit_http1_write(conn, conn_id, process_id, config, events);
     } else if let Some((resp, consumed)) =
-        h1::try_parse_http1_response_sized(&conn.h1_write_buffer, timestamp)
+        h1::try_parse_http1_response_sized(&conn.h1_write_buffer, timestamps)
     {
         conn.protocol = Protocol::Http1;
         conn.h1_write_buffer.drain(..consumed);
-        emit_h1_response(conn, conn_id, process_id, config, events, resp);
+        emit_h1_response(conn, conn_id, process_id, config, events, resp, Direction::Write);
         drain_parse_emit_http1_write(conn, conn_id, process_id, config, events);
     }
 }
@@ -1235,20 +1300,16 @@ fn drain_parse_emit_http1_unknown_read(
     config: &CollatorConfig,
     events: &mut Vec<CollationEvent>,
 ) {
-    let timestamp = conn
-        .response_chunks
-        .last()
-        .map(|c| c.timestamp_ns)
-        .unwrap_or(TimestampNs(0));
+    let timestamps = message_timestamps(&conn.response_chunks);
     if let Some((resp, consumed)) =
-        h1::try_parse_http1_response_sized(&conn.h1_read_buffer, timestamp)
+        h1::try_parse_http1_response_sized(&conn.h1_read_buffer, timestamps)
     {
         conn.protocol = Protocol::Http1;
         conn.h1_read_buffer.drain(..consumed);
-        emit_h1_response(conn, conn_id, process_id, config, events, resp);
+        emit_h1_response(conn, conn_id, process_id, config, events, resp, Direction::Read);
         drain_parse_emit_http1_read(conn, conn_id, process_id, config, events);
     } else if let Some((req, consumed)) =
-        h1::try_parse_http1_request_sized(&conn.h1_read_buffer, timestamp)
+        h1::try_parse_http1_request_sized(&conn.h1_read_buffer, timestamps)
     {
         conn.protocol = Protocol::Http1;
         conn.h1_read_buffer.drain(..consumed);
@@ -1278,11 +1339,12 @@ fn emit_h1_request(
             connection_id: conn_id,
             process_id,
             command: conn.command.clone(),
-            timestamp_ns: req.timestamp_ns,
+            timestamp_ns: req.start_timestamp_ns,
             stream_id: None,
             remote_port: conn.remote_port,
             local_port: conn.local_port,
             protocol: Protocol::Http1,
+            direction: Some(direction),
         };
         events.push(CollationEvent::Message {
             message: ParsedHttpMessage::Request(req.clone()),
@@ -1303,17 +1365,19 @@ fn emit_h1_response(
     config: &CollatorConfig,
     events: &mut Vec<CollationEvent>,
     resp: h1::HttpResponse,
+    direction: Direction,
 ) {
     if config.emit_messages {
         let metadata = MessageMetadata {
             connection_id: conn_id,
             process_id,
             command: conn.command.clone(),
-            timestamp_ns: resp.timestamp_ns,
+            timestamp_ns: resp.start_timestamp_ns,
             stream_id: None,
             remote_port: conn.remote_port,
             local_port: conn.local_port,
             protocol: Protocol::Http1,
+            direction: Some(direction),
         };
         events.push(CollationEvent::Message {
             message: ParsedHttpMessage::Response(resp.clone()),
@@ -1340,13 +1404,17 @@ fn is_response_complete(conn: &Conn) -> bool {
     }
 }
 
-fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
+fn build_exchange(conn: &mut Conn, conn_id: u128) -> Option<Exchange> {
     let (request, response, stream_id, latency_ns) = match conn.protocol {
         Protocol::Http1 => {
             // Take the already-parsed request and response
             let req = conn.h1_request.take()?;
             let resp = conn.h1_response.take()?;
-            let latency = resp.timestamp_ns.saturating_sub(req.timestamp_ns);
+            // Request-complete → response-complete, preserving the prior
+            // (single-`timestamp_ns` = last-chunk) latency definition exactly.
+            let latency = resp
+                .complete_timestamp_ns
+                .saturating_sub(req.complete_timestamp_ns);
             (req, resp, None, latency)
         },
         Protocol::Http2 => {
@@ -1380,20 +1448,42 @@ fn build_exchange(conn: &mut Conn) -> Option<Exchange> {
         &request.headers,
     ));
 
+    // Connection-level metadata is identical on both legs; the per-leg fields
+    // (timestamp_ns, direction) differ. `timestamp_ns` carries the leg's
+    // arrival-start (first byte). The response travels the opposite socket
+    // direction from the request.
+    let request_meta = MessageMetadata {
+        connection_id: conn_id,
+        process_id: conn.process_id,
+        command: conn.command.clone(),
+        timestamp_ns: request.start_timestamp_ns,
+        stream_id,
+        remote_port: conn.remote_port,
+        local_port: conn.local_port,
+        protocol: conn.protocol,
+        direction: conn.request_direction,
+    };
+    let response_meta = MessageMetadata {
+        connection_id: conn_id,
+        process_id: conn.process_id,
+        command: conn.command.clone(),
+        timestamp_ns: response.start_timestamp_ns,
+        stream_id,
+        remote_port: conn.remote_port,
+        local_port: conn.local_port,
+        protocol: conn.protocol,
+        direction: invert_direction(conn.request_direction),
+    };
+
     Some(Exchange {
         request,
         response,
+        request_meta,
+        response_meta,
         latency_ns,
-        protocol: conn.protocol,
-        process_id: conn.process_id,
         thread_id: conn.thread_id,
         fd: conn.fd,
-        command: conn.command.clone(),
-        remote_port: conn.remote_port,
-        local_port: conn.local_port,
-        stream_id,
         proxy_metadata: conn.proxy_metadata,
-        request_direction: conn.request_direction,
         request_fingerprint,
     })
 }

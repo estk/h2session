@@ -34,6 +34,14 @@ pub trait DataEvent {
     /// Timestamp in nanoseconds (monotonic, for latency calculation)
     fn timestamp_ns(&self) -> u64;
 
+    /// Userspace CLOCK_MONOTONIC time (ns) this event was read off the ringbuf,
+    /// for measuring the eBPF→ringbuf→collator pipeline delay against
+    /// `timestamp_ns`. Defaults to the kernel `timestamp_ns()` for sources that
+    /// have no separate userspace capture time (offline replay, tests).
+    fn userspace_timestamp_ns(&self) -> u64 {
+        self.timestamp_ns()
+    }
+
     /// Direction of the data flow
     fn direction(&self) -> Direction;
 

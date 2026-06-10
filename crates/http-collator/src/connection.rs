@@ -27,7 +27,10 @@ pub enum Protocol {
 #[derive(Debug, Clone)]
 pub(crate) struct DataChunk {
     pub(crate) data:         Bytes,
+    /// Kernel-capture time (`bpf_ktime_get_ns`) of this chunk.
     pub(crate) timestamp_ns: TimestampNs,
+    /// Userspace CLOCK_MONOTONIC time this chunk was read off the ringbuf.
+    pub(crate) userspace_timestamp_ns: TimestampNs,
     #[allow(dead_code)]
     pub(crate) direction:    Direction,
 }

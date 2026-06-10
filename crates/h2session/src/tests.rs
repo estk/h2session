@@ -1090,7 +1090,9 @@ fn test_into_http_request() {
     assert_eq!(req.method, http::Method::GET);
     assert_eq!(req.uri, "/foo");
     assert_eq!(req.body, vec![1, 2, 3]);
-    assert_eq!(req.timestamp_ns, TimestampNs(2000));
+    // start = first frame, complete = END_STREAM.
+    assert_eq!(req.start_timestamp_ns, TimestampNs(1000));
+    assert_eq!(req.complete_timestamp_ns, TimestampNs(2000));
 }
 
 #[test]
@@ -1114,7 +1116,9 @@ fn test_into_http_response() {
         .expect("should produce an HttpResponse");
     assert_eq!(resp.status, http::StatusCode::OK);
     assert_eq!(resp.body, vec![4, 5, 6]);
-    assert_eq!(resp.timestamp_ns, TimestampNs(3000));
+    // start = first frame (response start), complete = END_STREAM.
+    assert_eq!(resp.start_timestamp_ns, TimestampNs(3000));
+    assert_eq!(resp.complete_timestamp_ns, TimestampNs(4000));
 }
 
 #[test]

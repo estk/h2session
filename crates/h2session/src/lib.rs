@@ -23,6 +23,7 @@
 //! use h2session::{H2SessionCache, ParsedH2Message};
 //!
 //! let cache = H2SessionCache::<u64>::new();
+//! # let raw_bytes: Vec<u8> = vec![];
 //!
 //! // Parse a buffer for connection 42
 //! let completed = cache.parse(42, &raw_bytes).unwrap();
@@ -35,7 +36,6 @@
 //!         );
 //!     }
 //! }
-//! # let raw_bytes: Vec<u8> = vec![];
 //! ```
 //!
 //! ## Single-connection incremental parsing
@@ -44,6 +44,7 @@
 //! use h2session::{H2ConnectionState, TimestampNs};
 //!
 //! let mut state = H2ConnectionState::new();
+//! # let chunk: Vec<u8> = vec![];
 //!
 //! // Feed data as it arrives
 //! state.feed(&chunk, TimestampNs(0)).unwrap();
@@ -52,7 +53,6 @@
 //! while let Some((stream_id, msg)) = state.try_pop() {
 //!     println!("stream {stream_id}: request={}", msg.is_request());
 //! }
-//! # let chunk: Vec<u8> = vec![];
 //! ```
 //!
 //! # Feature flags

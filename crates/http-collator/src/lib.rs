@@ -230,10 +230,16 @@ impl<E: DataEvent> Collator<E> {
         };
 
         if conn_id != 0 {
-            let mut entry = self
-                .connections
-                .entry(conn_id)
-                .or_insert_with(|| Conn::new(process_id, thread_id, fd, remote_port, local_port, command.clone()));
+            let mut entry = self.connections.entry_sync(conn_id).or_insert_with(|| {
+                Conn::new(
+                    process_id,
+                    thread_id,
+                    fd,
+                    remote_port,
+                    local_port,
+                    command.clone(),
+                )
+            });
             let conn = entry.get_mut();
             if conn.proxy_metadata == 0 && proxy_metadata != 0 {
                 conn.proxy_metadata = proxy_metadata;
@@ -252,8 +258,17 @@ impl<E: DataEvent> Collator<E> {
         } else {
             let mut entry = self
                 .ssl_connections
-                .entry(process_id)
-                .or_insert_with(|| Conn::new(process_id, thread_id, fd, remote_port, local_port, command.clone()));
+                .entry_sync(process_id)
+                .or_insert_with(|| {
+                    Conn::new(
+                        process_id,
+                        thread_id,
+                        fd,
+                        remote_port,
+                        local_port,
+                        command.clone(),
+                    )
+                });
             let conn = entry.get_mut();
             if conn.proxy_metadata == 0 && proxy_metadata != 0 {
                 conn.proxy_metadata = proxy_metadata;
@@ -292,15 +307,15 @@ impl<E: DataEvent> Collator<E> {
     ) -> Vec<CollationEvent> {
         use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 
-        let mut quic_entry =
-            self.quic_connections
-                .entry(conn_id)
-                .or_insert_with(|| QuicConnection {
-                    h3_state: H3ConnectionState::new(),
-                    last_activity_ns: TimestampNs(0),
-                    pending_requests: std::collections::HashMap::new(),
-                    submitted_response_headers: std::collections::HashMap::new(),
-                });
+        let mut quic_entry = self
+            .quic_connections
+            .entry_sync(conn_id)
+            .or_insert_with(|| QuicConnection {
+                h3_state: H3ConnectionState::new(),
+                last_activity_ns: TimestampNs(0),
+                pending_requests: std::collections::HashMap::new(),
+                submitted_response_headers: std::collections::HashMap::new(),
+            });
         let quic_conn = quic_entry.get_mut();
 
         quic_conn.last_activity_ns = timestamp_ns;
@@ -451,15 +466,15 @@ impl<E: DataEvent> Collator<E> {
                     } else {
                         // No captured request (write probe may not have fired)
                         let placeholder = HttpRequest {
-                            method:       Method::GET,
-                            uri:          Uri::from_static("/"),
-                            headers:      HeaderMap::new(),
-                            body:         Vec::new(),
+                            method: Method::GET,
+                            uri: Uri::from_static("/"),
+                            headers: HeaderMap::new(),
+                            body: Vec::new(),
                             start_timestamp_ns: TimestampNs(msg.first_frame_timestamp_ns),
                             userspace_start_timestamp_ns: TimestampNs(0),
                             complete_timestamp_ns: TimestampNs(msg.first_frame_timestamp_ns),
                             userspace_complete_timestamp_ns: TimestampNs(0),
-                            version:      None,
+                            version: None,
                         };
                         (placeholder, 0)
                     };
@@ -541,15 +556,15 @@ impl<E: DataEvent> Collator<E> {
             return;
         }
 
-        let mut quic_entry =
-            self.quic_connections
-                .entry(conn_id)
-                .or_insert_with(|| QuicConnection {
-                    h3_state: H3ConnectionState::new(),
-                    last_activity_ns: TimestampNs(0),
-                    pending_requests: std::collections::HashMap::new(),
-                    submitted_response_headers: std::collections::HashMap::new(),
-                });
+        let mut quic_entry = self
+            .quic_connections
+            .entry_sync(conn_id)
+            .or_insert_with(|| QuicConnection {
+                h3_state: H3ConnectionState::new(),
+                last_activity_ns: TimestampNs(0),
+                pending_requests: std::collections::HashMap::new(),
+                submitted_response_headers: std::collections::HashMap::new(),
+            });
         let quic_conn = quic_entry.get_mut();
 
         quic_conn.last_activity_ns = timestamp_ns;
@@ -744,7 +759,7 @@ impl<E: DataEvent> Collator<E> {
     /// Callers should invoke this periodically to bound memory usage from
     /// abandoned connections and incomplete HTTP/2 streams.
     pub fn cleanup(&self, current_time_ns: TimestampNs) {
-        self.connections.retain(|_, conn| {
+        self.connections.retain_sync(|_, conn| {
             if current_time_ns.saturating_sub(conn.last_activity_ns) >= self.config.timeout_ns {
                 return false;
             }
@@ -752,7 +767,7 @@ impl<E: DataEvent> Collator<E> {
             conn.h2_read_state.evict_stale_streams(current_time_ns);
             true
         });
-        self.ssl_connections.retain(|_, conn| {
+        self.ssl_connections.retain_sync(|_, conn| {
             if current_time_ns.saturating_sub(conn.last_activity_ns) >= self.config.timeout_ns {
                 return false;
             }
@@ -760,7 +775,7 @@ impl<E: DataEvent> Collator<E> {
             conn.h2_read_state.evict_stale_streams(current_time_ns);
             true
         });
-        self.quic_connections.retain(|_, conn| {
+        self.quic_connections.retain_sync(|_, conn| {
             if current_time_ns.saturating_sub(conn.last_activity_ns) >= self.config.timeout_ns {
                 return false;
             }
@@ -776,9 +791,9 @@ impl<E: DataEvent> Collator<E> {
     /// If connection_id is 0, removes based on process_id from SSL connections.
     pub fn remove_connection(&self, connection_id: u128, process_id: u32) {
         if connection_id != 0 {
-            let _ = self.connections.remove(&connection_id);
+            let _ = self.connections.remove_sync(&connection_id);
         } else {
-            let _ = self.ssl_connections.remove(&process_id);
+            let _ = self.ssl_connections.remove_sync(&process_id);
         }
     }
 
@@ -791,14 +806,14 @@ impl<E: DataEvent> Collator<E> {
     /// the connection.
     pub fn close_connection(&self, connection_id: u128, process_id: u32) -> Vec<CollationEvent> {
         let events = if connection_id != 0 {
-            match self.connections.get(&connection_id) {
+            match self.connections.get_sync(&connection_id) {
                 Some(mut entry) => {
                     finalize_and_emit(entry.get_mut(), connection_id, process_id, &self.config)
                 },
                 None => Vec::new(),
             }
         } else {
-            match self.ssl_connections.get(&process_id) {
+            match self.ssl_connections.get_sync(&process_id) {
                 Some(mut entry) => {
                     finalize_and_emit(entry.get_mut(), connection_id, process_id, &self.config)
                 },
@@ -808,9 +823,9 @@ impl<E: DataEvent> Collator<E> {
 
         // Remove the connection after releasing the guard
         if connection_id != 0 {
-            let _ = self.connections.remove(&connection_id);
+            let _ = self.connections.remove_sync(&connection_id);
         } else {
-            let _ = self.ssl_connections.remove(&process_id);
+            let _ = self.ssl_connections.remove_sync(&process_id);
         }
 
         events
@@ -1223,12 +1238,28 @@ fn drain_parse_emit_http1_write(
             h1::try_parse_http1_request_sized(&conn.h1_write_buffer, timestamps)
         {
             conn.h1_write_buffer.drain(..consumed);
-            emit_h1_request(conn, conn_id, process_id, config, events, req, Direction::Write);
+            emit_h1_request(
+                conn,
+                conn_id,
+                process_id,
+                config,
+                events,
+                req,
+                Direction::Write,
+            );
         } else if let Some((resp, consumed)) =
             h1::try_parse_http1_response_sized(&conn.h1_write_buffer, timestamps)
         {
             conn.h1_write_buffer.drain(..consumed);
-            emit_h1_response(conn, conn_id, process_id, config, events, resp, Direction::Write);
+            emit_h1_response(
+                conn,
+                conn_id,
+                process_id,
+                config,
+                events,
+                resp,
+                Direction::Write,
+            );
         } else {
             break;
         }
@@ -1252,12 +1283,28 @@ fn drain_parse_emit_http1_read(
             h1::try_parse_http1_response_sized(&conn.h1_read_buffer, timestamps)
         {
             conn.h1_read_buffer.drain(..consumed);
-            emit_h1_response(conn, conn_id, process_id, config, events, resp, Direction::Read);
+            emit_h1_response(
+                conn,
+                conn_id,
+                process_id,
+                config,
+                events,
+                resp,
+                Direction::Read,
+            );
         } else if let Some((req, consumed)) =
             h1::try_parse_http1_request_sized(&conn.h1_read_buffer, timestamps)
         {
             conn.h1_read_buffer.drain(..consumed);
-            emit_h1_request(conn, conn_id, process_id, config, events, req, Direction::Read);
+            emit_h1_request(
+                conn,
+                conn_id,
+                process_id,
+                config,
+                events,
+                req,
+                Direction::Read,
+            );
         } else {
             break;
         }
@@ -1279,14 +1326,30 @@ fn drain_parse_emit_http1_unknown_write(
     {
         conn.protocol = Protocol::Http1;
         conn.h1_write_buffer.drain(..consumed);
-        emit_h1_request(conn, conn_id, process_id, config, events, req, Direction::Write);
+        emit_h1_request(
+            conn,
+            conn_id,
+            process_id,
+            config,
+            events,
+            req,
+            Direction::Write,
+        );
         drain_parse_emit_http1_write(conn, conn_id, process_id, config, events);
     } else if let Some((resp, consumed)) =
         h1::try_parse_http1_response_sized(&conn.h1_write_buffer, timestamps)
     {
         conn.protocol = Protocol::Http1;
         conn.h1_write_buffer.drain(..consumed);
-        emit_h1_response(conn, conn_id, process_id, config, events, resp, Direction::Write);
+        emit_h1_response(
+            conn,
+            conn_id,
+            process_id,
+            config,
+            events,
+            resp,
+            Direction::Write,
+        );
         drain_parse_emit_http1_write(conn, conn_id, process_id, config, events);
     }
 }
@@ -1306,14 +1369,30 @@ fn drain_parse_emit_http1_unknown_read(
     {
         conn.protocol = Protocol::Http1;
         conn.h1_read_buffer.drain(..consumed);
-        emit_h1_response(conn, conn_id, process_id, config, events, resp, Direction::Read);
+        emit_h1_response(
+            conn,
+            conn_id,
+            process_id,
+            config,
+            events,
+            resp,
+            Direction::Read,
+        );
         drain_parse_emit_http1_read(conn, conn_id, process_id, config, events);
     } else if let Some((req, consumed)) =
         h1::try_parse_http1_request_sized(&conn.h1_read_buffer, timestamps)
     {
         conn.protocol = Protocol::Http1;
         conn.h1_read_buffer.drain(..consumed);
-        emit_h1_request(conn, conn_id, process_id, config, events, req, Direction::Read);
+        emit_h1_request(
+            conn,
+            conn_id,
+            process_id,
+            config,
+            events,
+            req,
+            Direction::Read,
+        );
         drain_parse_emit_http1_read(conn, conn_id, process_id, config, events);
     }
 }

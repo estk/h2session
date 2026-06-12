@@ -167,25 +167,25 @@ impl CollatorConfig {
 #[derive(Debug, Clone)]
 pub struct Exchange {
     /// The HTTP request
-    pub request:        HttpRequest,
+    pub request: HttpRequest,
     /// The matched HTTP response
-    pub response:       HttpResponse,
+    pub response: HttpResponse,
     /// Metadata captured when the request leg was parsed (connection id,
     /// process/command, ports, protocol, stream id, and the socket direction
     /// the request was observed on). Connection-level fields (process, ports,
     /// protocol) are identical across both legs; `direction` and `timestamp_ns`
     /// are per-leg.
-    pub request_meta:   MessageMetadata,
+    pub request_meta: MessageMetadata,
     /// Metadata captured when the response leg was parsed. Carries the
     /// response's own `timestamp_ns` and `direction` (the opposite socket leg
     /// from the request); other fields mirror `request_meta`.
-    pub response_meta:  MessageMetadata,
+    pub response_meta: MessageMetadata,
     /// Time between request completion and response start, in nanoseconds
-    pub latency_ns:     u64,
+    pub latency_ns: u64,
     /// Thread ID (TID/LWP) that handled this connection
-    pub thread_id:      u32,
+    pub thread_id: u32,
     /// Socket file descriptor (-1 if unavailable)
-    pub fd:             i32,
+    pub fd: i32,
     /// Opaque metadata from the data source, propagated for proxy correlation
     pub proxy_metadata: u64,
     /// Stable xxhash3-64 fingerprint of canonicalised request headers
@@ -261,7 +261,10 @@ impl std::fmt::Display for Exchange {
         writeln!(
             f,
             "=== {} Exchange (PID: {}, Command: {}, Port: {}) ===",
-            proto_str, self.process_id(), self.command(), port_str
+            proto_str,
+            self.process_id(),
+            self.command(),
+            port_str
         )?;
         writeln!(f, "Latency: {:.2}ms", latency_ms)?;
         writeln!(f)?;

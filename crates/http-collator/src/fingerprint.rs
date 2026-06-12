@@ -18,12 +18,11 @@ use twox_hash::XxHash3_64;
 /// fingerprint so:
 ///
 /// - the same logical request fingerprints identically on the ingress and
-///   egress side of a proxy (RFC 7230 §6.1 hop-by-hop headers + the
-///   `Forwarded` / `X-Forwarded-*` / `Via` chain proxies inject), and
-/// - test-driven traffic that distinguishes requests only by `x-id`
-///   collapses into fingerprint-collision buckets, exercising the
-///   degenerate-FIFO fallback path that the strategy must handle correctly
-///   in production.
+///   egress side of a proxy (RFC 7230 §6.1 hop-by-hop headers + the `Forwarded`
+///   / `X-Forwarded-*` / `Via` chain proxies inject), and
+/// - test-driven traffic that distinguishes requests only by `x-id` collapses
+///   into fingerprint-collision buckets, exercising the degenerate-FIFO
+///   fallback path that the strategy must handle correctly in production.
 const EXCLUDED_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",
@@ -47,11 +46,7 @@ const EXCLUDED_HEADERS: &[&str] = &[
 /// that carry the same method, path, authority, and non-excluded headers —
 /// even if HPACK encoding, header iteration order, or HTTP/2 stream IDs
 /// differ between the two observations.
-pub fn compute_request_fingerprint(
-    method: &Method,
-    uri: &Uri,
-    headers: &HeaderMap,
-) -> u64 {
+pub fn compute_request_fingerprint(method: &Method, uri: &Uri, headers: &HeaderMap) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = XxHash3_64::new();
@@ -92,8 +87,9 @@ pub fn compute_request_fingerprint(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use http::header::{HeaderName, HeaderValue};
+
+    use super::*;
 
     fn hv(s: &str) -> HeaderValue {
         s.parse().unwrap()
@@ -111,8 +107,14 @@ mod tests {
 
     #[test]
     fn same_request_hashes_same() {
-        let a = build("GET", "/api/users/1", &[("x-id", "abc"), ("user-agent", "ua")]);
-        let b = build("GET", "/api/users/1", &[("x-id", "abc"), ("user-agent", "ua")]);
+        let a = build("GET", "/api/users/1", &[
+            ("x-id", "abc"),
+            ("user-agent", "ua"),
+        ]);
+        let b = build("GET", "/api/users/1", &[
+            ("x-id", "abc"),
+            ("user-agent", "ua"),
+        ]);
         assert_eq!(a, b);
     }
 
@@ -134,16 +136,12 @@ mod tests {
     fn excluded_proxy_headers_are_ignored() {
         // Proxy-injected forwarded chain must not change the fingerprint.
         let a = build("GET", "/x", &[("user-agent", "ua")]);
-        let b = build(
-            "GET",
-            "/x",
-            &[
-                ("user-agent", "ua"),
-                ("x-forwarded-for", "10.0.0.1"),
-                ("via", "1.1 haproxy"),
-                ("forwarded", "for=10.0.0.1"),
-            ],
-        );
+        let b = build("GET", "/x", &[
+            ("user-agent", "ua"),
+            ("x-forwarded-for", "10.0.0.1"),
+            ("via", "1.1 haproxy"),
+            ("forwarded", "for=10.0.0.1"),
+        ]);
         assert_eq!(a, b);
     }
 

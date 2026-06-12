@@ -26,32 +26,32 @@ pub enum Protocol {
 /// A chunk of data received from a data source
 #[derive(Debug, Clone)]
 pub(crate) struct DataChunk {
-    pub(crate) data:         Bytes,
+    pub(crate) data: Bytes,
     /// Kernel-capture time (`bpf_ktime_get_ns`) of this chunk.
     pub(crate) timestamp_ns: TimestampNs,
     /// Userspace CLOCK_MONOTONIC time this chunk was read off the ringbuf.
     pub(crate) userspace_timestamp_ns: TimestampNs,
     #[allow(dead_code)]
-    pub(crate) direction:    Direction,
+    pub(crate) direction: Direction,
 }
 
 /// Tracks state for a single connection
 pub(crate) struct Connection {
-    pub(crate) process_id:        u32,
-    pub(crate) thread_id:         u32,
+    pub(crate) process_id: u32,
+    pub(crate) thread_id: u32,
     /// Socket file descriptor (-1 if unavailable)
-    pub(crate) fd:                i32,
+    pub(crate) fd: i32,
     /// Process/command name (e.g., "curl", "nghttpx")
-    pub(crate) command:           String,
+    pub(crate) command: String,
     /// Remote port, None if unavailable (e.g., SSL without socket fd)
-    pub(crate) remote_port:       Option<u16>,
+    pub(crate) remote_port: Option<u16>,
     /// Local port, None if unavailable
-    pub(crate) local_port:        Option<u16>,
-    pub(crate) protocol:          Protocol,
-    pub(crate) request_chunks:    Vec<DataChunk>,
-    pub(crate) response_chunks:   Vec<DataChunk>,
-    pub(crate) last_activity_ns:  TimestampNs,
-    pub(crate) request_complete:  bool,
+    pub(crate) local_port: Option<u16>,
+    pub(crate) protocol: Protocol,
+    pub(crate) request_chunks: Vec<DataChunk>,
+    pub(crate) response_chunks: Vec<DataChunk>,
+    pub(crate) last_activity_ns: TimestampNs,
+    pub(crate) request_complete: bool,
     pub(crate) response_complete: bool,
 
     // HTTP/1 growable buffers — new data is appended as it arrives, avoiding
@@ -102,7 +102,14 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    pub(crate) fn new(process_id: u32, thread_id: u32, fd: i32, remote_port: u16, local_port: u16, command: String) -> Self {
+    pub(crate) fn new(
+        process_id: u32,
+        thread_id: u32,
+        fd: i32,
+        remote_port: u16,
+        local_port: u16,
+        command: String,
+    ) -> Self {
         Self {
             process_id,
             thread_id,

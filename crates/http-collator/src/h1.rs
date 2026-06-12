@@ -12,11 +12,11 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 #[derive(Debug, Clone, Copy)]
 pub struct MessageTimestamps {
     /// Kernel-capture time of the first chunk (message start).
-    pub start:             TimestampNs,
+    pub start: TimestampNs,
     /// Userspace ring-read time of the first chunk.
-    pub userspace_start:   TimestampNs,
+    pub userspace_start: TimestampNs,
     /// Kernel-capture time of the last chunk (message complete).
-    pub complete:          TimestampNs,
+    pub complete: TimestampNs,
     /// Userspace ring-read time of the completing chunk.
     pub userspace_complete: TimestampNs,
 }
@@ -98,7 +98,10 @@ pub fn try_parse_http1_request_sized(
 
 /// Try to parse an HTTP/1.x response, returning Some only if complete.
 /// This combines header parsing and body completeness checking in one pass.
-pub fn try_parse_http1_response(data: &[u8], timestamps: MessageTimestamps) -> Option<HttpResponse> {
+pub fn try_parse_http1_response(
+    data: &[u8],
+    timestamps: MessageTimestamps,
+) -> Option<HttpResponse> {
     try_parse_http1_response_sized(data, timestamps).map(|(resp, _)| resp)
 }
 
@@ -159,7 +162,10 @@ pub fn try_parse_http1_response_sized(
 /// Transfer-Encoding), RFC 7230 §3.3.3 says the body is everything until the
 /// connection closes. This function parses the headers and takes all remaining
 /// data as the body.
-pub fn try_finalize_http1_response(data: &[u8], timestamps: MessageTimestamps) -> Option<HttpResponse> {
+pub fn try_finalize_http1_response(
+    data: &[u8],
+    timestamps: MessageTimestamps,
+) -> Option<HttpResponse> {
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut res = httparse::Response::new(&mut headers);
 

@@ -8,9 +8,9 @@ use super::*;
 /// their intent; assertions read `start_timestamp_ns` as the representative.
 fn ts(n: u64) -> MessageTimestamps {
     MessageTimestamps {
-        start:              TimestampNs(n),
-        userspace_start:    TimestampNs(n),
-        complete:           TimestampNs(n),
+        start: TimestampNs(n),
+        userspace_start: TimestampNs(n),
+        complete: TimestampNs(n),
         userspace_complete: TimestampNs(n),
     }
 }

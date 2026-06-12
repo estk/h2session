@@ -80,7 +80,7 @@ fn test_ssl_port_zero_becomes_none() {
     let _ = collator.add_event(event);
 
     // Verify the connection was created with None for remote_port
-    let conn = collator.ssl_connections.get(&1234).unwrap();
+    let conn = collator.ssl_connections.get_sync(&1234).unwrap();
     assert_eq!(conn.remote_port, None, "Port 0 should become None");
 }
 
@@ -100,7 +100,11 @@ fn test_port_updated_from_later_event() {
 
     let _ = collator.add_event(event1);
     assert_eq!(
-        collator.ssl_connections.get(&1234).unwrap().remote_port,
+        collator
+            .ssl_connections
+            .get_sync(&1234)
+            .unwrap()
+            .remote_port,
         None
     );
 
@@ -118,7 +122,11 @@ fn test_port_updated_from_later_event() {
 
     // Port should now be updated
     assert_eq!(
-        collator.ssl_connections.get(&1234).unwrap().remote_port,
+        collator
+            .ssl_connections
+            .get_sync(&1234)
+            .unwrap()
+            .remote_port,
         Some(8080),
         "Port should be updated from later event"
     );
@@ -238,7 +246,7 @@ fn test_h2_incremental_parsing_no_body_duplication() {
     let _ = collator.add_event(event3);
 
     // Check the pending request body
-    let conn = collator.connections.get(&conn_id).unwrap();
+    let conn = collator.connections.get_sync(&conn_id).unwrap();
     let request = conn.pending_requests.get(&StreamId(1)).unwrap();
 
     // Body should be "helloworld", NOT "hellohelloworldhelloworldworld"
@@ -526,7 +534,7 @@ fn test_h2_fd_reuse_split_chunks_with_response() {
     // Verify the request was parsed (scope the guard to release the read lock
     // before calling add_event below, which needs a write lock on the same shard)
     {
-        let conn = collator.connections.get(&conn_id).unwrap();
+        let conn = collator.connections.get_sync(&conn_id).unwrap();
         assert!(
             conn.pending_requests.contains_key(&StreamId(1)),
             "Second exchange request should be in pending_requests"
@@ -667,26 +675,26 @@ fn test_h2_per_stream_latency() {
 fn test_exchange_display_port(#[case] remote_port: Option<u16>, #[case] expected_text: &str) {
     let exchange = Exchange {
         request: HttpRequest {
-            method:       http::Method::GET,
-            uri:          "/".parse().unwrap(),
-            headers:      http::HeaderMap::new(),
-            body:         vec![],
+            method: http::Method::GET,
+            uri: "/".parse().unwrap(),
+            headers: http::HeaderMap::new(),
+            body: vec![],
             start_timestamp_ns: TimestampNs(0),
             userspace_start_timestamp_ns: TimestampNs(0),
             complete_timestamp_ns: TimestampNs(0),
             userspace_complete_timestamp_ns: TimestampNs(0),
-            version:      None,
+            version: None,
         },
         response: HttpResponse {
-            status:       http::StatusCode::OK,
-            headers:      http::HeaderMap::new(),
-            body:         vec![],
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::new(),
+            body: vec![],
             start_timestamp_ns: TimestampNs(0),
             userspace_start_timestamp_ns: TimestampNs(0),
             complete_timestamp_ns: TimestampNs(0),
             userspace_complete_timestamp_ns: TimestampNs(0),
-            version:      None,
-            reason:       None,
+            version: None,
+            reason: None,
         },
         request_meta: MessageMetadata {
             connection_id: 0,
@@ -996,7 +1004,14 @@ fn test_h1_exchange_latency_is_complete_to_complete() {
         1_000_000,
         b"POST /api HTTP/1.1\r\nContent-Length: 5\r\n",
     ));
-    collator.add_event(make_event(Direction::Write, 1, 1234, 8080, 2_000_000, b"\r\nhello"));
+    collator.add_event(make_event(
+        Direction::Write,
+        1,
+        1234,
+        8080,
+        2_000_000,
+        b"\r\nhello",
+    ));
 
     // Response: first chunk at 5ms, completes at 9ms.
     collator.add_event(make_event(
@@ -1035,7 +1050,14 @@ fn test_h1_exchange_latency_is_complete_to_complete() {
 /// clock and the field is always populated.
 #[test]
 fn test_dataevent_userspace_timestamp_defaults_to_kernel() {
-    let event = make_event(Direction::Read, 1, 1234, 8080, 4_242_000, b"GET / HTTP/1.1\r\n\r\n");
+    let event = make_event(
+        Direction::Read,
+        1,
+        1234,
+        8080,
+        4_242_000,
+        b"GET / HTTP/1.1\r\n\r\n",
+    );
     assert_eq!(event.userspace_timestamp_ns(), event.timestamp_ns());
 }
 
@@ -1298,13 +1320,17 @@ fn test_cleanup_evicts_stale_h2_streams() {
 
     // Verify stream is active (scope the guard to release the read lock)
     {
-        let conn = collator.connections.get(&conn_id).unwrap();
+        let conn = collator.connections.get_sync(&conn_id).unwrap();
         assert_eq!(conn.h2_write_state.active_stream_count(), 1);
     }
 
     // Cleanup at t=40s (> default 30s stream timeout) with a recent last_activity
     // First update last_activity so the connection itself survives
-    collator.connections.get(&conn_id).unwrap().last_activity_ns = TimestampNs(39_000_000_000);
+    collator
+        .connections
+        .get_sync(&conn_id)
+        .unwrap()
+        .last_activity_ns = TimestampNs(39_000_000_000);
     collator.cleanup(TimestampNs(40_000_000_000));
 
     // Connection should survive but stale stream should be evicted
@@ -1313,7 +1339,7 @@ fn test_cleanup_evicts_stale_h2_streams() {
         1,
         "Connection should survive (recent activity)"
     );
-    let conn = collator.connections.get(&conn_id).unwrap();
+    let conn = collator.connections.get_sync(&conn_id).unwrap();
     assert_eq!(
         conn.h2_write_state.active_stream_count(),
         0,
@@ -1352,7 +1378,7 @@ fn test_body_size_limit_resets_connection() {
     );
 
     // Connection should be reset — protocol should be Unknown again
-    let conn = collator.connections.get(&1).unwrap();
+    let conn = collator.connections.get_sync(&1).unwrap();
     assert_eq!(conn.protocol, Protocol::Unknown);
     assert!(conn.request_chunks.is_empty());
     assert_eq!(conn.request_body_size, 0);
@@ -1412,7 +1438,7 @@ fn test_fd_reuse_http2_to_http1() {
 
     // Connection is now HTTP/2
     assert_eq!(
-        collator.connections.get(&conn_id).unwrap().protocol,
+        collator.connections.get_sync(&conn_id).unwrap().protocol,
         Protocol::Http2
     );
 
@@ -1422,7 +1448,7 @@ fn test_fd_reuse_http2_to_http1() {
     let events = collator.add_event(h1_event);
 
     // Should have reset to HTTP/1 and parsed the request
-    let conn = collator.connections.get(&conn_id).unwrap();
+    let conn = collator.connections.get_sync(&conn_id).unwrap();
     assert_eq!(
         conn.protocol,
         Protocol::Http1,
@@ -1449,8 +1475,8 @@ fn test_cleanup_clock_skew_no_panic() {
     // Manually insert a connection with last_activity in the "future"
     let _ = collator
         .connections
-        .insert(1, Conn::new(1234, 0, 0, 8080, 0, String::new()));
-    collator.connections.get(&1).unwrap().last_activity_ns = TimestampNs(10_000_000_000);
+        .insert_sync(1, Conn::new(1234, 0, 0, 8080, 0, String::new()));
+    collator.connections.get_sync(&1).unwrap().last_activity_ns = TimestampNs(10_000_000_000);
 
     // Cleanup with a current_time BEFORE the last activity (clock skew).
     // With unsigned subtraction this would panic; saturating_sub prevents it.
@@ -1516,7 +1542,7 @@ fn test_close_connection_finalizes_http1_response() {
 
     // Connection should be removed
     assert!(
-        collator.connections.get(&1).is_none(),
+        collator.connections.get_sync(&1).is_none(),
         "Connection should be removed after close"
     );
 }
@@ -1616,7 +1642,7 @@ fn test_unknown_protocol_webdav_propfind() {
     );
 
     // Verify the connection was promoted
-    let conn = collator.connections.get(&1).unwrap();
+    let conn = collator.connections.get_sync(&1).unwrap();
     assert_eq!(conn.protocol, Protocol::Http1);
 }
 

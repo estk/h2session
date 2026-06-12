@@ -11,13 +11,13 @@ use crate::state::TimestampNs;
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
     /// HTTP method (GET, POST, etc.)
-    pub method:       Method,
+    pub method: Method,
     /// Request target URI
-    pub uri:          Uri,
+    pub uri: Uri,
     /// HTTP headers
-    pub headers:      HeaderMap,
+    pub headers: HeaderMap,
     /// Request body bytes
-    pub body:         Vec<u8>,
+    pub body: Vec<u8>,
     /// Kernel-capture time (`bpf_ktime_get_ns`, CLOCK_MONOTONIC) of the first
     /// data chunk that began this request — i.e. when the request started
     /// arriving. For HTTP/2 this is the first frame of the stream.
@@ -38,18 +38,18 @@ pub struct HttpRequest {
     pub userspace_complete_timestamp_ns: TimestampNs,
     /// HTTP version: None for HTTP/2, Some(0) for HTTP/1.0, Some(1) for
     /// HTTP/1.1
-    pub version:      Option<u8>,
+    pub version: Option<u8>,
 }
 
 /// HTTP response parsed from any HTTP version
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     /// HTTP status code (200, 404, etc.)
-    pub status:       StatusCode,
+    pub status: StatusCode,
     /// HTTP headers
-    pub headers:      HeaderMap,
+    pub headers: HeaderMap,
     /// Response body bytes
-    pub body:         Vec<u8>,
+    pub body: Vec<u8>,
     /// Kernel-capture time (`bpf_ktime_get_ns`, CLOCK_MONOTONIC) of the first
     /// data chunk that began this response — i.e. response-start. For HTTP/2
     /// this is the first frame of the response stream.
@@ -66,7 +66,7 @@ pub struct HttpResponse {
     pub userspace_complete_timestamp_ns: TimestampNs,
     /// HTTP version: None for HTTP/2, Some(0) for HTTP/1.0, Some(1) for
     /// HTTP/1.1
-    pub version:      Option<u8>,
+    pub version: Option<u8>,
     /// Reason phrase: None for HTTP/2, Some("OK") etc for HTTP/1
-    pub reason:       Option<String>,
+    pub reason: Option<String>,
 }

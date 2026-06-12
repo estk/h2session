@@ -122,7 +122,7 @@ impl<K: Hash + Eq + Clone> H2SessionCache<K> {
     ) -> Result<HashMap<StreamId, ParsedH2Message>, ParseError> {
         let entry = self
             .connections
-            .entry(key)
+            .entry_sync(key)
             .or_insert_with(|| Mutex::new(H2ConnectionState::default()));
         let mut state = entry.get().lock().unwrap_or_else(|e| e.into_inner());
         parse::parse_frames_stateful(buffer, &mut state)
@@ -131,13 +131,13 @@ impl<K: Hash + Eq + Clone> H2SessionCache<K> {
     /// Remove connection state (call when connection closes)
     pub fn remove(&self, key: &K) -> Option<H2ConnectionState> {
         self.connections
-            .remove(key)
+            .remove_sync(key)
             .map(|(_, mutex)| mutex.into_inner().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// Check if connection state exists
     pub fn contains(&self, key: &K) -> bool {
-        self.connections.contains(key)
+        self.connections.contains_sync(key)
     }
 
     /// Get number of tracked connections

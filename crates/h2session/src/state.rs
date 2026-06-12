@@ -467,15 +467,15 @@ impl ParsedH2Message {
     /// per-frame userspace times, so the userspace fields are 0.
     pub fn to_http_request(&self) -> Option<crate::HttpRequest> {
         Some(crate::HttpRequest {
-            method:       self.http_method()?,
-            uri:          self.http_uri()?,
-            headers:      self.http_headers(),
-            body:         self.body.clone(),
+            method: self.http_method()?,
+            uri: self.http_uri()?,
+            headers: self.http_headers(),
+            body: self.body.clone(),
             start_timestamp_ns: self.first_frame_timestamp_ns,
             userspace_start_timestamp_ns: TimestampNs(0),
             complete_timestamp_ns: self.end_stream_timestamp_ns,
             userspace_complete_timestamp_ns: TimestampNs(0),
-            version:      Some(2),
+            version: Some(2),
         })
     }
 
@@ -486,15 +486,15 @@ impl ParsedH2Message {
     /// Userspace fields are 0 (not threaded per-frame for HTTP/2).
     pub fn to_http_response(&self) -> Option<crate::HttpResponse> {
         Some(crate::HttpResponse {
-            status:       self.http_status()?,
-            headers:      self.http_headers(),
-            body:         self.body.clone(),
+            status: self.http_status()?,
+            headers: self.http_headers(),
+            body: self.body.clone(),
             start_timestamp_ns: self.first_frame_timestamp_ns,
             userspace_start_timestamp_ns: TimestampNs(0),
             complete_timestamp_ns: self.end_stream_timestamp_ns,
             userspace_complete_timestamp_ns: TimestampNs(0),
-            version:      Some(2),
-            reason:       None,
+            version: Some(2),
+            reason: None,
         })
     }
 
